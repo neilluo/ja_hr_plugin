@@ -474,11 +474,6 @@ def extract_text(path: str) -> Dict[str, Any]:
     return result
 
 
-def extract_many(paths: List[str]) -> List[Dict[str, Any]]:
-    """便捷批量封装（契约未要求，W-C 可自行决定用不用）。"""
-    return [extract_text(p) for p in paths]
-
-
 # --------------------------------------------------------------------------- #
 # CLI（自测用；SKILL.md 不直接调本文件，由 W-C 的 intake 脚本调用）
 # --------------------------------------------------------------------------- #
