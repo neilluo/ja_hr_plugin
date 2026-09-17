@@ -12,6 +12,10 @@
     extraction_runner.py ExtractionRunner —— 并发提取池编排（建池/index-keyed 收集/
                                    预算触顶 cancel/提取摘要交 Console；两处 workers
                                    表达式刻意不合并）
+    table_gateway.py TableGateway —— dws IO 边界唯一入口（装配 counter/client/tbl +
+                                   config 失败 fatal；reset/ensure_options/附件上传/
+                                   batch_update/batch_upsert_by_key/set_row_count 薄转发；
+                                   判定逻辑与回读校验不进本类）
 
 沿 P2 纪律：**本包 `__init__` 不做任何 re-export**（不留 shim，调用方直接 import 子模块）。
 import 风格与 shared 既有包一致：shared/ 在 sys.path 上，包内模块用顶层绝对 import。

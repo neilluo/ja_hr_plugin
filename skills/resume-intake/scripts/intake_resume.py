@@ -126,7 +126,7 @@ for _p in (str(_SHARED_DIR), str(_VENDOR_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from aitable.client import DwsCallCounter, DwsClient, DwsError  # noqa: E402
+from aitable.client import DwsError                 # noqa: E402
 from aitable.table import AITable                   # noqa: E402
 from aitable.values import sanitize_text, values_equal  # noqa: E402
 from dedupe.base import UNSET                       # noqa: E402
@@ -146,6 +146,7 @@ from intake.checkpoint import CheckpointStore       # noqa: E402
 from intake.console import IntakeConsole            # noqa: E402
 from intake.extraction_runner import ExtractionRunner  # noqa: E402
 from intake.report import IntakeReport              # noqa: E402
+from intake.table_gateway import TableGateway       # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # 常量
@@ -533,17 +534,6 @@ def verify_by_filter(tbl: AITable, table_key: str, key_field: str,
 # --------------------------------------------------------------------------- #
 # 主流程
 # --------------------------------------------------------------------------- #
-def reset_table(tbl: AITable, table_key: str) -> Dict[str, Any]:
-    """--reset：清空表内全部记录（供重复测量用；生产 base 严禁使用）。"""
-    recs = tbl.query_records(table_key, fields=["phone"], all_pages=True, max_pages=100)
-    ids = [r["record_id"] for r in recs if r.get("record_id")]
-    if not ids:
-        return {"deleted": 0, "failed": [], "found": 0}
-    res = tbl.batch_delete(table_key, ids)
-    res["found"] = len(ids)
-    return res
-
-
 def run(args: argparse.Namespace) -> int:
     console = IntakeConsole()
     budget = WallBudget(args, WALL_BUDGET_DEFAULT)
@@ -572,13 +562,10 @@ def run(args: argparse.Namespace) -> int:
                "needs_agent_vision": 0}
     fatal: Optional[str] = None
 
-    counter = DwsCallCounter()
-    client = DwsClient(counter=counter, timeout=300, http_timeout=180)
-    try:
-        tbl = AITable(args.config, client=client)
-    except Exception as exc:                      # config 缺失/格式错 → 立刻可见地失败
-        fatal = "读取 config.json 失败：%s: %s" % (type(exc).__name__, exc)
-        tbl = None
+    gateway = TableGateway(args.config)
+    counter = gateway.counter
+    tbl = gateway.tbl
+    fatal = gateway.fatal
 
     console.banner()
     console.batch_info(batch_id, out_dir)
@@ -594,7 +581,7 @@ def run(args: argparse.Namespace) -> int:
         # 留下「表已清空但旧 done 还在」的假断点
         store.persist()
     if tbl is not None and args.reset:
-        r = reset_table(tbl, "resume")
+        r = gateway.reset("resume")
         console.reset_result(r.get("found", 0), r.get("deleted", 0),
                              len(r.get("failed") or []))
         if r.get("failed"):
@@ -809,7 +796,7 @@ def run(args: argparse.Namespace) -> int:
     attach_md5_field: Optional[str] = None
     if tbl is not None:
         try:
-            if ATTACH_MD5_FIELD_KEY in tbl.field_keys("resume"):
+            if ATTACH_MD5_FIELD_KEY in gateway.field_keys("resume"):
                 attach_md5_field = ATTACH_MD5_FIELD_KEY
         except Exception as exc:                    # 防御：读 config 出问题也只回退，不崩
             warnings.append("读取简历库字段清单失败（%s: %s）→ 库内去重按老库回退处理"
@@ -844,7 +831,7 @@ def run(args: argparse.Namespace) -> int:
             else:
                 # 缺陷3 的行数护栏：这次全表扫描已经**免费**给出了行数，喂给写前护栏，
                 # 省掉一次 record stats 调用（截断时数字不可信，就不喂）
-                tbl.set_row_count("resume", scan.records)
+                gateway.set_row_count("resume", scan.records)
         except DwsError as exc:
             warnings.append("库内附件查重扫描失败（%s/%s）：%s；本次跳过「%s」的库内比对"
                             % (exc.category, exc.code, exc.message[:200],
@@ -1008,7 +995,7 @@ def run(args: argparse.Namespace) -> int:
             try:
                 t0 = time.monotonic()
                 calls0 = counter.calls
-                opts = tbl.ensure_options("resume", field_key, names)
+                opts = gateway.ensure_options("resume", field_key, names)
                 console.ensure_options(field_key, len(names), len(opts),
                                        time.monotonic() - t0, counter.calls - calls0)
             except Exception as exc:
@@ -1033,8 +1020,8 @@ def run(args: argparse.Namespace) -> int:
                 budget.budget_stopped = True
                 break
             chunk = to_write[ci:ci + chunk_n]
-            results = tbl.upload_attachments([e["path"] for e in chunk],
-                                             concurrency=args.concurrency)
+            results = gateway.upload_attachments([e["path"] for e in chunk],
+                                                 args.concurrency)
             for ent, res in zip(chunk, results):
                 if res.get("ok") and res.get("cell"):
                     ent["row"]["attachment"] = res["cell"]
@@ -1093,8 +1080,8 @@ def run(args: argparse.Namespace) -> int:
             console.fixup_deferred(n_all, FIXUP_ROUND_MAX, len(fixups), len(deferred_fix))
         t0 = time.monotonic()
         calls0 = counter.calls
-        results = tbl.upload_attachments([e["path"] for e in fixups],
-                                         concurrency=args.concurrency)
+        results = gateway.upload_attachments([e["path"] for e in fixups],
+                                             args.concurrency)
         updates: List[Dict[str, Any]] = []
         for ent, res in zip(fixups, results):
             if res.get("ok") and res.get("cell"):
@@ -1119,7 +1106,7 @@ def run(args: argparse.Namespace) -> int:
                                    str(res.get("error"))[:200]))
         ok_rids: set = set()
         if updates:
-            r = tbl.batch_update("resume", updates)
+            r = gateway.batch_update("resume", updates)
             failed_rids = {str(f.get("record_id") or (f.get("row") or {}).get("record_id"))
                            for f in (r.get("failed") or [])}
             ids = [u["record_id"] for u in updates if str(u["record_id"]) not in failed_rids]
@@ -1175,7 +1162,7 @@ def run(args: argparse.Namespace) -> int:
         t0 = time.monotonic()
         calls0 = counter.calls
         try:
-            upsert_res = tbl.batch_upsert_by_key("resume", "phone", rows_in)
+            upsert_res = gateway.batch_upsert_by_key("resume", "phone", rows_in)
         except DwsError as exc:
             fatal = "批量写简历库失败（%s/%s）：%s" % (exc.category, exc.code, exc.message[:300])
             warnings.append(fatal)
@@ -1202,7 +1189,7 @@ def run(args: argparse.Namespace) -> int:
     if tbl is not None and written and not fatal:
         rb_fields = ["name", "phone", "education", "org", "full_text", "attachment",
                      "expected_location", "skills", ATTACH_MD5_FIELD_KEY]
-        rb_fields = [k for k in rb_fields if k in tbl.field_keys("resume")]
+        rb_fields = [k for k in rb_fields if k in gateway.field_keys("resume")]
         expected: Dict[str, Dict[str, Any]] = {}
         for ent in written:
             exp = {}
@@ -1254,7 +1241,7 @@ def run(args: argparse.Namespace) -> int:
                         fix_cells2[attach_md5_field] = ent["row"][attach_md5_field]
                     fixes.append({"record_id": ent["record_id"], "cells": fix_cells2})
             if fixes:
-                r = tbl.batch_update("resume", fixes)
+                r = gateway.batch_update("resume", fixes)
                 warnings.append("回读发现 %d 条附件缺失，已补一次 batch_update（updated=%s failed=%d）"
                                 % (len(fixes), r.get("updated"), len(r.get("failed") or [])))
 
