@@ -127,8 +127,7 @@ for _p in (str(_SHARED_DIR), str(_VENDOR_DIR)):
         sys.path.insert(0, _p)
 
 from aitable.client import DwsError                 # noqa: E402
-from aitable.table import AITable                   # noqa: E402
-from aitable.values import sanitize_text, values_equal  # noqa: E402
+from aitable.values import sanitize_text            # noqa: E402
 from dedupe.base import UNSET                       # noqa: E402
 from dedupe.content_hash import (                   # noqa: E402
     ATTACH_MD5_FIELD_KEY,
@@ -145,6 +144,7 @@ from intake.budget import WallBudget                # noqa: E402
 from intake.checkpoint import CheckpointStore       # noqa: E402
 from intake.console import IntakeConsole            # noqa: E402
 from intake.extraction_runner import ExtractionRunner  # noqa: E402
+from intake.readback import ReadBackVerifier       # noqa: E402
 from intake.report import IntakeReport              # noqa: E402
 from intake.table_gateway import TableGateway       # noqa: E402
 
@@ -171,8 +171,6 @@ EVIDENCE_LIMITS = {"education_text": 4000, "cert_text": 4000,
 OLD_TURNS_PER_FILE = 25
 #: 本脚本自己占的 agent 回合数（Turn 1 = 1 次脚本调用）
 NEW_TURNS = 1
-#: 写后读回传播延迟（W-B 实测：create 后按条件查 ≈2.7s 才可命中）
-SETTLE_WAITS = (1.5, 3.0, 4.5)
 #: 库内去重扫描的翻页上限（100 页 × 100 条/页 ≈ 10000 条）。存量打满就会截断，
 #: 而去重是按「扫回来的这批」判的 → 截断即漏判重复，所以必须报出来（缺陷2）。
 DEDUPE_SCAN_MAX_PAGES = 100
@@ -460,78 +458,6 @@ def _agent_vision_entry(ent: Dict[str, Any],
 
 
 # --------------------------------------------------------------------------- #
-# 回读校验（按 filter 查，一次调用同时拿到 record_id 映射与读回值）
-# --------------------------------------------------------------------------- #
-def verify_by_filter(tbl: AITable, table_key: str, key_field: str,
-                     keys: Sequence[str], fields: Sequence[str],
-                     expected: Dict[Any, Dict[str, Any]],
-                     attach_field: Optional[str] = None,
-                     settle_waits: Sequence[float] = SETTLE_WAITS) -> Dict[str, Any]:
-    """写后必回读（契约 D6），但**按业务键 filter 查**而不是按 record_id 查。
-
-    为什么不用 `AITable.readback_verify`：`batch_upsert_by_key` 返回的 record_ids 是
-    「本片 created ids + updated ids」拼接，**无法可靠对回具体行**；而本脚本必须知道
-    每份简历落到哪个 record_id（要写进 candidates.json 给 C2 用）。按手机号 filter 查
-    一次就同时拿到 record_id 映射 + 读回值，省一次调用。
-
-    传播延迟：W-B 实测 create 后按条件查 ≈2.7s 才可命中，所以这里自带**有界**轮询
-    （1.5/3.0/4.5s），绝不空转烧调用；轮询完仍不一致就如实报进 mismatch（D6）。
-    """
-    t0 = time.monotonic()
-    calls0 = tbl.dws_calls
-    keys = [k for k in (keys or []) if k]
-    found: Dict[Any, Dict[str, Any]] = {}
-    polls = 0
-    mismatch: List[Dict[str, Any]] = []
-    while True:
-        recs: List[Dict[str, Any]] = []
-        # filter 的 OR 条件也有 100 个上限，超出必须自己分片（每片仍是一次调用）
-        for i in range(0, len(keys), 100):
-            recs.extend(tbl.query_records(table_key, filter={key_field: keys[i:i + 100]},
-                                          fields=list(fields), limit=100, all_pages=True))
-        found = {}
-        for r in recs:
-            k = (r.get("cells") or {}).get(key_field)
-            if isinstance(k, str):
-                k = k.strip()
-            if k is None:
-                continue
-            found.setdefault(k, r)
-        mismatch = []
-        for k, exp in (expected or {}).items():
-            rec = found.get(k)
-            if rec is None:
-                continue
-            cells = rec.get("cells") or {}
-            for fk, ev in exp.items():
-                if not values_equal(ev, cells.get(fk)):
-                    mismatch.append({"key": k, "record_id": rec.get("record_id"),
-                                     "field": fk, "expected": ev, "actual": cells.get(fk)})
-        missing = [k for k in keys if k not in found]
-        if not missing and not mismatch:
-            break
-        if polls >= len(settle_waits):
-            break
-        time.sleep(settle_waits[polls])
-        polls += 1
-
-    missing = [k for k in keys if k not in found]
-    attach_missing: List[Any] = []
-    if attach_field:
-        for k, rec in found.items():
-            if not (rec.get("cells") or {}).get(attach_field):
-                attach_missing.append(k)
-    return {
-        "ok": not missing and not mismatch,
-        "requested": len(keys), "found": len(found), "missing": missing,
-        "mismatch": mismatch, "attachment_missing": attach_missing,
-        "records": found, "settle_polls": polls,
-        "dws_calls": tbl.dws_calls - calls0,
-        "elapsed_ms": int((time.monotonic() - t0) * 1000),
-    }
-
-
-# --------------------------------------------------------------------------- #
 # 主流程
 # --------------------------------------------------------------------------- #
 def run(args: argparse.Namespace) -> int:
@@ -566,6 +492,7 @@ def run(args: argparse.Namespace) -> int:
     counter = gateway.counter
     tbl = gateway.tbl
     fatal = gateway.fatal
+    readback = ReadBackVerifier(tbl, warnings)
 
     console.banner()
     console.batch_info(batch_id, out_dir)
@@ -809,7 +736,7 @@ def run(args: argparse.Namespace) -> int:
     if tbl is not None and need_lib_scan and not args.no_dedupe_scan and not budget.halted:
         try:
             t0 = time.monotonic()
-            scan = lib_deduper.scan(tbl, "resume",
+            scan = lib_deduper.scan(readback, "resume",
                                     max_pages=DEDUPE_SCAN_MAX_PAGES)
             console.dedupe_scan(lib_deduper.key_label, scan.records, scan.indexed,
                                 (lib_deduper.coverage_note()
@@ -885,7 +812,7 @@ def run(args: argparse.Namespace) -> int:
         try:
             t0 = time.monotonic()
             calls0 = counter.calls
-            scan = phone_deduper.scan(tbl, phones, "resume")
+            scan = phone_deduper.scan(readback, phones, "resume")
             console.phone_scan(len(phones), scan.indexed,
                                time.monotonic() - t0, counter.calls - calls0)
         except DwsError as exc:
@@ -916,12 +843,7 @@ def run(args: argparse.Namespace) -> int:
     all_locations: List[str] = []
     known_locs: List[str] = []
     if tbl is not None:
-        try:
-            known_locs = [o.get("name") for o in
-                          ((tbl.config.get("options") or {}).get("resume") or {})
-                          .get("expected_location", []) if o.get("name")]
-        except Exception:
-            known_locs = []
+        known_locs = readback.known_option_names("resume", "expected_location")
 
     for ent in entries:
         f = ent.get("fields") or {}
@@ -1111,20 +1033,7 @@ def run(args: argparse.Namespace) -> int:
                            for f in (r.get("failed") or [])}
             ids = [u["record_id"] for u in updates if str(u["record_id"]) not in failed_rids]
             # 写后必回读：附件字段非空才算补传成功（有界轮询，不空转烧调用）
-            polls = 0
-            while ids:
-                try:
-                    recs = tbl.query_records("resume", record_ids=ids, fields=["attachment"])
-                except DwsError as exc:
-                    warnings.append("补传附件回读查询失败（%s）：按未确认处理，请重跑复核"
-                                    % str(exc)[:160])
-                    recs = []
-                ok_rids = {r2.get("record_id") for r2 in recs
-                           if (r2.get("cells") or {}).get("attachment")}
-                if len(ok_rids) >= len(ids) or polls >= len(SETTLE_WAITS):
-                    break
-                time.sleep(SETTLE_WAITS[polls])
-                polls += 1
+            ok_rids = readback.poll_fixup_attachments(ids)
             for ent in fixups:
                 if ent.get("result"):                 # 上传已失败的前面处理过
                     continue
@@ -1199,13 +1108,13 @@ def run(args: argparse.Namespace) -> int:
                     exp[fk] = ent["row"][fk]
             expected[str(_clean(ent["row"]["phone"]))] = exp
         t0 = time.monotonic()
-        verify = verify_by_filter(tbl, "resume", "phone",
-                                  [str(_clean(e["row"]["phone"])) for e in written],
-                                  rb_fields, expected,
-                                  attach_field=("attachment"
-                                                if ("attachment" in rb_fields
-                                                    and not args.no_attachment)
-                                                else None))
+        verify = readback.verify_by_filter("resume", "phone",
+                                           [str(_clean(e["row"]["phone"])) for e in written],
+                                           rb_fields, expected,
+                                           attach_field=("attachment"
+                                                         if ("attachment" in rb_fields
+                                                             and not args.no_attachment)
+                                                         else None))
         for ent in written:
             ph = str(_clean(ent["row"]["phone"]))
             rec = (verify.get("records") or {}).get(ph)
