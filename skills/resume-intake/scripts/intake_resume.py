@@ -13,14 +13,16 @@ recruit-match-suite-fast / skills / resume-intake / scripts / intake_resume.py
     → 一次批量 upsert 写简历库 → 回读校验 → 产出 candidates.json /
       intake_report.json / checkpoint.json
 
-调用面（冻结，W-D 的 SKILL.md 照此写，不得偏离）
+调用面（冻结，W-D 的 SKILL.md 照此写，不得偏离；--wall-budget 为 P3 只增开关）
 ------------------------------------------------
     python3 scripts/intake_resume.py --config <config.json绝对路径> \
-            --files <f1> [f2 ...] --out-dir <绝对路径> [--no-attachment] [--reset]
+            --files <f1> [f2 ...] --out-dir <绝对路径> [--no-attachment] [--reset] \
+            [--wall-budget <秒>]
 
     产出: <out-dir>/candidates.json, <out-dir>/intake_report.json,
           <out-dir>/checkpoint.json
     stdout 末行: ARTIFACT:<out-dir>/intake_report.json 的绝对路径
+    partial 时: 额外一行 `RESUME: <原命令>`——重跑同一命令续跑（见纪律 9）
 
 `--out-dir` 缺省 = /tmp/recruit-fast/<batch_id>/（batch_id = 时间戳 + 短随机）。
 
@@ -57,16 +59,32 @@ recruit-match-suite-fast / skills / resume-intake / scripts / intake_resume.py
 8. 兼容 python 3.9 与 3.14（契约 D18）：无 match、无运行时 `X | None`、只用 typing.Optional。
    零第三方 pip 依赖（契约 §0.4）：sys.path 由 `Path(__file__).resolve().parents[3]`
    定位插件根后注入 `<root>/shared` 与 `<root>/shared/vendor`，禁止硬编码绝对路径。
+9. **增量 checkpoint + 墙钟预算（P3）**：checkpoint.json 不再只在流程末尾写一次——
+   「附件已传」（阶段 6 逐片）与「记录已写」（阶段 8 回读确认后逐条）各自一确立就
+   原子落盘（tmp + os.replace，SIGKILL 不留半截 JSON）；`progress` 段记录尚未写库
+   文件的中间状态（只作断点可见性，不参与跳过判定，done/done_md5 语义与旧版一致，
+   旧格式照常可读、读不懂视为空并告警）。`--wall-budget`（默认 100s < agent 工具
+   120s 超时）到点即 graceful 停：附件停止上传（记录仍照常 upsert，欠附件的重跑走
+   6b 只补附件）、打印已完成/未完成清单与一行 `RESUME:`、退出码 0、报告 ok=true 且
+   partial=true。**脚本内部绝不循环子批**（总墙钟仍会超外部超时）；续跑 = 重跑同一条
+   命令，checkpoint 幂等保证不产生重复记录。
+10. **扫描件/图片在 macOS 上自动 OCR 救回（P3）**：提取并发 4（EXTRACT_CONCURRENCY，
+   多份扫描件并行 Vision OCR，实测 3 份并行 1.764s vs 串行 3.810s），提取层细节见
+   shared/extraction/vision_ext.py。失败清单语义随之收窄为「仅加密/损坏/OCR 不可信
+   （非 macOS、或 OCR 文本仍是水印/重复串/0 数字字符）才失败」。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
+import shlex
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -97,6 +115,12 @@ from extract_text import detect_scanned, extract_text  # noqa: E402
 FULL_TEXT_MAX = 20000
 #: 附件并发度（契约 D5：API 限 20 QPS，5 留足余量）
 UPLOAD_CONCURRENCY = 5
+#: 提取/OCR 并发度（P3）：多份扫描件并行 Vision OCR，实测 3 份并行 1.764s vs
+#: 串行 3.810s；上限 4 是派工契约值，与附件并发 5 互不相干。
+EXTRACT_CONCURRENCY = 4
+#: --wall-budget 默认秒数：必须小于 agent 工具 120s 超时，留出 graceful 停止
+#: （落 checkpoint + 打印 RESUME + 写报告）与提交尾段（upsert+回读）的余量。
+WALL_BUDGET_DEFAULT = 100.0
 #: 每个候选人写入「技能标签」的上限（多选字段，避免选项池被噪声撑爆）
 SKILLS_MAX = 40
 #: evidence 各段长度上限（契约 D4：字段级全量 + 工作经历正文截断，不是「取前 N 字」）
@@ -137,8 +161,9 @@ CATEGORY_DEFAULT = "技术类"
 
 #: parse_status -> 业务话（给用户看的，不是技术错误码）
 PARSE_FAIL_REASON = {
-    "no_text_layer": "扫描件/图片无文字层，无法解析；请提供 Word 或 PDF 文字版简历"
-                     "（本期不做 OCR，不硬造字段）",
+    "no_text_layer": "扫描件/图片无文字层，且本机 OCR 未能救回（非 macOS 无 OCR 能力，"
+                     "或 OCR 文本未通过可信护栏：仍是水印/重复串/无数字字符）；"
+                     "请提供 Word 或 PDF 文字版简历（不硬造字段）",
     "garbled": "文本层疑似乱码/编码错位，无法可靠解析；请提供文字版简历或转人工核对原件",
     "encrypted": "文件加密或无读取权限，无法解析；请提供未加密的文字版简历",
     "unsupported": "不支持的文件格式，无法解析；请提供 PDF/Word(docx/doc) 文字版简历",
@@ -163,6 +188,12 @@ EVIDENCE_KEYS = ("education_text", "cert_text", "work_text", "skill_text")
 # --------------------------------------------------------------------------- #
 def _new_batch_id() -> str:
     return "%s-%04x" % (time.strftime("%Y%m%d-%H%M%S"), random.getrandbits(16))
+
+
+def _resume_cmd() -> str:
+    """RESUME: 行内容 = 原命令原样重跑（脚本路径换成绝对路径，防换 cwd 后失效）。"""
+    argv = [str(Path(sys.argv[0]).resolve())] + list(sys.argv[1:])
+    return shlex.join(argv)
 
 
 def _today() -> str:
@@ -280,6 +311,59 @@ def _write_json(path: Path, payload: Any) -> None:
         json.dump(payload, fh, ensure_ascii=False, indent=2)
 
 
+def _write_json_atomic(path: Path, payload: Any) -> None:
+    """tmp + os.replace：进程在任意瞬间被 SIGKILL 也不会留下半截 JSON。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(str(tmp), "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+    os.replace(str(tmp), str(path))
+
+
+def _persist_checkpoint(checkpoint_path: Path, checkpoint: Dict[str, Any]) -> None:
+    """P3 增量 checkpoint：每份文件的「写库」「附件上传」状态一确立就整文件原子落盘
+    （旧实现只在流程末尾写一次，被杀即全丢，N≈150 撞 120s 工具超时悬崖）。"""
+    checkpoint["generated_at"] = now_iso()
+    checkpoint["done_count"] = len(checkpoint.get("done") or {})
+    _write_json_atomic(checkpoint_path, checkpoint)
+
+
+def _safe_extract_text(fp: str) -> Dict[str, Any]:
+    """线程池里的提取入口。extract_text 契约上永不抛异常，这里再兜一层防御。"""
+    try:
+        return extract_text(str(Path(fp).expanduser()))
+    except Exception as exc:                        # pragma: no cover
+        return {"status": "error", "text": "", "md5": "", "size": 0,
+                "kind": None, "backend": "none", "elapsed_ms": 0, "ext": None,
+                "error": "提取线程异常 %s: %s" % (type(exc).__name__, exc)}
+
+
+def _done_entry(ent: Dict[str, Any], prev: Dict[str, Any],
+                result_str: Optional[str] = None) -> Dict[str, Any]:
+    """checkpoint.done 条目（v3 §9#6 语义）：「记录已写」与「附件已传」分开记状态，
+    并存派生字段供跳过重跑时恢复 candidates.json 完整性。阶段 8 逐条落盘与阶段 9
+    终稿共用本构造，保证两处内容一致。"""
+    row = ent.get("row") or {}
+    return {
+        "md5": ent["md5"],
+        "file_name": ent["file_name"],
+        "record_written": True,
+        "attachment_uploaded": ent["attachment_status"] == "uploaded",
+        "record_id": ent.get("record_id") or prev.get("record_id"),
+        "phone": row.get("phone") or prev.get("phone"),
+        "dedupe": ent["dedupe"],
+        "result": (result_str if result_str in ("新入库", "已覆盖")
+                   else prev.get("result") or "已入库"),
+        "attachment_status": ent["attachment_status"],
+        "org_guess": ent.get("org_guess") or prev.get("org_guess"),
+        "org_confidence": ent.get("org_confidence") or prev.get("org_confidence"),
+        "category_guess": ent.get("category_guess") or prev.get("category_guess"),
+        "skills": list(row.get("skills") or prev.get("skills") or []),
+        "expected_location": row.get("expected_location") or prev.get("expected_location"),
+        "at": now_iso(),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # 回读校验（按 filter 查，一次调用同时拿到 record_id 映射与读回值）
 # --------------------------------------------------------------------------- #
@@ -368,6 +452,15 @@ def reset_table(tbl: AITable, table_key: str) -> Dict[str, Any]:
 
 def run(args: argparse.Namespace) -> int:
     t_start = time.monotonic()
+    budget = float(getattr(args, "wall_budget", None) or WALL_BUDGET_DEFAULT)
+    deadline = t_start + budget
+    budget_stopped = False          # 预算触顶（阶段1截断 / 写库前停 / 附件截断）
+    deferred_files: List[str] = []  # 记录已入库、附件因预算欠传的文件
+    halted = False                  # 写库前 graceful 停止（不再进入任何 dws 写阶段）
+
+    def over_budget() -> bool:
+        return time.monotonic() >= deadline
+
     batch_id = args.batch_id or _new_batch_id()
     out_dir = Path(args.out_dir).expanduser() if args.out_dir else \
         Path("/tmp/recruit-fast") / batch_id
@@ -384,7 +477,9 @@ def run(args: argparse.Namespace) -> int:
     summary = {"new": 0, "overwrite": 0, "skip": 0, "fail": 0,
                "attachment_uploaded": 0, "attachment_failed": 0,
                # v3 §9#6 只增字段：本次「只补附件」路径的计数（记录不重建）
-               "attachment_fixup_uploaded": 0, "attachment_fixup_failed": 0}
+               "attachment_fixup_uploaded": 0, "attachment_fixup_failed": 0,
+               # P3 只增字段：墙钟预算内未处理的文件数（重跑同一命令续跑）
+               "pending_budget": 0}
     fatal: Optional[str] = None
 
     counter = DwsCallCounter()
@@ -403,10 +498,18 @@ def run(args: argparse.Namespace) -> int:
               flush=True)
 
     files: List[str] = list(args.files or [])
-    checkpoint: Dict[str, Any] = {"batch_id": batch_id, "out_dir": str(out_dir),
+    checkpoint: Dict[str, Any] = {"version": 2,
+                                  "batch_id": batch_id, "out_dir": str(out_dir),
                                   "config_path": str(Path(args.config).resolve()),
-                                  "generated_at": now_iso(), "done": {}, "done_md5": []}
+                                  "generated_at": now_iso(), "done": {}, "done_md5": [],
+                                  # progress = 尚未写库文件的中间状态（提取完成/附件已传），
+                                  # P3 增量落盘用；done/done_md5 语义与旧版完全一致
+                                  "progress": {}}
 
+    if args.reset:
+        # --reset 先把 checkpoint 清成空骨架并立即落盘：清表与重跑之间被杀也不会
+        # 留下「表已清空但旧 done 还在」的假断点
+        _persist_checkpoint(checkpoint_path, checkpoint)
     if tbl is not None and args.reset:
         r = reset_table(tbl, "resume")
         print("--reset：表内发现 %d 条，已删除 %d 条（失败 %d）"
@@ -415,15 +518,23 @@ def run(args: argparse.Namespace) -> int:
             warnings.append("--reset 删除失败 %d 片：%s"
                             % (len(r["failed"]), json.dumps(r["failed"], ensure_ascii=False)[:300]))
 
-    # ---- checkpoint（契约 D12 幂等续跑）----
+    # ---- checkpoint（契约 D12 幂等续跑；P3 起逐条落盘，格式 version=2）----
+    # 重跑兼容：旧格式（无 version/progress）照常读 done/done_md5；整个文件读不懂
+    # （坏 JSON / 结构不认识）→ 告警并按空 checkpoint 处理，绝不崩溃。
     if checkpoint_path.exists() and not args.reset:
         try:
             old = json.loads(checkpoint_path.read_text(encoding="utf-8"))
             if isinstance(old, dict) and isinstance(old.get("done"), dict):
                 checkpoint["done"] = old["done"]
                 checkpoint["done_md5"] = old.get("done_md5") or []
+                if isinstance(old.get("progress"), dict):
+                    checkpoint["progress"] = old["progress"]
                 print("读到 checkpoint：%d 份已成功，重跑将跳过（D12 幂等）"
                       % len(checkpoint["done"]), flush=True)
+            else:
+                warnings.append("checkpoint.json 结构不认识（缺 done 映射，可能是更旧的"
+                                "格式或半截文件），本次按空 checkpoint 处理；已入库项靠"
+                                "手机号查重兜底，不会产生重复记录")
         except (ValueError, OSError) as exc:
             warnings.append("checkpoint.json 读取失败（%s），本次按全新批次处理" % exc)
 
@@ -431,13 +542,49 @@ def run(args: argparse.Namespace) -> int:
 
     # ------------------------------------------------------------------ #
     # 阶段 1：提取 + 抽字段（纯本地，零 dws 调用）
+    # P3：提取并发跑（EXTRACT_CONCURRENCY=4，多份扫描件并行 Vision OCR）；
+    # 墙钟预算触顶时取消未开始的提取，对应文件进「未完成」清单（RESUME 续跑）。
     # ------------------------------------------------------------------ #
     entries: List[Dict[str, Any]] = []
     t_extract = time.monotonic()
+    ex_by_idx: Dict[int, Dict[str, Any]] = {}
+    if files:
+        workers = max(1, min(EXTRACT_CONCURRENCY, len(files)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(_safe_extract_text, fp): i
+                    for i, fp in enumerate(files)}
+            for fut in as_completed(futs):
+                i = futs[fut]
+                try:
+                    ex_by_idx[i] = fut.result()
+                except Exception as exc:            # pragma: no cover（防御）
+                    ex_by_idx[i] = {
+                        "status": "error", "text": "", "md5": "", "size": 0,
+                        "kind": None, "backend": "none", "elapsed_ms": 0,
+                        "ext": None,
+                        "error": "提取线程异常 %s: %s" % (type(exc).__name__, exc)}
+                if over_budget():
+                    for f2 in futs:
+                        f2.cancel()                 # 只取消还没开始的；在跑的会跑完
+                    budget_stopped = True
+                    break
+    budget_reason = ("墙钟预算 %.0fs 耗尽，本次未处理；checkpoint 已落盘，"
+                     "重跑同一命令续跑（幂等，不产生重复记录）" % budget)
     for i, fp in enumerate(files):
         p = Path(fp).expanduser()
         fname = p.name
-        ex = extract_text(str(p))
+        ex = ex_by_idx.get(i)
+        if ex is None:
+            entries.append({
+                "seq": i + 1, "file_name": fname, "path": str(p.resolve()),
+                "md5": "", "size": 0, "kind": None, "backend": "none",
+                "parse_status": "pending_budget", "extract_ms": None,
+                "text": "", "fields": None,
+                "result": "未完成", "reason": budget_reason, "dedupe": "new",
+                "attachment_status": "deferred", "record_id": None,
+                "writable": False, "warnings": [],
+            })
+            continue
         ent: Dict[str, Any] = {
             "seq": i + 1, "file_name": fname, "path": str(p.resolve()),
             "md5": ex.get("md5") or "", "size": ex.get("size") or 0,
@@ -475,8 +622,37 @@ def run(args: argparse.Namespace) -> int:
         entries.append(ent)
     extract_ms = int((time.monotonic() - t_extract) * 1000)
     n_ok = sum(1 for e in entries if e["parse_status"] == "ok")
-    print("提取完成：%d 份文件，%d 份可用文本，%d 份不可用；本地耗时 %dms（0 次 dws 调用）"
-          % (len(entries), n_ok, len(entries) - n_ok, extract_ms), flush=True)
+    n_pending = sum(1 for e in entries if e["result"] == "未完成")
+    print("提取完成：%d 份文件（并发 %d），%d 份可用文本，%d 份不可用%s；"
+          "本地耗时 %dms（0 次 dws 调用）"
+          % (len(entries), min(EXTRACT_CONCURRENCY, max(1, len(files))),
+             n_ok, len(entries) - n_ok - n_pending,
+             ("，%d 份因预算未提取" % n_pending) if n_pending else "",
+             extract_ms), flush=True)
+
+    # 提取进度即刻落盘（record_written=False 的 progress 条目：只作断点可见性，
+    # 不参与 done/done_md5 的跳过判定，重跑语义不变）
+    for ent in entries:
+        md5 = ent["md5"]
+        if md5 and md5 not in done_md5:
+            prog = checkpoint["progress"].setdefault(md5, {"md5": md5})
+            prog.update({"file_name": ent["file_name"], "record_written": False,
+                         "parse_status": ent["parse_status"], "at": now_iso()})
+    _persist_checkpoint(checkpoint_path, checkpoint)
+
+    # ---- 预算检查点 A：写库前。已触顶 → graceful 停止，不进入任何 dws 写阶段 ----
+    # done_md5 里的文件不标「未完成」：阶段 2 的本地跳过/补附件判定照常给它们结果
+    if budget_stopped or over_budget():
+        halted = True
+        budget_stopped = True
+        for ent in entries:
+            if ent["result"] is None and ent["md5"] not in done_md5:
+                ent["result"] = "未完成"
+                ent["writable"] = False
+                ent["reason"] = ("墙钟预算 %.0fs 耗尽（未进入写库阶段），本次未处理；"
+                                 "重跑同一命令续跑" % budget)
+        print("⏸ 墙钟预算 %.0fs 耗尽：未进入写库阶段，graceful 停止"
+              "（checkpoint 已落盘，退出码 0）" % budget, flush=True)
 
     # ------------------------------------------------------------------ #
     # 阶段 2：去重（checkpoint 与本批内部走**真 MD5**；库内附件走「文件名+字节大小」）
@@ -564,7 +740,7 @@ def run(args: argparse.Namespace) -> int:
         need_lib_scan = True
 
     name_size_deduper = NameSizeDeduper()
-    if tbl is not None and need_lib_scan and not args.no_dedupe_scan:
+    if tbl is not None and need_lib_scan and not args.no_dedupe_scan and not halted:
         try:
             t0 = time.monotonic()
             scan = name_size_deduper.scan(tbl, "resume",
@@ -736,29 +912,59 @@ def run(args: argparse.Namespace) -> int:
 
     # ------------------------------------------------------------------ #
     # 阶段 6：并发上传附件（契约 D5，一律用原始文件名），fileToken 随 upsert 一次写入
+    # P3：按并发度分片串行推进，每片完成后**立即落 checkpoint**（附件状态逐条持久化）；
+    # 片间检查墙钟预算，触顶即停止上传——但**已进提交阶段的记录照常 upsert**（欠附件的
+    # 记 record_written=True + attachment_uploaded=False，重跑走 6b 只补附件不重建记录）。
     # ------------------------------------------------------------------ #
     if tbl is not None and to_write and not args.no_attachment:
-        paths = [e["path"] for e in to_write]
+        chunk_n = max(1, int(args.concurrency))
         t0 = time.monotonic()
         calls0 = counter.calls
-        results = tbl.upload_attachments(paths, concurrency=args.concurrency)
-        up_ms = int((time.monotonic() - t0) * 1000)
-        for ent, res in zip(to_write, results):
-            if res.get("ok") and res.get("cell"):
-                ent["row"]["attachment"] = res["cell"]
-                ent["attachment_status"] = "uploaded"
-                summary["attachment_uploaded"] += 1
-            else:
-                ent["attachment_status"] = "failed"
-                summary["attachment_failed"] += 1
-                ent["warnings"].append("附件上传失败：%s" % (res.get("error") or "未知错误"))
-                warnings.append("《%s》附件上传失败（%s/%s）：%s；简历正文已照常入库，"
-                                "可后续用「补传附件」重跑"
-                                % (ent["file_name"], res.get("category"), res.get("code"),
-                                   str(res.get("error"))[:200]))
-        print("附件并发上传（concurrency=%d）：%d 成功 / %d 失败，%dms，%d 次调用"
+        truncated_at = len(to_write)
+        for ci in range(0, len(to_write), chunk_n):
+            if over_budget():
+                truncated_at = ci
+                budget_stopped = True
+                break
+            chunk = to_write[ci:ci + chunk_n]
+            results = tbl.upload_attachments([e["path"] for e in chunk],
+                                             concurrency=args.concurrency)
+            for ent, res in zip(chunk, results):
+                if res.get("ok") and res.get("cell"):
+                    ent["row"]["attachment"] = res["cell"]
+                    ent["attachment_status"] = "uploaded"
+                    summary["attachment_uploaded"] += 1
+                else:
+                    ent["attachment_status"] = "failed"
+                    summary["attachment_failed"] += 1
+                    ent["warnings"].append("附件上传失败：%s" % (res.get("error") or "未知错误"))
+                    warnings.append("《%s》附件上传失败（%s/%s）：%s；简历正文已照常入库，"
+                                    "可后续用「补传附件」重跑"
+                                    % (ent["file_name"], res.get("category"), res.get("code"),
+                                       str(res.get("error"))[:200]))
+                # 附件状态一确立就落盘（progress 条目；record_written 仍为 False）
+                md5 = ent["md5"]
+                if md5 and md5 not in done_md5:
+                    prog = checkpoint["progress"].setdefault(md5, {"md5": md5})
+                    prog.update({"file_name": ent["file_name"], "record_written": False,
+                                 "parse_status": ent["parse_status"],
+                                 "attachment_uploaded": ent["attachment_status"] == "uploaded",
+                                 "attachment_status": ent["attachment_status"],
+                                 "at": now_iso()})
+            _persist_checkpoint(checkpoint_path, checkpoint)
+        if truncated_at < len(to_write):
+            for ent in to_write[truncated_at:]:
+                ent["attachment_status"] = "deferred"
+                msg = ("墙钟预算（%.0fs）耗尽，附件本轮未上传；记录将先入库，"
+                       "重跑同一命令自动只补附件（不重建记录）" % budget)
+                ent["warnings"].append(msg)
+                warnings.append("《%s》%s" % (ent["file_name"], msg))
+                deferred_files.append(ent["file_name"])
+        print("附件并发上传（concurrency=%d，逐片落 checkpoint）：%d 成功 / %d 失败 / "
+              "%d 预算内未传，%dms，%d 次调用"
               % (args.concurrency, summary["attachment_uploaded"],
-                 summary["attachment_failed"], up_ms, counter.calls - calls0), flush=True)
+                 summary["attachment_failed"], len(to_write) - truncated_at,
+                 int((time.monotonic() - t0) * 1000), counter.calls - calls0), flush=True)
 
     # ------------------------------------------------------------------ #
     # 阶段 6b：补传附件（v3 §9#6）——上次 --no-attachment 或附件失败、记录已写库的文件，
@@ -821,6 +1027,14 @@ def run(args: argparse.Namespace) -> int:
                                      "并回读校验通过")
                     summary["attachment_uploaded"] += 1
                     summary["attachment_fixup_uploaded"] += 1
+                    # 补传成功即刻落盘（P3 增量 checkpoint：附件状态一确立就持久化）
+                    md5 = ent["md5"]
+                    if md5 and (checkpoint["done"] or {}).get(md5):
+                        prev = checkpoint["done"][md5]
+                        prev.update({"attachment_uploaded": True,
+                                     "attachment_status": "uploaded", "at": now_iso()})
+                        checkpoint["progress"].pop(md5, None)
+                        _persist_checkpoint(checkpoint_path, checkpoint)
                 else:
                     ent["result"] = "失败"
                     ent["attachment_status"] = "failed"
@@ -894,6 +1108,16 @@ def run(args: argparse.Namespace) -> int:
             ph = str(_clean(ent["row"]["phone"]))
             rec = (verify.get("records") or {}).get(ph)
             ent["record_id"] = rec["record_id"] if rec else None
+            # 写库状态一确认（回读到 record_id）就逐条落盘（P3 增量 checkpoint）：
+            # 之后任意瞬间被杀，重跑都能按 done 条目整条跳过 / 只补附件
+            if ent["record_id"] and ent["md5"]:
+                prev = (checkpoint["done"] or {}).get(ent["md5"]) or {}
+                checkpoint["done"][ent["md5"]] = _done_entry(
+                    ent, prev, "新入库" if ent["dedupe"] == "new" else "已覆盖")
+                if ent["md5"] not in checkpoint["done_md5"]:
+                    checkpoint["done_md5"].append(ent["md5"])
+                checkpoint["progress"].pop(ent["md5"], None)
+                _persist_checkpoint(checkpoint_path, checkpoint)
         print("回读校验：%d 条请求 / %d 条读到 / %d 处不一致 / %d 条附件缺失，"
               "轮询 %d 次，%.2fs，%d 次调用"
               % (verify.get("requested", 0), verify.get("found", 0),
@@ -951,6 +1175,8 @@ def run(args: argparse.Namespace) -> int:
             summary["overwrite"] += 1
         elif ent["result"] == "跳过":
             summary["skip"] += 1
+        elif ent["result"] == "未完成":
+            summary["pending_budget"] += 1
         else:
             summary["fail"] += 1
 
@@ -1006,8 +1232,8 @@ def run(args: argparse.Namespace) -> int:
             # 契约 D13：工作年限来源必须透传给 C2 / Turn 2
             "years_source": f.get("years_experience_source"),
         }
-        if ent["parse_status"] != "ok":
-            # 契约 D11：不硬造字段 → 一律留空
+        if ent["parse_status"] != "ok" or ent["result"] == "未完成":
+            # 契约 D11：不硬造字段 → 一律留空；「未完成」（预算内未处理）同样不给字段
             for k in ("name", "phone", "education", "school", "school_rank", "major",
                       "years_experience", "expected_position", "expected_location"):
                 cand[k] = None
@@ -1023,28 +1249,12 @@ def run(args: argparse.Namespace) -> int:
         # 同时存档派生字段（org/category/skills/expected_location），跳过重跑时恢复，
         # 保证 candidates.json 跨次运行字段完整（W-G 修复的接缝 bug）。
         # 新入库/已覆盖 → 记全新条目；补传附件路径（fix_attachment）→ 合并更新旧条目。
+        # P3：写库成功的条目在阶段 8 回读确认后已**逐条落盘**；这里是终稿重建（内容
+        # 由同一个 _done_entry 构造，两处一致），随收尾整体再写一次。
         if ent["md5"] and (ent["result"] in ("新入库", "已覆盖")
                            or (ent.get("fix_attachment") and ent["result"] in ("跳过", "失败"))):
             prev = (checkpoint["done"] or {}).get(ent["md5"]) or {}
-            checkpoint["done"][ent["md5"]] = {
-                "md5": ent["md5"],
-                "file_name": ent["file_name"],
-                "record_written": True,
-                "attachment_uploaded": ent["attachment_status"] == "uploaded",
-                "record_id": ent.get("record_id") or prev.get("record_id"),
-                "phone": cand.get("phone") or prev.get("phone"),
-                "dedupe": ent["dedupe"],
-                "result": (ent["result"] if ent["result"] in ("新入库", "已覆盖")
-                           else prev.get("result") or "已入库"),
-                "attachment_status": ent["attachment_status"],
-                "org_guess": ent.get("org_guess") or prev.get("org_guess"),
-                "org_confidence": ent.get("org_confidence") or prev.get("org_confidence"),
-                "category_guess": ent.get("category_guess") or prev.get("category_guess"),
-                "skills": list((ent.get("row") or {}).get("skills") or prev.get("skills") or []),
-                "expected_location": ((ent.get("row") or {}).get("expected_location")
-                                      or prev.get("expected_location")),
-                "at": now_iso(),
-            }
+            checkpoint["done"][ent["md5"]] = _done_entry(ent, prev, ent["result"])
             if ent["md5"] not in checkpoint["done_md5"]:
                 checkpoint["done_md5"].append(ent["md5"])
         elif ent["md5"] and ent["result"] == "跳过" and (checkpoint["done"] or {}).get(ent["md5"]):
@@ -1083,8 +1293,20 @@ def run(args: argparse.Namespace) -> int:
     # --reset 单独使用（不带 --files）时 rows 为空是**预期**结果，不算失败
     ok = fatal is None and not infra_fail and (bool(rows) or (args.reset and not files))
 
+    # ---- P3 墙钟预算：partial 语义（优雅停 + 续跑，不在脚本内循环子批）----
+    # partial=true 时报告仍 ok=true、退出码 0：预算内完成的都是真完成，未完成项
+    # 靠重跑同一命令续（checkpoint 幂等）。消费面纪律见 HOTPATH.md：见 RESUME:
+    # 就重跑同命令，最多 3 次；仍 partial 才把已完成/未完成清单报给用户。
+    pending_files = [e["file_name"] for e in entries if e["result"] == "未完成"]
+    partial_flag = bool(pending_files or deferred_files or budget_stopped)
+    args._partial = partial_flag
+
     report = {
         "ok": ok,
+        "partial": partial_flag,
+        "wall_budget_s": budget,
+        "pending_files": pending_files,
+        "deferred_attachment_files": deferred_files,
         "elapsed_ms": elapsed_ms,
         "dws_calls": dws_calls,
         "turns_saved_estimate": turns_saved,
@@ -1124,7 +1346,8 @@ def run(args: argparse.Namespace) -> int:
     print("", flush=True)
     print("── 简历入库结果 ──────────────", flush=True)
     print("序号 | 文件名 | 处理结果 | 说明", flush=True)
-    icon = {"新入库": "✅ 新入库", "已覆盖": "✅ 已覆盖", "跳过": "⏭️ 跳过", "失败": "❌ 失败"}
+    icon = {"新入库": "✅ 新入库", "已覆盖": "✅ 已覆盖", "跳过": "⏭️ 跳过",
+            "失败": "❌ 失败", "未完成": "⏸ 未完成"}
     for r in rows:
         print("%d | %s | %s | %s" % (r["seq"], r["file_name"],
                                      icon.get(r["result"], r["result"]), r["reason"]), flush=True)
@@ -1132,6 +1355,9 @@ def run(args: argparse.Namespace) -> int:
     print("小计：新入库 %d | 覆盖 %d | 跳过 %d | 失败 %d | 附件已传 %d | 附件失败 %d"
           % (summary["new"], summary["overwrite"], summary["skip"], summary["fail"],
              summary["attachment_uploaded"], summary["attachment_failed"]), flush=True)
+    if summary["pending_budget"]:
+        print("其中墙钟预算内未完成：%d 份（重跑同一命令续跑，checkpoint 幂等）"
+              % summary["pending_budget"], flush=True)
     if fixups:
         print("其中补传附件（记录未重建，v3 §9#6）：成功 %d | 失败 %d"
               % (summary["attachment_fixup_uploaded"], summary["attachment_fixup_failed"]),
@@ -1144,6 +1370,15 @@ def run(args: argparse.Namespace) -> int:
         print("warnings %d 条（前 8 条）：" % len(warnings), flush=True)
         for w in warnings[:8]:
             print("  - %s" % w[:220], flush=True)
+    if partial_flag:
+        print("⏸ partial=true：墙钟预算 %.0fs 内未完成 %d 份、附件欠传 %d 份；"
+              "checkpoint 已逐条落盘，重跑同一命令续跑（幂等，不产生重复记录）"
+              % (budget, len(pending_files), len(deferred_files)), flush=True)
+        for nm in pending_files:
+            print("  未完成: %s" % nm, flush=True)
+        for nm in deferred_files:
+            print("  附件欠传: %s" % nm, flush=True)
+        print("RESUME: %s" % _resume_cmd(), flush=True)
     if fatal:
         print("FATAL: %s" % fatal, flush=True)
     print("candidates → %s" % candidates_path, flush=True)
@@ -1168,6 +1403,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="跳过附件上传（老插件「方案C·延后」，之后可补传）")
     ap.add_argument("--reset", action="store_true",
                     help="先清空 resume 表全部记录（仅供重复性能测量；生产 base 严禁使用）")
+    ap.add_argument("--wall-budget", type=float, default=WALL_BUDGET_DEFAULT,
+                    help="墙钟预算秒数（默认 %.0f，必须小于 agent 工具 120s 超时）。"
+                         "到点 graceful 停：checkpoint 逐条落盘、打印已完成/未完成清单与"
+                         "一行 RESUME: 提示、退出码 0、报告 ok=true 且 partial=true；"
+                         "续跑 = 重跑同一条命令（checkpoint 幂等，不产生重复记录）"
+                         % WALL_BUDGET_DEFAULT)
     # ---- W-I 性能优化 O2（W-J 移植）：合并入口（入库 + 生成判定输入 一次调用做完，省一个 agent 回合）----
     # 只加这三个参数；岗位预筛/字段裁剪（O4）默认全开、由 build_match_input 内部控制，
     # O4-c（--emit-stdout）实测负收益**不移植** → 判定输入一律走 SHARD: 路径 Read 分片文件。
@@ -1206,6 +1447,12 @@ def auto_match(args: argparse.Namespace, intake_rc: int) -> int:
         print("== auto-match 跳过 ==", flush=True)
         print("入库未成功（退出码 %d）→ 不生成判定输入。请先按入库报告修正后重跑入库"
               "（checkpoint 幂等，已成功项不会重放）。" % intake_rc, file=sys.stderr, flush=True)
+        return intake_rc
+    if getattr(args, "_partial", False):
+        print("== auto-match 跳过 ==", flush=True)
+        print("本批 partial=true（墙钟预算内有未完成/附件欠传项）→ 先按 RESUME 提示重跑"
+              "同一命令补齐，再单独跑 build_match_input.py 生成判定输入。",
+              file=sys.stderr, flush=True)
         return intake_rc
     if not args.out_dir:
         print("== auto-match 跳过 ==", flush=True)
@@ -1254,6 +1501,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(list(argv) if argv is not None else None)
     if not args.files and not args.reset:
         print("错误：--files 至少要给一个文件（或单独用 --reset 清表）", file=sys.stderr)
+        return 2
+    if args.wall_budget <= 0:
+        print("错误：--wall-budget 必须是正秒数（默认 %.0f，须小于 agent 工具 120s 超时）"
+              % WALL_BUDGET_DEFAULT, file=sys.stderr)
         return 2
     if not Path(args.config).expanduser().exists():
         print("错误：--config 不存在：%s" % args.config, file=sys.stderr)

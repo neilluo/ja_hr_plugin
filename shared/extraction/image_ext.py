@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""图片梯队：无文本层可提，直接终态（契约 D11：本期不做 OCR，不硬造字段，
-进 ❌ 清单建议提供文字版）。status=no_text_layer, backend=none。
+"""图片梯队：无文本层可提，返回非 ok 结果让 chain 落下一级。
 
-P3 的 VisionOcrExt 落地前，本梯队是图片的唯一去处；它返回非 ok 结果，
-chain 耗尽后的终态与旧实现逐字段一致（text="" / pages=None / warning=固定文案）。
+P3 起 macOS 上图片会继续落到 VisionOcrExt（注册序在 JxaExt 之后、本梯队之前，
+见 extract_text._CHAIN）自动 OCR 救回；本梯队是 OCR 不可用（非 darwin）或
+OCR 文本不可信时的最后一级，其 no_text_layer 结果决定 chain 耗尽终态
+（text="" / backend=none），门面据此如实报「无法解析」（D11 不硬造字段）。
 """
 
 from __future__ import annotations
@@ -20,5 +21,5 @@ class ImageExt(TextExtractor):
 
     def extract(self, doc: ResumeDocument) -> ExtractionResult:
         return ExtractionResult("", None, "no_text_layer", "none", [
-            "图片文件无文本层可提取（本期不做 OCR）。"
-            "建议候选人提供 word/pdf 文字版简历。"])
+            "图片文件无文本层可提取，且本机 OCR 未能救回（非 macOS 无 Vision OCR "
+            "梯队，或 OCR 文本未通过可信护栏）。建议候选人提供 word/pdf 文字版简历。"])

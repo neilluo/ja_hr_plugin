@@ -46,9 +46,17 @@ python3 <PLUGIN>/skills/resume-intake/scripts/intake_resume.py \
 - `--files` **一次全给**，不要分多次调用。
 - `--auto-match`：入库成功后同进程接着生成定向匹配判定输入（省一个编排回合）。
   digest 默认落在 `<out-dir>/../match`；要换位置加 `--match-out-dir <目录>`。
+  本批 partial（见下）时 auto-match 会自动跳过，先续跑补齐再单独跑 build_match_input。
+- `--wall-budget <秒>`（默认 100，勿超过 agent 工具 120s 超时）：墙钟预算。到点脚本
+  **graceful 停**：checkpoint 逐条落盘、打印已完成/未完成清单与一行 `RESUME:`、
+  退出码 0、报告 `ok=true` 且 `partial=true`。
 - 用户明确说"先不传附件" → 加 `--no-attachment`；之后"补传附件" = **重跑同一条命令去掉该参数**
-  （`checkpoint.json` 幂等，已入库的不重放）。用户说"从头重来"才加 `--reset`。
-- 脚本内部完成（**你一件都不用自己做**）：提取文本 → 正则预抽字段 → 库内附件「文件名+字节大小」比对 →
+  （`checkpoint.json` 幂等，已入库的不重放；checkpoint 是**增量落盘**的——每份文件的
+  「记录已写」「附件已传」状态一确立就写盘，中途被杀也不丢已完成进度）。
+  用户说"从头重来"才加 `--reset`。
+- 脚本内部完成（**你一件都不用自己做**）：提取文本（**macOS 上扫描件/图片简历自动走系统
+  Vision OCR 救回**，零依赖、纯本地不出网，多份并行 ≤4；首次运行可能弹 macOS 授权弹窗，
+  请用户点允许）→ 正则预抽字段 → 库内附件「文件名+字节大小」比对 →
   一次批量手机号查重 → 批量写简历库（≤100 条/次，命中即覆盖更新）→ 技能标签**只增不删**补选项 →
   期望地点兜底「不限」→ 原始文件名并发上传附件（并发 5）→ 写后回读 →
   生成 digest.json + 分片，并打印 `SHARD:<分片文件绝对路径>`。
@@ -56,14 +64,22 @@ python3 <PLUGIN>/skills/resume-intake/scripts/intake_resume.py \
 **凭证校验（必做，防静默早退）**：stdout 会有两行 `ARTIFACT:` —— 第一行是
 `intake_report.json`，第二行是 `digest.json`。规则：
 
+- stdout 有 `RESUME:` 行（= 报告 `partial=true`，墙钟预算耗尽）→ **重跑同一条命令续跑**
+  （checkpoint 幂等，不产生重复记录），**最多 3 次**；仍 partial → 把已完成/未完成清单
+  如实报给用户。partial 时不会有 `SHARD:` 行，属预期，别当故障。
 - stdout 同时有「── 简历入库结果 ──」清单 + `digest:` / `分片:` 摘要 + `SHARD:` 行 →
   **两件事都成了**。入库清单直接在 stdout 里读，**不要**再去 Read `intake_report.json`
   或 `candidates.json`（stdout 已经给了逐行结果与小计）。
-- 有入库清单但没有 `SHARD:` 行 → 入库成了、判定输入没生成：单独补跑
+- 有入库清单但没有 `SHARD:` 行（且没有 `RESUME:` 行）→ 入库成了、判定输入没生成：单独补跑
   `python3 <PLUGIN>/skills/match-verify/scripts/build_match_input.py --config <CFG>
   --candidates <out-dir>/candidates.json --out-dir <out-dir>/../match --max-per-batch 8`。
 - 入库清单显示失败 / 脚本异常 / 没有 `ARTIFACT:` 行 → **重跑同一条命令**（幂等续跑），
   最多 2 次；仍失败 → 如实告知失败原因与已完成部分，**禁止跳过或假装成功**。
+- 失败清单语义（P3 起收窄）：macOS 上扫描件/图片会自动 OCR 入库，❌ 失败只剩
+  **加密 / 损坏 / OCR 不可信**（OCR 文本仍是水印/重复串/无数字字符）三种情况；
+  非 macOS 机器扫描件/图片仍如实报 `no_text_layer`（跨平台 OCR 兜底在后续版本规划中，
+  当前未实现，别向用户声称有）。OCR 救回的简历带「OCR 文本可能有小误读」警告，
+  姓名/手机号等关键字段的人工确认警告必须照转。
 
 > 注：判定输入**不会**打在 stdout 上（qodercli 会在约 30 KB 处静默切断 Bash 输出，
 > 半截 JSON 比不给更危险）。一律按 `SHARD:` 路径 Read 分片文件。
@@ -126,8 +142,10 @@ Read `SHARD:` 指向的 `digest_batch_NN.json`。单片场景就是**一次 Read
    （组织是匹配的前提：简历组织必须等于岗位组织，否则匹配不到任何岗位。）
 6. **不进判定、必须先停下问用户**：`dedupe=="conflict"`（手机号相同但姓名不同 = 疑似重名/错录）
    → 停止该候选人后续流程，业务话请用户确认，**不自动选第一条**。
-   `parse_status != "ok"`（扫描件 `no_text_layer` / 加密 / 乱码）→ 如实进 ❌ 清单，
-   写"无法解析（扫描件/加密/乱码），请提供文字版"，**绝不硬造字段**。
+   `parse_status != "ok"`（`no_text_layer` / 加密 / 乱码）→ 如实进 ❌ 清单，
+   写"无法解析，请提供文字版"，**绝不硬造字段**。注意 P3 起 macOS 上扫描件/图片已被
+   自动 OCR 救回（parse_status=ok，backend=vision_ocr，带「OCR 可能有小误读」警告——
+   警告必须照转）；仍报 `no_text_layer` 的只剩非 macOS 机器或 OCR 文本不可信的文件。
    沟通状态=已入职 → 终止态，不参与匹配（长期规则，无需逐次确认）。
 7. **不输出任何分数**：`skill_score` / `bonus_score` / `total` 一律不写。
    分数与最终推荐状态由回合 3 脚本重算（它会校验 `skill_hits ⊆ must_skills`、
@@ -205,9 +223,10 @@ python3 <PLUGIN>/skills/match-verify/scripts/apply_decisions.py --config <CFG> \
 1 | 【暖通主管_曲靖】石昊.pdf | ✅ 新入库 | 制造中心·技术类，附件已传
 2 | 胡裕_14年.pdf | ✅ 已覆盖 | 手机号已存在，用最新简历覆盖更新
 3 | 张三.pdf | ⏭️ 跳过 | 与系统内已有附件完全相同（重复上传）
-4 | 扫描件.pdf | ❌ 失败 | 无法解析（扫描件），请提供文字版
+4 | 扫描件.png | ✅ 新入库 | macOS Vision OCR 救回入库；OCR 文本可能有小误读，姓名请人工确认
+5 | 加密件.pdf | ❌ 失败 | 无法解析（加密），请提供未加密文字版
 ────────────────────────
-小计：新入库 1 | 覆盖 1 | 跳过 1 | 失败 1 | 附件已传 2 | 附件失败 0
+小计：新入库 2 | 覆盖 1 | 跳过 1 | 失败 1 | 附件已传 3 | 附件失败 0
 待关注：李四（手机号与库内"王芳"相同，请确认是否同一人）
 
 审阅备注：低置信组织复核结论 + 估算年限的原文复核结论（写清依据）

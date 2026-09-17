@@ -61,6 +61,8 @@ class PypdfExt(TextExtractor):
                 ["pypdf 失败(%s: %s)" % (type(e).__name__, e)])
         if nws(text):
             return ExtractionResult(text, npages, "ok", "pypdf")
+        # npages 如实上报（P1 评审裁决①）：文本层是空的但页数已解析出来，
+        # chain 会在终态/赢家里保留首个非零 npages，扫描件不再丢页数
         return ExtractionResult(
-            "", 0, "no_text_layer", "none",
+            "", npages, "no_text_layer", "none",
             ["pypdf 提取到 0 个非空白字符（可能无文本层）"])

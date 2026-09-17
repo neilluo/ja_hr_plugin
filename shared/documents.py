@@ -146,6 +146,9 @@ class ResumeDocument:
     size: int
     md5: str
     _data: Optional[bytes] = field(default=None, repr=False, compare=False)
+    # chain 在逐级询问 can_handle 前把「已走过的梯队结果」挂在这里（同一 list 对象，
+    # 边跑边 append）；VisionOcrExt 等后置梯队靠它判断"前序全部没拿到可用文本"。
+    prior: List[Any] = field(default_factory=list, repr=False, compare=False)
 
     @classmethod
     def inspect(cls, path: Path, size: int, md5: str) -> "ResumeDocument":

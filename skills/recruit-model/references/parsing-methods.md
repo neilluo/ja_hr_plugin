@@ -10,20 +10,29 @@
 |---|---|---|
 | .docx | 标准库 zipfile 读 `word/document.xml`，按 `w:p` 段落拼接 `w:t`（表格版简历只取 `w:t` 会丢换行） | 报错转人工 |
 | .doc（含 WPS 生成的复合文档） | vendor 的 olefile 读 `WordDocument` 流，fcMin/fcMac 偏移 0x18/0x1C（little-endian uint32），UTF-16-LE 解码并清洗控制符 | 报错转人工 |
-| .pdf | **vendor pypdf → macOS JXA/PDFKit → 报错转人工**（D9 梯队）。禁止依赖 pdfplumber（其依赖链含 cryptography 二进制 wheel，客户机最容易装挂） | 无文本层 → `no_text_layer` |
-| 图片/其它 | 不支持 | `unsupported` |
+| .pdf | **vendor pypdf → macOS JXA/PDFKit → macOS Vision OCR（扫描件救回，见下）→ 报错转人工**（D9 梯队 + P3 Tier 1.5）。禁止依赖 pdfplumber（其依赖链含 cryptography 二进制 wheel，客户机最容易装挂） | 无文本层且 OCR 不可用/不可信 → `no_text_layer` |
+| 图片（png/jpg 等） | **macOS 上自动 Vision OCR 入库**（P3，见下）；非 macOS 无文本层可提 | `no_text_layer`（跨平台 OCR 兜底在后续版本规划中，当前未实现） |
+
+## Vision OCR 梯队（P3，仅 macOS，backend=vision_ocr）
+
+- 机制：系统自带 `osascript -l JavaScript`（JXA）调 Vision framework 的 `VNRecognizeTextRequest`（Accurate 档，zh-Hans/zh-Hant/en-US，语言纠错开）。PDF 逐页 2x 缩放渲染后 OCR；图片直接 OCR。**零 pip 依赖、零联网、零 API key**，简历不出机器。实现在 `shared/extraction/vision_ext.py`。
+- 触发条件：darwin 且（图片 或 前序文本层梯队全部没拿到可用文本）。**「拿到文本但护栏判定是水印/扫描件」的假 ok 也会被 chain 的 gate（`detect_scanned`）降级后落到本梯队**——这是扫描件 PDF（pypdf 能提出水印字符）能被救回的关键。
+- OCR 结果**必须再过护栏**，不可信判 `no_text_layer` 而非假成功：①数字字符数为 0 直接不可信（简历几乎必含手机号/年份）；②`detect_scanned` 同款水印/重复串判定。实测 3 份失败件（1 png + 2 扫描 PDF）全救回、手机号 3/3、学历/学校/专业 3/3、姓名 2/3（png 那份姓名误抓但自动带「请人工确认」警告）。
+- 性能：单份 1.16~1.58s；入库脚本提取阶段并发 ≤4（实测 3 份并行 1.764s vs 串行 3.810s）。
+- **TCC 授权**：首次运行 osascript 读 ~/Desktop、~/Documents、iCloud 目录文件时 macOS 可能弹授权弹窗，需用户点一次允许（对已授权终端一般不弹）。弹窗挂起时梯队按 60s 超时转失败，重跑即可。
+- notes/warning 会带 OCR 置信度摘要（行数、mean/min 置信度、低置信行数）与「OCR 文本可能有小误读」标记，agent 转述时保留。
 
 ## 提取状态（parse_status）与 agent 的业务话
 
 | 状态 | 含义 | agent 必须怎么做 |
 |---|---|---|
-| `ok` | 提取成功 | 正常进判定 |
-| `no_text_layer` | 扫描件/图片型 PDF，无文字层（实测约 3/31 ≈ 10%） | 进 ❌ 清单：如实告知"该文件是扫描件，无法解析，请提供文字版简历"，**不硬造任何字段**（D11）；OCR 不在本期范围 |
+| `ok` | 提取成功（含 macOS Vision OCR 救回的扫描件/图片，backend=vision_ocr） | 正常进判定；OCR 救回件的「可能有小误读」与人工确认警告照转 |
+| `no_text_layer` | 无文字层且 OCR 未能救回：非 macOS 机器，或 OCR 文本不可信（仍是水印/重复串/0 数字字符） | 进 ❌ 清单：如实告知"无法解析，请提供文字版简历"，**不硬造任何字段**（D11） |
 | `garbled` | 提取出文本但乱码 | 同上，建议重新导出标准 Word/PDF |
 | `encrypted` | WPS/Office 加密 | 告知"文件被加密，请提供未加密版本"，不猜测内容 |
 | `unsupported` / `error` | 格式不支持/读取失败 | 如实告知格式与失败原因 |
 
-判定扫描件：字符数阈值 + 水印串重复占比（`detect_scanned`）。提不出来就停，**绝不猜测编造**。
+P3 起失败清单语义收窄为「**仅加密/损坏/OCR 不可信才失败**」（macOS 上）。判定扫描件：字符数阈值 + 水印串重复占比 + 数字字符数（`detect_scanned`）。提不出来就停，**绝不猜测编造**。
 
 ## 字段预抽（正则，脚本完成）
 

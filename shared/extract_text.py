@@ -14,7 +14,7 @@ pypdf / typing_extensions，见 `shared/vendor/VENDOR_MANIFEST.txt`）。
         {"path": str, "kind": "pdf|docx|doc|image|unknown",
          "text": str, "chars": int, "elapsed_ms": int,
          "status": "ok|no_text_layer|garbled|encrypted|unsupported|error",
-         "backend": "pypdf|pdfkit_jxa|stdlib_zip|ole_stdlib|ole_vendored|none",
+         "backend": "pypdf|pdfkit_jxa|vision_ocr|stdlib_zip|ole_stdlib|ole_vendored|none",
          "md5": str, "size": int, "error": str | None}
     detect_scanned(text: str, kind: str) -> bool
 
@@ -39,14 +39,24 @@ ExtractionResult / kind 嗅探）在 `shared/documents.py`；具体提取实现�
               都失败 -> status=error；**禁止** pdfplumber（依赖链含二进制 wheel）
     .docx  -> DocxZipExt  stdlib zipfile + 正则             backend=stdlib_zip
     .doc   -> DocPieceExt OLE2/CFB + MS-DOC piece table     backend=ole_vendored/ole_stdlib
-    图片    -> ImageExt    无文本层可提，status=no_text_layer, backend=none
-              （契约 D11：本期不做 OCR，不硬造字段，进 ❌ 清单建议提供文字版）
+    扫描件/图片 -> VisionOcrExt（Tier 1.5，P3，仅 darwin）   backend=vision_ocr
+              macOS 自带 Vision framework 走 osascript/JXA，零 pip 依赖。
+              图片直接受理；PDF 仅当 pypdf/JXA 都没拿到可用文本（含「提出文本但
+              被 detect_scanned 判成水印/扫描件」的 gate 降级）才受理。
+              OCR 文本必须再过 detect_scanned + 「数字字符数>0」护栏，不可信判
+              no_text_layer，绝不当假成功（B1：markitdown 的水印噪声曾骗过护栏）。
+              非 darwin 无此梯队 -> ImageExt/no_text_layer 如实告知；跨平台
+              agent 多模态兜底是后续阶段的事，本文件不声称已实现。
+    图片（OCR 不可用/不可信时的终态）-> ImageExt  status=no_text_layer, backend=none
+              （契约 D11：不硬造字段，进 ❌ 清单建议提供文字版）
     unknown（纯文本兜底）-> 仍由本文件 _plain_text 处理，不进链
 
 ExtractorChain 按注册顺序问 can_handle，第一个 extract 返回 status=="ok" 的
-梯队赢；走过的每一级记录进 notes（backend 链路可追溯）。加梯队 = 加一个类 +
-_CHAIN 注册一行（P3 的 Vision OCR 即按此接入）。各梯队的标定结论与护栏阈值
-依据在对应模块 docstring。
+梯队赢；走过的每一级记录进 notes（backend 链路可追溯）。P3 起 run() 额外接受
+gate（本门面传 detect_scanned）：ok 结果若被 gate 判为水印/扫描件文本会降级
+落下一级；npages 在所有梯队里保留首个非零值（P1 评审裁决①：扫描件不再丢页数）。
+加梯队 = 加一个类 + _CHAIN 注册一行。各梯队的标定结论与护栏阈值依据在对应模块
+docstring。
 
 兼容性
 ------
@@ -73,6 +83,7 @@ from extraction.docx_zip_ext import DocxZipExt
 from extraction.image_ext import ImageExt
 from extraction.jxa_ext import JxaExt
 from extraction.pypdf_ext import PypdfExt
+from extraction.vision_ext import VisionOcrExt
 
 __all__ = [
     "extract_text",
@@ -84,9 +95,11 @@ __all__ = [
 
 # --------------------------------------------------------------------------- #
 # 提取责任链（注册顺序 = 梯队顺序；加梯队 = 加一个类 + 这里加一行）
+# VisionOcrExt = Tier 1.5（P3）：仅 darwin，只接「图片」与「前序文本层梯队全部
+# 没拿到可用文本的 PDF」；OCR 文本仍要过 detect_scanned + 数字字符数护栏。
 # --------------------------------------------------------------------------- #
-_CHAIN = ExtractorChain([PypdfExt(), JxaExt(), DocxZipExt(), DocPieceExt(),
-                         ImageExt()])
+_CHAIN = ExtractorChain([PypdfExt(), JxaExt(), VisionOcrExt(),
+                         DocxZipExt(), DocPieceExt(), ImageExt()])
 
 
 # --------------------------------------------------------------------------- #
@@ -214,10 +227,12 @@ def detect_scanned(text: str, kind: str) -> bool:
             实测最短的有效简历（周彦淇 966 字符）数字也有 29 个，
             而 3 份扫描件数字都是 0 个。
 
-    kind == "image" 时直接返回 True：图片没有文本层可提，按契约 D11 归为
-    no_text_layer（本期不做 OCR）。
+    kind == "image" 且文本为空时直接返回 True：图片没有文本层可提。
+    P3 起图片可能被 Vision OCR 救回（backend=vision_ocr）——**有文本的图片不再
+    一票判死**，改走与 pdf 相同的内容判据（字符数/数字字符数/重复度/水印词）：
+    OCR 文本若仍是水印/重复串/数字极少，照样判 True（防静默假成功，B1 教训）。
     """
-    if kind == "image":
+    if kind == "image" and not _nws(text):
         return True
     body = _nws(text)
     n = len(body)
@@ -372,16 +387,19 @@ def extract_text(path: str) -> Dict[str, Any]:
                 error = ("不支持的扩展名 %r（魔数前 8 字节 %s）；契约 kind 枚举只覆盖 "
                          "pdf/docx/doc/image" % (ext or "(无)", doc.head[:8].hex()))
         else:
-            _res = _CHAIN.run(doc)
+            # gate=detect_scanned（P3）：梯队返回 ok 但文本层被判「扫描件只剩水印/
+            # 重复串」时降级落下一级——没有这一层，pypdf 提出 671 字符水印就赢了，
+            # Vision OCR 永远接不到手。护栏本身与门面阶段 2 用同一个函数，口径一致。
+            _res = _CHAIN.run(doc, gate=detect_scanned)
             text, backend, pages, docmeta = (
                 _res.text, _res.backend, _res.npages, _res.meta)
             if _res.notes:
                 warning = "; ".join(_res.notes)
             if _res.status != "ok":
                 hard_status = _res.status
-                # chain 耗尽且全梯队 error 才会走到这里；P1 里只有 pdf 双梯队可达
+                # chain 耗尽且全梯队 error 才会走到这里（P3 起 pdf 含 Vision OCR 梯队）
                 if _res.status == "error" and kind == "pdf":
-                    error = "PDF 两条梯队都失败: %s" % ("; ".join(_res.notes) or "无文本")
+                    error = "PDF 全部梯队都失败: %s" % ("; ".join(_res.notes) or "无文本")
     except PermissionError as e:
         hard_status = "encrypted"
         error = str(e)
@@ -425,7 +443,8 @@ def extract_text(path: str) -> Dict[str, Any]:
         status = "no_text_layer"
         warning = ((warning + "; ") if warning else "") + (
             "疑似扫描件：非空白字符 %d、数字字符仅 %d 个、唯一字符占比 %.3f"
-            "（水印/重复串占比高）。建议提供文字版，本期不做 OCR。"
+            "（水印/重复串占比高）。建议提供文字版；macOS 上扫描件/图片会先经"
+            " Vision OCR 梯队救回，走到本判定说明 OCR 不可用或 OCR 文本不可信。"
             % (checks["chars"], checks["digits"], checks["unique_ratio"]))
     else:
         status = "ok"
