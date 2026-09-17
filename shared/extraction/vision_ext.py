@@ -26,6 +26,7 @@ TCC：osascript 首次读 ~/Desktop、~/Documents、iCloud 下的文件可能触
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -166,6 +167,12 @@ class VisionOcrExt(TextExtractor):
     """
 
     def can_handle(self, doc: ResumeDocument) -> bool:
+        # RECRUIT_NO_VISION（P4，仅测试用）：置位时本梯队恒不受理，用来在 darwin
+        # 上模拟「非 macOS / Vision 失败或不可信」，验证 agent 多模态兜底通道
+        # （needs_agent_vision → VISION_NEEDED → --apply-vision-patch）。
+        # 默认不置位，行为与 P3 完全一致。
+        if os.environ.get("RECRUIT_NO_VISION"):
+            return False
         if sys.platform != "darwin":
             return False
         if doc.kind == FileKind.IMAGE:

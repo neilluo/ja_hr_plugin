@@ -132,7 +132,7 @@
 - JD 查重：**岗位名称 + 所属部门 + 组织分类** 三者全同才算重复（不同组织下的同名同部门岗视为不同岗位、各自新建）。命中 → 覆盖更新；不同 → 新建。
 - 附件查重：键是**文件名 + 字节大小**（**不是**内容级 MD5）。库内已有同名同大小附件 → 判定重复上传，跳过并告知"库内已存在同名同大小的简历附件（文件名+字节大小 比对命中）"。真 MD5 只用于本批内部去重与 checkpoint 幂等续跑。
 - 幂等续跑：intake 脚本落 `checkpoint.json`（已成功文件的**真 MD5** 列表），重跑跳过已成功项、不重放（D12）；`--reset` 显式清空断点重来。P3 起 checkpoint **增量落盘**（「记录已写」「附件已传」各自一确立就原子写盘，version=2 带 progress 段；读不懂视为空并告警不崩溃），并新增 `--wall-budget <秒>`（默认 100 < 工具 120s 超时）：到点 graceful 停、报告 `partial=true` 并打印一行 `RESUME:`，重跑同一命令续跑（见 execution-notes「幂等与续跑」）。
-- 扫描件/图片简历：macOS 上由提取层自动走系统 Vision OCR 入库（backend=vision_ocr，零依赖纯本地；首次可能弹 macOS 授权弹窗）；失败清单语义为「仅加密/损坏/OCR 不可信才失败」。非 macOS 如实报 no_text_layer（跨平台兜底后续版本规划，未实现）。细节见 parsing-methods.md。
+- 扫描件/图片简历：macOS 上由提取层自动走系统 Vision OCR 入库（backend=vision_ocr，零依赖纯本地；首次可能弹 macOS 授权弹窗）。**P4a 起 OCR 不可用/不可信（非 macOS 等）不再判死**：转 agent 多模态兜底——脚本打印 `VISION_NEEDED:` 清单，agent 一轮读完写补丁 json，重跑加 `--apply-vision-patch`（backend=agent_vision，草稿字段 field_source=agent_vision 进 needs_review；agent 绝不写库）；读不出份数 >20% 触发闸门（不写任何记录，reason=vision_gate，请用户确认整批格式问题）。失败清单语义为「仅加密/损坏/补丁未覆盖才失败」。细节见 parsing-methods.md 与 resume-intake/HOTPATH.md。
 
 ## 9. 不依赖的表格能力（D1/D2，与老版的关键差异）
 

@@ -50,6 +50,32 @@ python3 <PLUGIN>/skills/resume-intake/scripts/intake_resume.py \
 - `--wall-budget <秒>`（默认 100，勿超过 agent 工具 120s 超时）：墙钟预算。到点脚本
   **graceful 停**：checkpoint 逐条落盘、打印已完成/未完成清单与一行 `RESUME:`、
   退出码 0、报告 `ok=true` 且 `partial=true`。
+- **agent 多模态兜底协议（P4a，跨平台扫描件/图片的最后一线）**：stdout 出现一行
+  `VISION_NEEDED: <绝对路径1> <绝对路径2> ...`（= 有文件本机读不出文字，
+  `parse_status=needs_agent_vision`，清单同时进报告 `vision_needed_files`）→
+  你在**一轮**里用多模态能力 Read 完列出的**全部**文件，把每份的文字与关键字段誊出来，
+  用 Write 按下面 schema 写出补丁 json，然后**重跑同一条命令**加
+  `--apply-vision-patch <补丁json绝对路径>`（checkpoint 幂等，已入库项不重放）：
+
+  ```json
+  {"<文件绝对路径>": {"text": "...", "fields_draft": {"name": "...", "phone": "...", ...},
+                       "confidence": 0.0, "notes": "..."}}
+  ```
+
+  - `text` = 你读出的简历全文（**必填**，脚本用它跑正则抽字段并写入简历全文）；
+    `fields_draft` = 字段草稿，**只填你从图里确凿读出的字段，可以留空**——脚本先对
+    `text` 跑正则，**regex 有值的字段用 regex，regex 为空才取 fields_draft**；
+    `confidence`（0~1）与 `notes` 可选，会原样记进该候选人的 warnings。
+  - **agent 只产出结构化补丁，绝不写库、禁止逐条敲 dws 写表**；入库仍由脚本走正常
+    查重/护栏/回读流程。凡取自 `fields_draft` 的字段会被打 `field_source="agent_vision"`
+    并追加进该候选人 `needs_review`，回合 2 **必须**用 evidence 原文复核后照转。
+  - **20% 闸门（用户拍板）**：读不出的份数超过本批 20% 时脚本**不写任何记录**，stdout
+    提示「本批 X/Y 份读不出文字，超过 20% 阈值，疑似整批格式问题，请确认后重试或提供
+    文字版」并列出名单，退出码 0、报告 `ok=true`、`partial=true`、`reason="vision_gate"`。
+    此时**不要**走补丁协议——把这段业务话如实转给用户确认（疑似整批格式问题），
+    用户确认后再重跑 / 打补丁 / 换文字版。
+  - `RECRUIT_NO_VISION=1` 是**仅测试用**环境变量（关掉本机 Vision OCR 演练本通道），
+    生产流程绝不设置。
 - 用户明确说"先不传附件" → 加 `--no-attachment`；之后"补传附件" = **重跑同一条命令去掉该参数**
   （`checkpoint.json` 幂等，已入库的不重放；checkpoint 是**增量落盘**的——每份文件的
   「记录已写」「附件已传」状态一确立就写盘，中途被杀也不丢已完成进度）。
@@ -64,9 +90,13 @@ python3 <PLUGIN>/skills/resume-intake/scripts/intake_resume.py \
 **凭证校验（必做，防静默早退）**：stdout 会有两行 `ARTIFACT:` —— 第一行是
 `intake_report.json`，第二行是 `digest.json`。规则：
 
-- stdout 有 `RESUME:` 行（= 报告 `partial=true`，墙钟预算耗尽）→ **重跑同一条命令续跑**
-  （checkpoint 幂等，不产生重复记录），**最多 3 次**；仍 partial → 把已完成/未完成清单
-  如实报给用户。partial 时不会有 `SHARD:` 行，属预期，别当故障。
+- stdout 有 `RESUME:` 行（= 报告 `partial=true`，墙钟预算耗尽或 20% 闸门触发）→
+  预算耗尽：**重跑同一条命令续跑**（checkpoint 幂等，不产生重复记录），**最多 3 次**；
+  仍 partial → 把已完成/未完成清单如实报给用户。闸门触发（报告 `reason="vision_gate"`）：
+  不重跑、不打补丁，先把「疑似整批格式问题」业务话报给用户确认。
+  partial 时不会有 `SHARD:` 行，属预期，别当故障。
+- stdout 有 `VISION_NEEDED:` 行（且没有闸门提示）→ 走上面的 **agent 多模态兜底协议**：
+  一轮读完全部列出文件 → Write 补丁 json → 重跑同命令加 `--apply-vision-patch`。
 - stdout 同时有「── 简历入库结果 ──」清单 + `digest:` / `分片:` 摘要 + `SHARD:` 行 →
   **两件事都成了**。入库清单直接在 stdout 里读，**不要**再去 Read `intake_report.json`
   或 `candidates.json`（stdout 已经给了逐行结果与小计）。
@@ -75,10 +105,10 @@ python3 <PLUGIN>/skills/resume-intake/scripts/intake_resume.py \
   --candidates <out-dir>/candidates.json --out-dir <out-dir>/../match --max-per-batch 8`。
 - 入库清单显示失败 / 脚本异常 / 没有 `ARTIFACT:` 行 → **重跑同一条命令**（幂等续跑），
   最多 2 次；仍失败 → 如实告知失败原因与已完成部分，**禁止跳过或假装成功**。
-- 失败清单语义（P3 起收窄）：macOS 上扫描件/图片会自动 OCR 入库，❌ 失败只剩
-  **加密 / 损坏 / OCR 不可信**（OCR 文本仍是水印/重复串/无数字字符）三种情况；
-  非 macOS 机器扫描件/图片仍如实报 `no_text_layer`（跨平台 OCR 兜底在后续版本规划中，
-  当前未实现，别向用户声称有）。OCR 救回的简历带「OCR 文本可能有小误读」警告，
+- 失败清单语义（P4a 起再收窄）：macOS 上扫描件/图片自动 OCR 入库；非 macOS 或 OCR
+  不可信的文件**不再直接判死**，转 agent 多模态兜底（见上面的 `VISION_NEEDED:` 协议）。
+  ❌ 失败只剩 **加密 / 损坏 / 补丁未覆盖或补丁后仍读不出手机号**（`needs_agent_vision`
+  如实报，不硬造字段）。OCR/补丁救回的简历带「文本可能有小误读」类警告，
   姓名/手机号等关键字段的人工确认警告必须照转。
 
 > 注：判定输入**不会**打在 stdout 上（qodercli 会在约 30 KB 处静默切断 Bash 输出，
@@ -133,6 +163,9 @@ Read `SHARD:` 指向的 `digest_batch_NN.json`。单片场景就是**一次 Read
    `candidate_overrides.years_experience`，复核依据写进该人各条目的 `evidence`。
    原文实在支撑不了 → **不拿估算值当年限否决依据**，该岗从宽记「待定」，
    并在 evidence 注明"年限无法从原文确认"。
+   `needs_review` 含**字段名**（如 `"phone"`、`"school"`，来自 agent 多模态兜底补丁的
+   `field_source="agent_vision"` 字段）→ 同样必须用 evidence 原文逐个复核，发现误读在
+   `candidate_overrides` 里回填修正值，并把「该字段来自图片识别草稿、已复核」照转。
 4. **稀疏字段补齐**：`evidence` 里有明确城市 → `candidate_overrides.expected_location`；
    证书缺失 → 从 `evidence.cert_text` 补 `certificates_extra`；漏抽技能 → `skills_extra`。
    没有要修正的字段就**不要**给这个人出 `candidate_overrides` 条目。
@@ -142,10 +175,11 @@ Read `SHARD:` 指向的 `digest_batch_NN.json`。单片场景就是**一次 Read
    （组织是匹配的前提：简历组织必须等于岗位组织，否则匹配不到任何岗位。）
 6. **不进判定、必须先停下问用户**：`dedupe=="conflict"`（手机号相同但姓名不同 = 疑似重名/错录）
    → 停止该候选人后续流程，业务话请用户确认，**不自动选第一条**。
-   `parse_status != "ok"`（`no_text_layer` / 加密 / 乱码）→ 如实进 ❌ 清单，
+   `parse_status != "ok"`（`needs_agent_vision` 补丁未覆盖 / 加密 / 乱码）→ 如实进 ❌ 清单，
    写"无法解析，请提供文字版"，**绝不硬造字段**。注意 P3 起 macOS 上扫描件/图片已被
-   自动 OCR 救回（parse_status=ok，backend=vision_ocr，带「OCR 可能有小误读」警告——
-   警告必须照转）；仍报 `no_text_layer` 的只剩非 macOS 机器或 OCR 文本不可信的文件。
+   自动 OCR 救回，P4a 起非 macOS/OCR 不可信的文件走 `VISION_NEEDED:` agent 多模态兜底
+   （补丁覆盖后 parse_status=ok、backend=agent_vision，草稿字段带 needs_review 标记——
+   警告必须照转）；到判定时仍 `needs_agent_vision` 的只剩补丁没覆盖的文件，如实报。
    沟通状态=已入职 → 终止态，不参与匹配（长期规则，无需逐次确认）。
 7. **不输出任何分数**：`skill_score` / `bonus_score` / `total` 一律不写。
    分数与最终推荐状态由回合 3 脚本重算（它会校验 `skill_hits ⊆ must_skills`、

@@ -13,16 +13,19 @@ recruit-match-suite-fast / skills / resume-intake / scripts / intake_resume.py
     → 一次批量 upsert 写简历库 → 回读校验 → 产出 candidates.json /
       intake_report.json / checkpoint.json
 
-调用面（冻结，W-D 的 SKILL.md 照此写，不得偏离；--wall-budget 为 P3 只增开关）
+调用面（冻结，W-D 的 SKILL.md 照此写，不得偏离；--wall-budget 为 P3 只增开关、
+--apply-vision-patch 为 P4a 只增开关）
 ------------------------------------------------
     python3 scripts/intake_resume.py --config <config.json绝对路径> \
             --files <f1> [f2 ...] --out-dir <绝对路径> [--no-attachment] [--reset] \
-            [--wall-budget <秒>]
+            [--wall-budget <秒>] [--apply-vision-patch <patch.json>]
 
     产出: <out-dir>/candidates.json, <out-dir>/intake_report.json,
           <out-dir>/checkpoint.json
     stdout 末行: ARTIFACT:<out-dir>/intake_report.json 的绝对路径
     partial 时: 额外一行 `RESUME: <原命令>`——重跑同一命令续跑（见纪律 9）
+    有读不出文字的文件时: 额外一行 `VISION_NEEDED: <绝对路径1> <绝对路径2> ...`
+            ——agent 多模态兜底协议触发器（见纪律 11）
 
 `--out-dir` 缺省 = /tmp/recruit-fast/<batch_id>/（batch_id = 时间戳 + 短随机）。
 
@@ -72,6 +75,18 @@ recruit-match-suite-fast / skills / resume-intake / scripts / intake_resume.py
    多份扫描件并行 Vision OCR，实测 3 份并行 1.764s vs 串行 3.810s），提取层细节见
    shared/extraction/vision_ext.py。失败清单语义随之收窄为「仅加密/损坏/OCR 不可信
    （非 macOS、或 OCR 文本仍是水印/重复串/0 数字字符）才失败」。
+11. **agent 多模态兜底通道（P4a，客户硬需求「不能接受简历解析报错」的最后一环）**：
+   chain 终态仍 no_text_layer 的文件不再判死 → parse_status="needs_agent_vision"，
+   stdout 打印一行 `VISION_NEEDED: <绝对路径...>`（清单同时进报告 vision_needed_files）。
+   agent **一轮**多模态读完全部列出文件，按补丁 schema 写 json，重跑同命令加
+   `--apply-vision-patch <json>`；脚本用 FieldMerger 合并（regex 有值用 regex，
+   regex 为空才取 fields_draft；取自草稿的字段打 field_source="agent_vision" 并追加进
+   needs_review 由回合 2 复核）。**agent 只产出结构化补丁，绝不写库**——写库仍走本
+   脚本正常查重/护栏/回读流程。**20% 闸门（用户拍板）**：needs_agent_vision 份数 /
+   总份数 > 0.20 → 疑似整批格式问题，**不写任何记录**，退出码 0、ok=true、
+   partial=true、reason="vision_gate"，请用户确认后重试或提供文字版。
+   `RECRUIT_NO_VISION=1`（仅测试用）令 Vision OCR 梯队恒不受理，用于在非 macOS
+   语义下演练本通道。
 """
 
 from __future__ import annotations
@@ -106,6 +121,8 @@ from dedupe.name_size import NameSizeDeduper        # noqa: E402
 from dedupe.phone import PhoneDeduper               # noqa: E402
 from extract_fields import extract_resume_fields    # noqa: E402
 from extract_text import detect_scanned, extract_text  # noqa: E402
+from fields.merger import FieldMerger               # noqa: E402
+from fields.regex_ext import RegexFieldExtractor    # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # 常量
@@ -135,6 +152,15 @@ SETTLE_WAITS = (1.5, 3.0, 4.5)
 #: 库内去重扫描的翻页上限（100 页 × 100 条/页 ≈ 10000 条）。存量打满就会截断，
 #: 而去重是按「扫回来的这批」判的 → 截断即漏判重复，所以必须报出来（缺陷2）。
 DEDUPE_SCAN_MAX_PAGES = 100
+#: P4a 20% 闸门（用户拍板）：needs_agent_vision 份数 / 总份数 > 此比例 →
+#: 疑似整批格式问题，不写任何记录，报告 reason="vision_gate"。
+VISION_GATE_RATIO = 0.20
+#: 6b 补传附件（只补附件、记录不重建）单轮处理上限（主控裁决回写）：
+#: 超出部分 defer 到下一轮 RESUME，防大批量补传把墙钟拖爆。
+FIXUP_ROUND_MAX = 100
+
+#: P4a：agent 多模态兜底合并器（regex 优先、补丁草稿补空、逐字段打 field_source）
+_VISION_MERGER = FieldMerger([RegexFieldExtractor()])
 
 # 组织归属关键词（老插件口径，见 v0.1.0/skills/recruit-model/references/system-config.md:28
 # 与 resume-intake/SKILL.md:24）
@@ -164,6 +190,10 @@ PARSE_FAIL_REASON = {
     "no_text_layer": "扫描件/图片无文字层，且本机 OCR 未能救回（非 macOS 无 OCR 能力，"
                      "或 OCR 文本未通过可信护栏：仍是水印/重复串/无数字字符）；"
                      "请提供 Word 或 PDF 文字版简历（不硬造字段）",
+    "needs_agent_vision": "本机读不出文字（扫描件/图片无文字层且 OCR 不可用或不可信），"
+                          "已列入 VISION_NEEDED 清单等 agent 多模态兜底；本轮未提供"
+                          "覆盖该文件的 --apply-vision-patch 补丁，如实不入库（不硬造字段）。"
+                          "agent 读清单内文件产出补丁后重跑同一命令即可入库",
     "garbled": "文本层疑似乱码/编码错位，无法可靠解析；请提供文字版简历或转人工核对原件",
     "encrypted": "文件加密或无读取权限，无法解析；请提供未加密的文字版简历",
     "unsupported": "不支持的文件格式，无法解析；请提供 PDF/Word(docx/doc) 文字版简历",
@@ -177,8 +207,9 @@ CANDIDATE_FIELDS = (
     "expected_position", "expected_location", "org_guess", "org_confidence",
     "category_guess", "parse_status", "dedupe", "attachment_status", "evidence",
 )
-#: 契约 D13 要求额外透传的工作年限来源（text|filename|estimated）
-CANDIDATE_EXTRA_FIELDS = ("years_source",)
+#: 契约 D13 要求额外透传的工作年限来源（text|filename|estimated）；
+#: P4a 只增：needs_review（agent 兜底草稿字段复核清单）与 field_sources（逐字段来源）
+CANDIDATE_EXTRA_FIELDS = ("years_source", "needs_review", "field_sources")
 
 EVIDENCE_KEYS = ("education_text", "cert_text", "work_text", "skill_text")
 
@@ -338,6 +369,86 @@ def _safe_extract_text(fp: str) -> Dict[str, Any]:
                 "error": "提取线程异常 %s: %s" % (type(exc).__name__, exc)}
 
 
+def _load_vision_patch(raw_path: str) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
+    """P4a：读 agent 多模态兜底补丁 json（--apply-vision-patch）。
+
+    补丁 schema（与 HOTPATH.md 逐字一致）：
+        {"<文件绝对路径>": {"text": "...", "fields_draft": {"name": "...", "phone": "...", ...},
+                             "confidence": 0.0, "notes": "..."}}
+    返回 (按解析后绝对路径归一的补丁 dict, 错误消息或 None)。永不抛异常；
+    非法条目直接忽略（宁缺勿造）。
+    """
+    try:
+        raw = json.loads(Path(raw_path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return {}, "补丁文件读取失败：%s: %s" % (type(exc).__name__, exc)
+    if not isinstance(raw, dict):
+        return {}, '补丁顶层结构必须是对象 {"<文件绝对路径>": {...}}'
+    out: Dict[str, Dict[str, Any]] = {}
+    for k, v in raw.items():
+        if not isinstance(v, dict):
+            continue
+        try:
+            out[str(Path(str(k)).expanduser().resolve())] = v
+        except (OSError, ValueError):
+            continue
+    return out, None
+
+
+def _agent_vision_entry(ent: Dict[str, Any],
+                        vision_patch: Dict[str, Dict[str, Any]]) -> None:
+    """P4a：提取终态 no_text_layer 的文件不再判死，转 agent 多模态兜底通道。
+
+    - 补丁覆盖本文件（按解析后绝对路径匹配）→ FieldMerger 合并：先对 patch.text
+      跑 RegexFieldExtractor，**regex 有值的字段用 regex**，regex 为空才取
+      fields_draft；取自草稿的字段打 field_source="agent_vision" 并追加进该候选人
+      needs_review；patch.text 写入简历全文（阶段 4 照常 sanitize/截断），notes
+      记 backend="agent_vision"。之后按正常候选走查重/写库/回读（agent 绝不写库）。
+    - 补丁未覆盖 → parse_status="needs_agent_vision" + 失败清单语义（如实告知，
+      不硬造字段），等下一轮带补丁重跑。
+    """
+    ent["parse_status"] = "needs_agent_vision"
+    patch_entry = vision_patch.get(ent["path"])
+    if patch_entry is None:
+        ent["result"] = "失败"
+        ent["reason"] = PARSE_FAIL_REASON["needs_agent_vision"]
+        return
+    p_text = str(patch_entry.get("text") or "")
+    draft = patch_entry.get("fields_draft")
+    drafts = [draft] if isinstance(draft, dict) else []
+    cf = _VISION_MERGER.resume_fields_with_drafts(p_text, ent["file_name"], drafts)
+    f = cf.to_dict()
+    f["field_sources"] = dict(cf.field_sources)
+    f["needs_review"] = list(cf.needs_review)
+    ent["text"] = p_text
+    ent["fields"] = f
+    ent["warnings"] = list(f.get("warnings") or [])
+    ent["parse_status"] = "ok"
+    ent["backend"] = "agent_vision"          # notes 记 backend="agent_vision"
+    ent["vision_patched"] = True
+    adopted = list(cf.needs_review)
+    note = "agent 多模态兜底补丁已合并（backend=agent_vision"
+    if patch_entry.get("confidence") is not None:
+        note += "，confidence=%s" % patch_entry.get("confidence")
+    note += "）"
+    if adopted:
+        note += ("；字段[%s]取自 agent 草稿（field_source=agent_vision），"
+                 "已标 needs_review，回合 2 必须用 evidence 原文复核"
+                 % "、".join(adopted))
+    if patch_entry.get("notes"):
+        note += "；agent 补丁备注：%s" % str(patch_entry.get("notes"))[:200]
+    ent["warnings"].append(note)
+    if not p_text.strip():
+        ent["warnings"].append("agent 补丁 text 为空——仅 fields_draft 生效，"
+                               "简历全文留空，回合 2 请重点复核")
+    if not _clean(f.get("phone")):
+        ent["result"] = "失败"
+        ent["reason"] = ("agent 兜底补丁合并后仍未解析到手机号，无法按手机号查重入库；"
+                         "请人工确认简历里的联系方式后补录（不硬造字段）")
+    else:
+        ent["writable"] = True
+
+
 def _done_entry(ent: Dict[str, Any], prev: Dict[str, Any],
                 result_str: Optional[str] = None) -> Dict[str, Any]:
     """checkpoint.done 条目（v3 §9#6 语义）：「记录已写」与「附件已传」分开记状态，
@@ -479,7 +590,9 @@ def run(args: argparse.Namespace) -> int:
                # v3 §9#6 只增字段：本次「只补附件」路径的计数（记录不重建）
                "attachment_fixup_uploaded": 0, "attachment_fixup_failed": 0,
                # P3 只增字段：墙钟预算内未处理的文件数（重跑同一命令续跑）
-               "pending_budget": 0}
+               "pending_budget": 0,
+               # P4a 只增字段：转 agent 多模态兜底的文件数（VISION_NEEDED 清单）
+               "needs_agent_vision": 0}
     fatal: Optional[str] = None
 
     counter = DwsCallCounter()
@@ -540,6 +653,17 @@ def run(args: argparse.Namespace) -> int:
 
     done_md5 = set(checkpoint.get("done_md5") or [])
 
+    # ---- P4a：agent 多模态兜底补丁（--apply-vision-patch，可缺省）----
+    vision_patch: Dict[str, Dict[str, Any]] = {}
+    if getattr(args, "apply_vision_patch", None):
+        vision_patch, patch_err = _load_vision_patch(args.apply_vision_patch)
+        if patch_err:
+            fatal = "--apply-vision-patch %s" % patch_err
+            warnings.append(fatal)
+        else:
+            print("读到 agent 兜底补丁：%d 个文件条目（%s）"
+                  % (len(vision_patch), args.apply_vision_patch), flush=True)
+
     # ------------------------------------------------------------------ #
     # 阶段 1：提取 + 抽字段（纯本地，零 dws 调用）
     # P3：提取并发跑（EXTRACT_CONCURRENCY=4，多份扫描件并行 Vision OCR）；
@@ -596,19 +720,23 @@ def run(args: argparse.Namespace) -> int:
             "writable": False, "warnings": [],
         }
         if ex.get("status") != "ok":
-            ent["result"] = "失败"
-            reason = PARSE_FAIL_REASON.get(ex.get("status"),
-                                           "文件解析失败；请确认文件完整后重新提供")
-            if ex.get("status") == "unsupported":
-                reason = "%s（扩展名 %s）" % (reason, ex.get("ext") or p.suffix or "(无)")
-            if ex.get("error"):
-                reason = "%s（技术细节：%s）" % (reason, str(ex["error"])[:120])
-            ent["reason"] = reason
+            if ex.get("status") == "no_text_layer":
+                # P4a：chain 终态 no_text_layer 不再判死 → agent 多模态兜底通道
+                # （补丁覆盖则合并入库，未覆盖则 needs_agent_vision 如实失败）
+                _agent_vision_entry(ent, vision_patch)
+            else:
+                ent["result"] = "失败"
+                reason = PARSE_FAIL_REASON.get(ex.get("status"),
+                                               "文件解析失败；请确认文件完整后重新提供")
+                if ex.get("status") == "unsupported":
+                    reason = "%s（扩展名 %s）" % (reason, ex.get("ext") or p.suffix or "(无)")
+                if ex.get("error"):
+                    reason = "%s（技术细节：%s）" % (reason, str(ex["error"])[:120])
+                ent["reason"] = reason
         elif detect_scanned(ent["text"], ent.get("kind") or ""):
-            # 双保险：extract_text 已判过，这里再判一次（契约 D11）
-            ent["parse_status"] = "no_text_layer"
-            ent["result"] = "失败"
-            ent["reason"] = PARSE_FAIL_REASON["no_text_layer"]
+            # 双保险：extract_text 已判过，这里再判一次（契约 D11）。
+            # P4a：与 chain 终态 no_text_layer 同语义，转 agent 多模态兜底通道
+            _agent_vision_entry(ent, vision_patch)
         else:
             f = extract_resume_fields(ent["text"], fname)
             ent["fields"] = f
@@ -623,12 +751,34 @@ def run(args: argparse.Namespace) -> int:
     extract_ms = int((time.monotonic() - t_extract) * 1000)
     n_ok = sum(1 for e in entries if e["parse_status"] == "ok")
     n_pending = sum(1 for e in entries if e["result"] == "未完成")
-    print("提取完成：%d 份文件（并发 %d），%d 份可用文本，%d 份不可用%s；"
+    # ---- P4a：agent 多模态兜底清单（VISION_NEEDED）+ 20% 闸门（用户拍板）----
+    vision_needed = [e for e in entries if e["parse_status"] == "needs_agent_vision"]
+    vision_needed_paths = [e["path"] for e in vision_needed]
+    summary["needs_agent_vision"] = len(vision_needed)
+    vision_gated = bool(entries) and \
+        (len(vision_needed) / float(len(entries))) > VISION_GATE_RATIO
+    print("提取完成：%d 份文件（并发 %d），%d 份可用文本，%d 份不可用%s%s；"
           "本地耗时 %dms（0 次 dws 调用）"
           % (len(entries), min(EXTRACT_CONCURRENCY, max(1, len(files))),
              n_ok, len(entries) - n_ok - n_pending,
              ("，%d 份因预算未提取" % n_pending) if n_pending else "",
+             ("，%d 份转 agent 多模态兜底" % len(vision_needed)) if vision_needed else "",
              extract_ms), flush=True)
+    if vision_needed and not vision_gated:
+        # 单行、空格分隔的绝对路径清单——agent 兜底协议触发器（见 HOTPATH.md）
+        print("VISION_NEEDED: %s" % " ".join(vision_needed_paths), flush=True)
+        print("%d 份文件本机读不出文字 → agent 多模态兜底：**一轮**读完上面全部文件，"
+              "按补丁 schema 写 json，重跑同一命令加 --apply-vision-patch <json>"
+              "（agent 只产出补丁，绝不写库）" % len(vision_needed), flush=True)
+    if vision_gated:
+        # 20% 闸门：疑似整批格式问题 → 不写任何记录（halted 拦掉全部 dws 写阶段），
+        # 退出码 0、报告 ok=true、partial=true、reason="vision_gate"
+        halted = True
+        print("⛔ 本批 %d/%d 份读不出文字，超过 20%% 阈值，疑似整批格式问题，"
+              "请确认后重试或提供文字版（本轮不写任何记录，报告 reason=vision_gate）"
+              % (len(vision_needed), len(entries)), flush=True)
+        for e in vision_needed:
+            print("  读不出文字: %s（%s）" % (e["file_name"], e["path"]), flush=True)
 
     # 提取进度即刻落盘（record_written=False 的 progress 条目：只作断点可见性，
     # 不参与 done/done_md5 的跳过判定，重跑语义不变）
@@ -779,6 +929,28 @@ def run(args: argparse.Namespace) -> int:
             ent["dedupe"] = d.dedupe
             ent["record_id"] = d.record_id
             ent["reason"] = d.reason
+
+    # ---- P4a 20% 闸门执行：进入任何 dws 写阶段之前，本轮**零写入** ----
+    # （库内扫描已被 halted 拦掉；这里把仍未定论的条目全部转「未完成」并清空
+    # 补传队列，阶段 3~8 因此自然全跳过；重跑同一命令续处理，checkpoint 幂等）
+    if vision_gated:
+        fixups = []
+        for ent in entries:
+            if ent["result"] is None:
+                ent["result"] = "未完成"
+                ent["writable"] = False
+                if ent.get("fix_attachment"):
+                    ent["reason"] = ("20% 闸门触发（本批 %d/%d 份读不出文字 > %.0f%%），"
+                                     "本轮不写任何记录，补传附件一并顺延；确认后重跑"
+                                     "同一命令续补"
+                                     % (len(vision_needed), len(entries),
+                                        VISION_GATE_RATIO * 100))
+                else:
+                    ent["reason"] = ("20%% 闸门触发（本批 %d/%d 份读不出文字 > %.0f%%），"
+                                     "疑似整批格式问题，本轮未写任何记录；请确认后重跑"
+                                     "同一命令，或提供文字版简历"
+                                     % (len(vision_needed), len(entries),
+                                        VISION_GATE_RATIO * 100))
 
     # ------------------------------------------------------------------ #
     # 阶段 3：一次批量手机号查重（契约要求：单次 filter 查询判 new/overwrite/conflict）
@@ -973,6 +1145,22 @@ def run(args: argparse.Namespace) -> int:
     #          欠传状态（下次重跑继续补）。
     # ------------------------------------------------------------------ #
     if tbl is not None and fixups and not fatal:
+        # ---- 主控裁决回写（P4a）：补传路径每轮最多处理 FIXUP_ROUND_MAX 份，
+        # 超出 defer 到下一轮 RESUME（防大批量补传把墙钟拖爆；记录保持已入库）----
+        if len(fixups) > FIXUP_ROUND_MAX:
+            n_all = len(fixups)
+            deferred_fix = fixups[FIXUP_ROUND_MAX:]
+            fixups = fixups[:FIXUP_ROUND_MAX]
+            for ent in deferred_fix:
+                ent["result"] = "未完成"
+                ent["writable"] = False
+                ent["reason"] = ("记录上次已入库；补传附件队列 %d 份超过单轮上限 %d，"
+                                 "本份顺延到下一轮——重跑同一命令续补（RESUME，幂等）"
+                                 % (n_all, FIXUP_ROUND_MAX))
+                deferred_files.append(ent["file_name"])
+            print("补传附件队列 %d 份 > 单轮上限 %d：本轮只处理前 %d 份，"
+                  "其余 %d 份 defer 到下一轮（重跑同一命令续补）"
+                  % (n_all, FIXUP_ROUND_MAX, len(fixups), len(deferred_fix)), flush=True)
         t0 = time.monotonic()
         calls0 = counter.calls
         results = tbl.upload_attachments([e["path"] for e in fixups],
@@ -1231,6 +1419,11 @@ def run(args: argparse.Namespace) -> int:
                          for k in EVIDENCE_KEYS},
             # 契约 D13：工作年限来源必须透传给 C2 / Turn 2
             "years_source": f.get("years_experience_source"),
+            # P4a（只增键）：agent 多模态兜底的复核清单与逐字段来源。
+            # needs_review = 取自补丁 fields_draft 的字段名（field_source=agent_vision），
+            # 回合 2 必须用 evidence 原文复核；未经补丁的候选人两键为空。
+            "needs_review": [str(x) for x in (f.get("needs_review") or [])],
+            "field_sources": dict(f.get("field_sources") or {}),
         }
         if ent["parse_status"] != "ok" or ent["result"] == "未完成":
             # 契约 D11：不硬造字段 → 一律留空；「未完成」（预算内未处理）同样不给字段
@@ -1242,6 +1435,8 @@ def run(args: argparse.Namespace) -> int:
             cand["org_guess"] = None
             cand["category_guess"] = CATEGORY_DEFAULT
             cand["years_source"] = None
+            cand["needs_review"] = []
+            cand["field_sources"] = {}
             cand["evidence"] = {k: "" for k in EVIDENCE_KEYS}
         candidates.append(cand)
 
@@ -1280,7 +1475,10 @@ def run(args: argparse.Namespace) -> int:
 
     elapsed_ms = int((time.monotonic() - t_start) * 1000)
     dws_calls = counter.calls
-    turns_saved = max(0, len(files) * OLD_TURNS_PER_FILE - NEW_TURNS) if files else 0
+    # 主控裁决回写（P4a）：turns_saved 不再把「未完成」文件计入省下回合——
+    # 预算/闸门/补传上限顺延的文件本轮没做完，声称省下它们的回合是虚报。
+    n_done_files = sum(1 for e in entries if e["result"] != "未完成")
+    turns_saved = max(0, n_done_files * OLD_TURNS_PER_FILE - NEW_TURNS) if files else 0
     # 基础设施级失败判定：**该写的都没写进去** → ok=false，让 agent 重跑本步（契约 D7）。
     # 与「业务级失败」区分开：全是扫描件导致 rows 全失败是**正常业务结论**，ok 仍为 true。
     wrote_ok = [e for e in to_write if e["result"] in ("新入库", "已覆盖")]
@@ -1298,7 +1496,8 @@ def run(args: argparse.Namespace) -> int:
     # 靠重跑同一命令续（checkpoint 幂等）。消费面纪律见 HOTPATH.md：见 RESUME:
     # 就重跑同命令，最多 3 次；仍 partial 才把已完成/未完成清单报给用户。
     pending_files = [e["file_name"] for e in entries if e["result"] == "未完成"]
-    partial_flag = bool(pending_files or deferred_files or budget_stopped)
+    # P4a：20% 闸门触发也是 partial（本轮零写入，确认后重跑同一命令续处理）
+    partial_flag = bool(pending_files or deferred_files or budget_stopped or vision_gated)
     args._partial = partial_flag
 
     report = {
@@ -1307,6 +1506,10 @@ def run(args: argparse.Namespace) -> int:
         "wall_budget_s": budget,
         "pending_files": pending_files,
         "deferred_attachment_files": deferred_files,
+        # P4a（只增键）：agent 多模态兜底清单（绝对路径）与 20% 闸门状态。
+        # 闸门触发时本轮零写入，报告 ok=true、partial=true、reason="vision_gate"。
+        "vision_needed_files": vision_needed_paths,
+        "vision_gate": vision_gated,
         "elapsed_ms": elapsed_ms,
         "dws_calls": dws_calls,
         "turns_saved_estimate": turns_saved,
@@ -1315,6 +1518,8 @@ def run(args: argparse.Namespace) -> int:
         "warnings": warnings,
         "retry_count": counter.retries,
     }
+    if vision_gated:
+        report["reason"] = "vision_gate"
     checkpoint.update({
         "generated_at": now_iso(),
         "batch_id": batch_id,
@@ -1363,17 +1568,24 @@ def run(args: argparse.Namespace) -> int:
               % (summary["attachment_fixup_uploaded"], summary["attachment_fixup_failed"]),
               flush=True)
     print("墙钟 %.2fs | dws_calls=%d（重试 %d）| 本地提取 %dms | 估算省下 %d 个 agent 回合"
-          "（老插件 %d 回合/份 × %d 份 − 本脚本 %d 回合）"
+          "（老插件 %d 回合/份 × %d 份已完成 − 本脚本 %d 回合；未完成 %d 份不计入）"
           % (elapsed_ms / 1000.0, dws_calls, counter.retries, extract_ms, turns_saved,
-             OLD_TURNS_PER_FILE, len(files), NEW_TURNS), flush=True)
+             OLD_TURNS_PER_FILE, n_done_files, NEW_TURNS,
+             len(files) - n_done_files), flush=True)
     if warnings:
         print("warnings %d 条（前 8 条）：" % len(warnings), flush=True)
         for w in warnings[:8]:
             print("  - %s" % w[:220], flush=True)
     if partial_flag:
-        print("⏸ partial=true：墙钟预算 %.0fs 内未完成 %d 份、附件欠传 %d 份；"
-              "checkpoint 已逐条落盘，重跑同一命令续跑（幂等，不产生重复记录）"
-              % (budget, len(pending_files), len(deferred_files)), flush=True)
+        if vision_gated:
+            print("⏸ partial=true：20%% 闸门触发（%d/%d 份读不出文字 > %.0f%%），"
+                  "本轮未写任何记录；请与用户确认整批格式问题后重跑同一命令，"
+                  "或让用户提供文字版简历"
+                  % (len(vision_needed), len(entries), VISION_GATE_RATIO * 100), flush=True)
+        else:
+            print("⏸ partial=true：墙钟预算 %.0fs 内未完成 %d 份、附件欠传 %d 份；"
+                  "checkpoint 已逐条落盘，重跑同一命令续跑（幂等，不产生重复记录）"
+                  % (budget, len(pending_files), len(deferred_files)), flush=True)
         for nm in pending_files:
             print("  未完成: %s" % nm, flush=True)
         for nm in deferred_files:
@@ -1409,6 +1621,16 @@ def build_parser() -> argparse.ArgumentParser:
                          "一行 RESUME: 提示、退出码 0、报告 ok=true 且 partial=true；"
                          "续跑 = 重跑同一条命令（checkpoint 幂等，不产生重复记录）"
                          % WALL_BUDGET_DEFAULT)
+    ap.add_argument("--apply-vision-patch", default=None,
+                    help="agent 多模态兜底补丁 json 绝对路径（P4a）。补丁 schema："
+                         '{"<文件绝对路径>": {"text": "...", '
+                         '"fields_draft": {"name": "...", "phone": "...", ...}, '
+                         '"confidence": 0.0, "notes": "..."}}。'
+                         "合并规则：先对 patch.text 跑正则抽取，regex 有值的字段用 regex，"
+                         "regex 为空才取 fields_draft；取自草稿的字段打 "
+                         "field_source=agent_vision 并追加进该候选人 needs_review，"
+                         "patch.text 写入简历全文并记 backend=agent_vision。"
+                         "agent 只产出补丁、绝不写库——入库仍走本脚本正常查重/护栏/回读")
     # ---- W-I 性能优化 O2（W-J 移植）：合并入口（入库 + 生成判定输入 一次调用做完，省一个 agent 回合）----
     # 只加这三个参数；岗位预筛/字段裁剪（O4）默认全开、由 build_match_input 内部控制，
     # O4-c（--emit-stdout）实测负收益**不移植** → 判定输入一律走 SHARD: 路径 Read 分片文件。
@@ -1508,6 +1730,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     if not Path(args.config).expanduser().exists():
         print("错误：--config 不存在：%s" % args.config, file=sys.stderr)
+        return 2
+    if args.apply_vision_patch and not Path(args.apply_vision_patch).expanduser().exists():
+        print("错误：--apply-vision-patch 不存在：%s" % args.apply_vision_patch,
+              file=sys.stderr)
         return 2
     try:
         rc = run(args)

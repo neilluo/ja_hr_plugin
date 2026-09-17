@@ -62,6 +62,10 @@ class CandidateFields:
     # ---- 每字段来源 ----
     name_source: Optional[str] = None
     field_sources: Dict[str, str] = field(default_factory=dict)
+    # ---- P4：取自外部草稿（agent 多模态兜底 fields_draft）的字段名清单 ----
+    # 与 field_sources 一样**不进 to_dict()**（进了会改动 FIELDS 层指纹）；
+    # intake 的 --apply-vision-patch 路径直接读对象属性并透传给 candidates.json。
+    needs_review: List[str] = field(default_factory=list)
     # ---- 置信度 / 告警 / 元信息 ----
     confidence: Dict[str, str] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)

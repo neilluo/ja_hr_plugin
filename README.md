@@ -87,7 +87,7 @@ HR/用人经理共用   招聘查询（候选人向）                          
 
 4.2 简历入库 /resume-intake（HR）
 怎么说：上传 1 个或多个简历（PDF/Word），说"解析入库"。
-三步走：Turn 1 `intake_resume.py --files ...`（提取（**macOS 上扫描件/图片简历自动走系统 Vision OCR 救回入库**，零依赖纯本地不出网，首次运行可能弹一次 macOS 授权弹窗；失败清单语义收窄为"仅加密/损坏/OCR 不可信才失败"，非 macOS 如实报 no_text_layer）+预抽字段+去重（本批内真 MD5、库内附件按文件名+字节大小）+手机号批量查重+批量写+技能标签只增不删+期望地点兜底「不限」+并发原文件名附件+回读；checkpoint **增量落盘**幂等续跑，`--wall-budget`（默认 100s）到点 graceful 停并打印 `RESUME:`，重跑同一命令续跑不产生重复记录）→ Turn 2 agent 审阅报告（转述清单、加密/损坏/OCR 不可信如实告知不硬造、OCR 救回件的小误读与人工确认警告照转、手机号冲突停下问用户、低置信组织复核）→ Turn 3 默认接续定向匹配。
+三步走：Turn 1 `intake_resume.py --files ...`（提取（**macOS 上扫描件/图片简历自动走系统 Vision OCR 救回入库**，零依赖纯本地不出网，首次运行可能弹一次 macOS 授权弹窗；**P4a 起非 macOS/OCR 不可信的文件不再判死**：脚本打印一行 `VISION_NEEDED: <绝对路径...>`，agent 一轮多模态读完全部列出文件、按 schema 写补丁 json、重跑同命令加 `--apply-vision-patch` 即可入库——agent 只产出结构化补丁绝不写库，草稿字段打 `field_source=agent_vision` 并进 `needs_review` 由回合 2 复核；读不出份数 >20% 触发闸门：不写任何记录、`reason=vision_gate`、请用户确认整批格式问题；失败清单语义收窄为"仅加密/损坏/补丁未覆盖才失败"）+预抽字段+去重（本批内真 MD5、库内附件按文件名+字节大小）+手机号批量查重+批量写+技能标签只增不删+期望地点兜底「不限」+并发原文件名附件+回读；checkpoint **增量落盘**幂等续跑，`--wall-budget`（默认 100s）到点 graceful 停并打印 `RESUME:`，重跑同一命令续跑不产生重复记录；补传附件路径每轮上限 100 份、超出 defer 下一轮；`turns_saved_estimate` 只按已完成文件计）→ Turn 2 agent 审阅报告（转述清单、加密/损坏如实告知不硬造、OCR/agent 补丁救回件的小误读与人工确认警告照转、手机号冲突停下问用户、低置信组织复核）→ Turn 3 默认接续定向匹配。
 产出：简历入库清单 + 待关注项；用户可"先不传附件"（--no-attachment）之后补传。
 
 4.3 定向匹配 /match-verify（HR）

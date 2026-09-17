@@ -34,7 +34,8 @@ argument-hint-zh: 上传 1 个或多个简历文件(PDF/Word)
 # macOS / Linux
 python3 scripts/intake_resume.py --config <config.json绝对路径> \
         --files <简历文件1> [简历文件2 ...] \
-        --out-dir <输出目录绝对路径> [--no-attachment] [--reset] [--wall-budget <秒>]
+        --out-dir <输出目录绝对路径> [--no-attachment] [--reset] [--wall-budget <秒>] \
+        [--apply-vision-patch <补丁.json绝对路径>]
 
 # Windows（不要用裸 python，别名可能静默失败、退出码 49）
 py -3 scripts\intake_resume.py --config <config.json绝对路径> --files <文件...> --out-dir <绝对路径>
@@ -44,8 +45,10 @@ py -3 scripts\intake_resume.py --config <config.json绝对路径> --files <文�
 - `--files`：用户本次上传的全部简历文件，**一次全给**，不要分多次调用。
 - `--out-dir`：本批产物目录（建议工作区下专用目录），同一批次的后续步骤复用同一目录。
 - `--wall-budget <秒>`：墙钟预算（默认 100，必须小于 agent 工具 120s 超时）。到点脚本 **graceful 停**：checkpoint 逐条落盘、stdout 打印已完成/未完成清单与一行 `RESUME:`、退出码 0、报告 `ok=true` 且 `partial=true`（附 `pending_files`/`deferred_attachment_files` 名单）。**续跑 = 重跑同一条命令**（checkpoint 增量落盘 + 幂等，不产生重复记录）；见 `RESUME:` 就重跑，最多 3 次，仍 partial 才把已完成/未完成清单报给用户。脚本内部**不循环子批**（那只会把总墙钟拖过外部超时）。
-- `--no-attachment`：用户明确说"先不传附件"时加；之后"补传附件"= **重跑同一命令不带此参数**——checkpoint 把「记录已写」与「附件已传」分开记状态（契约 v3 §9#6），且 P3 起**每个状态一确立就原子落盘**（中途被杀/超时不丢已完成进度），重跑时已完整成功的文件整条跳过，只欠附件的文件**仅补传附件**（按 record_id 更新附件字段并回读，绝不重复建记录）。
+- `--no-attachment`：用户明确说"先不传附件"时加；之后"补传附件"= **重跑同一命令不带此参数**——checkpoint 把「记录已写」与「附件已传」分开记状态（契约 v3 §9#6），且 P3 起**每个状态一确立就原子落盘**（中途被杀/超时不丢已完成进度），重跑时已完整成功的文件整条跳过，只欠附件的文件**仅补传附件**（按 record_id 更新附件字段并回读，绝不重复建记录）。补传路径每轮最多处理 **100 份**（P4a 主控裁决），超出部分 defer 到下一轮：stdout 会说明，重跑同一命令续补（RESUME 语义，幂等）。
 - `--reset`：仅用户明确要求"从头重来"时加。
+- `--apply-vision-patch <补丁.json>`（P4a，**agent 多模态兜底通道**）：本机读不出文字的文件（chain 终态 `no_text_layer`，即非 macOS 或 Vision OCR 失败/不可信）不再判死——entry 记 `parse_status="needs_agent_vision"`，stdout 打印一行 `VISION_NEEDED: <绝对路径1> <绝对路径2> ...`（清单同时进 `intake_report.json` 的 `vision_needed_files`）。agent **一轮**多模态读完全部列出文件，按补丁 schema（`{"<文件绝对路径>": {"text": "...", "fields_draft": {...}, "confidence": 0.0, "notes": "..."}}`，逐字定义见 [HOTPATH.md](HOTPATH.md)）Write 补丁 json，**重跑同一命令**加本参数。合并规则（FieldMerger）：先对 `patch.text` 跑正则抽取，**regex 有值的字段用 regex，regex 为空才取 `fields_draft`**；取自草稿的字段打 `field_source="agent_vision"` 并追加进该候选人 `needs_review`（回合 2 用 evidence 原文复核）；`patch.text` 写入简历全文并记 `backend="agent_vision"`。**agent 只产出结构化补丁，绝不写库**——写库仍走脚本正常查重/护栏/回读；补丁没覆盖的文件维持失败清单语义（如实告知，不硬造）。
+- **20% 闸门（用户拍板，P4a）**：`needs_agent_vision` 份数 / 总份数 > 0.20 → 疑似整批格式问题，脚本**不写任何记录**，stdout 业务话提示「本批 X/Y 份读不出文字，超过 20% 阈值，疑似整批格式问题，请确认后重试或提供文字版」并列出名单，退出码 0、报告 `ok=true`、`partial=true`、`reason="vision_gate"`。agent 此时不走补丁协议，把业务话转给用户确认。`RECRUIT_NO_VISION=1` 为**仅测试用**环境变量（Vision OCR 梯队恒不受理，用于演练兜底通道），生产不设置。
 - 脚本内部完成：提取文本（**macOS 上扫描件/图片简历自动走系统自带 Vision OCR 救回**：零 pip 依赖、纯本地不出网、多份并行 ≤4、单份约 1.2~1.6s；OCR 文本必须过「水印/重复串/数字字符数」护栏，不可信则如实报失败，绝不假成功。**首次运行可能触发 macOS TCC 授权弹窗**，需用户点一次允许）→ 正则预抽字段 → 去重（本批内/checkpoint 走真 MD5；库内附件走「文件名+字节大小」，**不是**内容级比对，转述时别说成"MD5 相同"）→ 一次批量查重（手机号主键）→ 批量写简历库（≤100 条/次，命中即覆盖更新）→ 技能标签只增不删补选项 → 期望地点兜底「不限」→ 并发上传附件（原始文件名）→ 写后回读。
 - 产物：`<out-dir>/candidates.json`、`intake_report.json`、`checkpoint.json`；stdout 末行 `ARTIFACT:<绝对路径>/intake_report.json`。
 
@@ -56,7 +59,7 @@ py -3 scripts\intake_resume.py --config <config.json绝对路径> --files <文�
 读 `intake_report.json` 与 `candidates.json`，做四件事：
 
 1. **转述上传处理清单**（业务话，见下方固定格式）：`rows` 逐行转述，`summary` 做小计，`warnings` 全部转述，失败项不隐藏。
-2. **解析失败项如实告知**：`parse_status` 为 `no_text_layer`/`garbled`/`encrypted` 的候选人 → ❌ 行写明"无法解析，请提供文字版"，**绝不硬造字段**。P3 起 macOS 上扫描件/图片已被自动 Vision OCR 救回（`parse_status=ok`、`backend=vision_ocr`），仍失败的只剩**加密/损坏/OCR 不可信**（OCR 文本仍是水印/重复串/无数字字符）；非 macOS 机器的扫描件/图片仍如实报 `no_text_layer`（跨平台 OCR 兜底在后续版本规划中，当前未实现）。OCR 救回件的「OCR 文本可能有小误读」与姓名/手机号人工确认警告必须照转。
+2. **解析失败项如实告知**：`parse_status` 为 `needs_agent_vision`（补丁未覆盖）/`garbled`/`encrypted` 的候选人 → ❌ 行写明"无法解析，请提供文字版"，**绝不硬造字段**。P3 起 macOS 上扫描件/图片已被自动 Vision OCR 救回（`parse_status=ok`、`backend=vision_ocr`）；P4a 起非 macOS/OCR 不可信的文件走 **agent 多模态兜底**（`VISION_NEEDED:` → 一轮读完 → 补丁 json → 重跑加 `--apply-vision-patch`，见 Turn 1），补丁覆盖后 `parse_status=ok`、`backend=agent_vision`，取自草稿的字段带 `field_source="agent_vision"` 并进 `needs_review`——复核警告必须照转。仍失败的只剩**加密/损坏/补丁未覆盖或补丁后仍读不出手机号**。OCR/补丁救回件的「文本可能有小误读」与姓名/手机号人工确认警告必须照转。`needs_review` 含 agent_vision 字段名的候选人，在匹配回合用 evidence 原文逐个复核（同 `"years"` 的复核纪律）。
 3. **冲突停下问用户**：`dedupe == "conflict"`（手机号相同但姓名不同 = 疑似重名/错录）→ 停止该候选人后续流程，业务话请用户确认，不自动选。
 4. **低置信组织复核**：`org_confidence == "low"` 的候选人，依 `evidence` 原文判定组织（制造基地/厂务/设备/EHS → 制造中心；财务/行政/人力/数据信息 → 职能中心）；**判不了才问用户，不猜**。判定结果记录下来，在匹配环节的 `candidate_overrides` 里回填（见 [定向匹配](../match-verify/SKILL.md)）；`needs_review` 含 `"years"` 的候选人同样留到匹配回合用原文复核工作年限。
 

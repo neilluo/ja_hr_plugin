@@ -10,8 +10,8 @@
 |---|---|---|
 | .docx | 标准库 zipfile 读 `word/document.xml`，按 `w:p` 段落拼接 `w:t`（表格版简历只取 `w:t` 会丢换行） | 报错转人工 |
 | .doc（含 WPS 生成的复合文档） | vendor 的 olefile 读 `WordDocument` 流，fcMin/fcMac 偏移 0x18/0x1C（little-endian uint32），UTF-16-LE 解码并清洗控制符 | 报错转人工 |
-| .pdf | **vendor pypdf → macOS JXA/PDFKit → macOS Vision OCR（扫描件救回，见下）→ 报错转人工**（D9 梯队 + P3 Tier 1.5）。禁止依赖 pdfplumber（其依赖链含 cryptography 二进制 wheel，客户机最容易装挂） | 无文本层且 OCR 不可用/不可信 → `no_text_layer` |
-| 图片（png/jpg 等） | **macOS 上自动 Vision OCR 入库**（P3，见下）；非 macOS 无文本层可提 | `no_text_layer`（跨平台 OCR 兜底在后续版本规划中，当前未实现） |
+| .pdf | **vendor pypdf → macOS JXA/PDFKit → macOS Vision OCR（扫描件救回，见下）→ agent 多模态兜底（P4a，见下）**（D9 梯队 + P3 Tier 1.5 + P4a）。禁止依赖 pdfplumber（其依赖链含 cryptography 二进制 wheel，客户机最容易装挂） | 无文本层且 OCR 不可用/不可信 → `needs_agent_vision`（转 agent 兜底，不再直接判死） |
+| 图片（png/jpg 等） | **macOS 上自动 Vision OCR 入库**（P3，见下）；OCR 不可用/不可信 → agent 多模态兜底（P4a，见下） | `needs_agent_vision`（跨平台兜底已实现：agent 一轮多模态读完产出补丁） |
 
 ## Vision OCR 梯队（P3，仅 macOS，backend=vision_ocr）
 
@@ -21,18 +21,31 @@
 - 性能：单份 1.16~1.58s；入库脚本提取阶段并发 ≤4（实测 3 份并行 1.764s vs 串行 3.810s）。
 - **TCC 授权**：首次运行 osascript 读 ~/Desktop、~/Documents、iCloud 目录文件时 macOS 可能弹授权弹窗，需用户点一次允许（对已授权终端一般不弹）。弹窗挂起时梯队按 60s 超时转失败，重跑即可。
 - notes/warning 会带 OCR 置信度摘要（行数、mean/min 置信度、低置信行数）与「OCR 文本可能有小误读」标记，agent 转述时保留。
+- `RECRUIT_NO_VISION=1`（**仅测试用**环境变量）：Vision 梯队恒不受理，用于在 macOS 上演练下面的 agent 多模态兜底通道；生产流程绝不设置。
+
+## agent 多模态兜底通道（P4a，跨平台，backend=agent_vision）
+
+客户硬需求「不能接受简历解析报错」的最后一环：Vision OCR 只在 macOS 可用，非 macOS、或 Vision 失败/文本不可信时，提取终态仍是 `no_text_layer`——P4a 起这种文件**不再判死**，转成 agent 推理：
+
+1. 入库脚本把这些文件记 `parse_status="needs_agent_vision"`，stdout 打印一行 `VISION_NEEDED: <绝对路径1> <绝对路径2> ...`（单行、空格分隔；清单同时进 `intake_report.json` 的 `vision_needed_files`），其余文件照常入库。
+2. agent **一轮**用多模态能力读完全部列出文件，按补丁 schema（与 HOTPATH.md 逐字一致）Write 补丁 json：
+   `{"<文件绝对路径>": {"text": "...", "fields_draft": {"name": "...", "phone": "...", ...}, "confidence": 0.0, "notes": "..."}}`
+3. **重跑同一条命令**加 `--apply-vision-patch <补丁.json>`。合并规则（`shared/fields/merger.py` FieldMerger）：先对 `patch.text` 跑 RegexFieldExtractor；**regex 有值的字段用 regex**；regex 为空的字段才取 `fields_draft`；凡取自草稿的字段打 `field_source="agent_vision"` 并追加进该候选人 `needs_review`（回合 2 用 evidence 原文复核）；`patch.text` 写入简历全文字段并记 `backend="agent_vision"`。之后按正常候选走查重/写库/回读。
+4. **agent 只产出结构化补丁，绝不写库**；补丁没覆盖的文件维持失败清单语义（如实告知，不硬造）。
+5. **20% 闸门（用户拍板）**：`needs_agent_vision` 份数 / 总份数 > 0.20 → 疑似整批格式问题，**不写任何记录**，stdout 业务话「本批 X/Y 份读不出文字，超过 20% 阈值，疑似整批格式问题，请确认后重试或提供文字版」+ 名单，退出码 0、报告 `ok=true`、`partial=true`、`reason="vision_gate"`。agent 转述给用户确认，**不**打补丁。
 
 ## 提取状态（parse_status）与 agent 的业务话
 
 | 状态 | 含义 | agent 必须怎么做 |
 |---|---|---|
-| `ok` | 提取成功（含 macOS Vision OCR 救回的扫描件/图片，backend=vision_ocr） | 正常进判定；OCR 救回件的「可能有小误读」与人工确认警告照转 |
-| `no_text_layer` | 无文字层且 OCR 未能救回：非 macOS 机器，或 OCR 文本不可信（仍是水印/重复串/0 数字字符） | 进 ❌ 清单：如实告知"无法解析，请提供文字版简历"，**不硬造任何字段**（D11） |
-| `garbled` | 提取出文本但乱码 | 同上，建议重新导出标准 Word/PDF |
+| `ok` | 提取成功（含 macOS Vision OCR 救回的扫描件/图片 backend=vision_ocr，与 agent 补丁救回的 backend=agent_vision） | 正常进判定；救回件的「可能有小误读」与人工确认警告照转；agent_vision 草稿字段按 `needs_review` 复核 |
+| `needs_agent_vision` | 本机读不出文字（提取终态 `no_text_layer`：非 macOS，或 OCR 文本不可信——水印/重复串/0 数字字符），且本轮补丁未覆盖 | 走 agent 多模态兜底协议（见上节）：一轮读完 `VISION_NEEDED:` 清单 → 写补丁 json → 重跑加 `--apply-vision-patch`。触发 20% 闸门时改为请用户确认整批格式问题 |
+| `no_text_layer` | 提取层原始终态（extract_text 层面）；入库脚本 P4a 起把它转成 `needs_agent_vision`，候选人层面不再出现 | —（维护者参考） |
+| `garbled` | 提取出文本但乱码 | 进 ❌ 清单：建议重新导出标准 Word/PDF |
 | `encrypted` | WPS/Office 加密 | 告知"文件被加密，请提供未加密版本"，不猜测内容 |
 | `unsupported` / `error` | 格式不支持/读取失败 | 如实告知格式与失败原因 |
 
-P3 起失败清单语义收窄为「**仅加密/损坏/OCR 不可信才失败**」（macOS 上）。判定扫描件：字符数阈值 + 水印串重复占比 + 数字字符数（`detect_scanned`）。提不出来就停，**绝不猜测编造**。
+P4a 起失败清单语义收窄为「**仅加密/损坏/补丁未覆盖（或补丁后仍读不出手机号）才失败**」。判定扫描件：字符数阈值 + 水印串重复占比 + 数字字符数（`detect_scanned`）。本机提不出来先转 agent 兜底，兜底也读不出就停，**绝不猜测编造**。
 
 ## 字段预抽（正则，脚本完成）
 
