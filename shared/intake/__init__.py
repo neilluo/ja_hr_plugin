@@ -18,7 +18,16 @@
                                    判定逻辑与回读校验不进本类）
     readback.py     ReadBackVerifier —— 写后回读与核查读路径（verify_by_filter 回读轮询/
                                    6b 补传附件轮询/去重 scan 的 query 薄转发门面/
-                                   known_locs config 读；判定逻辑留 run()）
+                                   known_locs config 读；判定逻辑留编排层）
+    pipeline.py     IntakePipeline —— 简历入库 Turn 1 的编排层（run() 的 10 个阶段
+                                   1~9 + 6b 各一方法 + 序幕 prepare / 收尾 finish；
+                                   条目状态机与全部业务判定、CLI 侧 validate_args /
+                                   crash_artifact；fatal 唯一写点 _set_fatal、
+                                   halted 闸门、intake 侧纯规则 guess_org /
+                                   guess_category / normalize_location 与常量在此）
+
+`skills/*/scripts/intake_*.py` 只剩 CLI 装配（build_parser / main / auto_match）+
+一次 `IntakePipeline(args, console).run()`；A 侧（resume）已完成，B 侧（job）归 P9。
 
 沿 P2 纪律：**本包 `__init__` 不做任何 re-export**（不留 shim，调用方直接 import 子模块）。
 import 风格与 shared 既有包一致：shared/ 在 sys.path 上，包内模块用顶层绝对 import。

@@ -4,9 +4,11 @@
 收拢 skills/resume-intake/scripts/intake_resume.py 里散落的预算状态：
   t_start / budget / deadline   计时三元组（构造时定格，t_start 供 Report 算 elapsed_ms）
   budget_stopped                预算触顶标志（阶段1 截断 / 写库前停 / 附件截断）
-  halted                        写库前 graceful 停止（不再进入任何 dws 写阶段；
-                                vision gate 也翻这个标志——判定本体留在 Pipeline）
   deferred_files                记录已入库、附件因预算欠传的文件名清单
+
+「不进任何 dws 写阶段」的 `halted` 标志**不在本类**（P7 刀6 起归 IntakePipeline）：
+它是预算与 20% vision gate 共用的编排级闸门，两个写点分处两个阶段，收在 Pipeline
+才有唯一所有权；本类的 halt_before_write() 只翻 budget_stopped + 打印。
 
 partial 语义（→ RESUME: 行触发条件）由 IntakeReport.assemble 读取
 budget_stopped / deferred_files 后判定；args._partial 黑板写与 --auto-match
@@ -17,7 +19,7 @@ budget_stopped / deferred_files 后判定；args._partial 黑板写与 --auto-ma
 与 Console 的协作点：halt_before_write() 调 console.budget_halt(budget)。
 
 预算检查点 A 里 `ent["md5"] not in done_md5` 的判定属 Pipeline（用
-store.done_md5 快照），本类只提供 halt_reason() 文本与状态翻转。
+store.done_md5 快照），本类只提供 halt_reason() 文本与 budget_stopped 翻转。
 """
 
 import time
@@ -31,7 +33,6 @@ class WallBudget:
         self.deadline = self.t_start + self.budget
         self.budget_stopped = False
         self.deferred_files: List[str] = []
-        self.halted = False
 
     def over_budget(self) -> bool:
         return time.monotonic() >= self.deadline
@@ -41,9 +42,8 @@ class WallBudget:
         self.budget_stopped = True
 
     def halt_before_write(self, console: Any) -> None:
-        """预算检查点 A：写库前 graceful 停止。entries 的「未完成」标记留在 Pipeline
-        （判定用 store.done_md5 快照，属 Pipeline 职责，别塞进 budget）。"""
-        self.halted = True
+        """预算检查点 A：写库前 graceful 停止。entries 的「未完成」标记与 `halted`
+        闸门都留在 Pipeline（判定用 store.done_md5 快照，属 Pipeline 职责）。"""
         self.budget_stopped = True
         console.budget_halt(self.budget)
 

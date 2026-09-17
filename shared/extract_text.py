@@ -14,7 +14,8 @@ pypdf / typing_extensions，见 `shared/vendor/VENDOR_MANIFEST.txt`）。
         {"path": str, "kind": "pdf|docx|doc|image|unknown",
          "text": str, "chars": int, "elapsed_ms": int,
          "status": "ok|no_text_layer|garbled|encrypted|unsupported|error",
-         "backend": "pypdf|pdfkit_jxa|vision_ocr|stdlib_zip|ole_stdlib|ole_vendored|none",
+         "backend": "pypdf|pdfkit_jxa|vision_ocr|agent_vision|stdlib_zip|ole_stdlib|"
+                    "ole_vendored|none",
          "md5": str, "size": int, "error": str | None}
     detect_scanned(text: str, kind: str) -> bool
 
@@ -45,11 +46,19 @@ ExtractionResult / kind 嗅探）在 `shared/documents.py`；具体提取实现�
               被 detect_scanned 判成水印/扫描件」的 gate 降级）才受理。
               OCR 文本必须再过 detect_scanned + 「数字字符数>0」护栏，不可信判
               no_text_layer，绝不当假成功（B1：markitdown 的水印噪声曾骗过护栏）。
-              非 darwin 无此梯队 -> ImageExt/no_text_layer 如实告知；跨平台
-              agent 多模态兜底是后续阶段的事，本文件不声称已实现。
+              非 darwin 无此梯队 -> ImageExt/no_text_layer 如实告知。
+    跨平台兜底 -> AgentPatchExt（Tier 2，P4a 通道 / P7 刀6 入链） backend=agent_vision
+              agent 多模态读出的补丁（`--apply-vision-patch`）作为链上最后一环：
+              只接「补丁表里有本文件」且「链终态本来是 no_text_layer」的文档，
+              文本原样返回并合并 fields_draft（取自草稿的字段 field_source=
+              agent_vision + needs_review）。补丁表为空时恒不受理（链行为与 P4a
+              之前逐字一致）；本门面只经 `agent_patch_tier()` 注册唯一实例，
+              装补丁是编排层（intake Pipeline）的事，本文件不读任何补丁文件。
     图片（OCR 不可用/不可信时的终态）-> ImageExt  status=no_text_layer, backend=none
               （契约 D11：不硬造字段，进 ❌ 清单建议提供文字版）
     unknown（纯文本兜底）-> 仍由本文件 _plain_text 处理，不进链
+              （因此 Tier 2 对它不适用；编排层用 AgentPatchExt.merge_entry 走同一份
+              合并实现兜底，见 intake/pipeline.py）
 
 ExtractorChain 按注册顺序问 can_handle，第一个 extract 返回 status=="ok" 的
 梯队赢；走过的每一级记录进 notes（backend 链路可追溯）。P3 起 run() 额外接受
@@ -77,6 +86,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from documents import VENDOR_DIR, ResumeDocument
 from documents import nws as _nws
 from documents import sniff_kind as _sniff_file_kind
+from extraction.agent_patch_ext import AgentPatchExt, agent_patch_tier
 from extraction.chain import ExtractorChain
 from extraction.doc_piece_ext import DocPieceExt
 from extraction.docx_zip_ext import DocxZipExt
@@ -97,9 +107,15 @@ __all__ = [
 # 提取责任链（注册顺序 = 梯队顺序；加梯队 = 加一个类 + 这里加一行）
 # VisionOcrExt = Tier 1.5（P3）：仅 darwin，只接「图片」与「前序文本层梯队全部
 # 没拿到可用文本的 PDF」；OCR 文本仍要过 detect_scanned + 数字字符数护栏。
+# AgentPatchExt = Tier 2（P4a 通道，P7 刀6 入链）：agent 多模态补丁，只接「补丁表
+# 里有本文件」且「链终态本来是 no_text_layer」的文档；**必须排链尾**——can_handle
+# 靠 doc.prior 判断本机梯队全失败，插在中间会漏掉 docx/doc/image 的失败
+# （见 extraction/agent_patch_ext.py 模块 docstring）。补丁表为空时恒不受理，
+# 链行为与 P4a 之前逐字一致。
 # --------------------------------------------------------------------------- #
 _CHAIN = ExtractorChain([PypdfExt(), JxaExt(), VisionOcrExt(),
-                         DocxZipExt(), DocPieceExt(), ImageExt()])
+                         DocxZipExt(), DocPieceExt(), ImageExt(),
+                         agent_patch_tier()])
 
 
 # --------------------------------------------------------------------------- #
@@ -400,6 +416,13 @@ def extract_text(path: str) -> Dict[str, Any]:
                 # chain 耗尽且全梯队 error 才会走到这里（P3 起 pdf 含 Vision OCR 梯队）
                 if _res.status == "error" and kind == "pdf":
                     error = "PDF 全部梯队都失败: %s" % ("; ".join(_res.notes) or "无文本")
+            elif _res.backend == AgentPatchExt.BACKEND:
+                # Tier 2（agent 多模态补丁）赢时**不过下面的本机质量护栏**：护栏
+                # （字符数/CJK 占比/乱码占比/detect_scanned）恰恰是因为本机读不出
+                # 文字才走到这一环，拿它去判 agent 读出来的补丁文本会把兜底通道自己
+                # 判死（补丁文本短/无数字很常见）。与 P4a 编排层原语义一致：补丁覆盖
+                # 本文件即 parse_status="ok"，文本原样入库，复核责任交回合 2。
+                hard_status = "ok"
     except PermissionError as e:
         hard_status = "encrypted"
         error = str(e)
