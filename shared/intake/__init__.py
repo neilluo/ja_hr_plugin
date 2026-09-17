@@ -7,6 +7,11 @@
     report.py     IntakeReport  —— 报告组装（14 键 report dict）+ 产物落盘 + 尾部人读清单
     checkpoint.py CheckpointStore —— 增量 checkpoint v2 全部读写（done/progress 两 map、
                                    5 处增量原子写、终稿 update + 非原子落盘）
+    budget.py     WallBudget    —— --wall-budget 墙钟预算（计时/触顶判定/优雅停标志/
+                                   partial 语义的 reason 文本；不新增落盘时机）
+    extraction_runner.py ExtractionRunner —— 并发提取池编排（建池/index-keyed 收集/
+                                   预算触顶 cancel/提取摘要交 Console；两处 workers
+                                   表达式刻意不合并）
 
 沿 P2 纪律：**本包 `__init__` 不做任何 re-export**（不留 shim，调用方直接 import 子模块）。
 import 风格与 shared 既有包一致：shared/ 在 sys.path 上，包内模块用顶层绝对 import。

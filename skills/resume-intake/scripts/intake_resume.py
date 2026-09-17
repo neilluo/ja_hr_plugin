@@ -113,7 +113,6 @@ import re
 import shlex
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -138,12 +137,14 @@ from dedupe.content_hash import (                   # noqa: E402
 from dedupe.name_size import NameSizeDeduper        # noqa: E402
 from dedupe.phone import PhoneDeduper               # noqa: E402
 from extract_fields import extract_resume_fields    # noqa: E402
-from extract_text import detect_scanned, extract_text  # noqa: E402
+from extract_text import detect_scanned             # noqa: E402
 from fields.identity import IDENTITY_EVIDENCE_KEYS, identity_evidence  # noqa: E402
 from fields.merger import FieldMerger               # noqa: E402
 from fields.regex_ext import RegexFieldExtractor    # noqa: E402
+from intake.budget import WallBudget                # noqa: E402
 from intake.checkpoint import CheckpointStore       # noqa: E402
 from intake.console import IntakeConsole            # noqa: E402
+from intake.extraction_runner import ExtractionRunner  # noqa: E402
 from intake.report import IntakeReport              # noqa: E402
 
 # --------------------------------------------------------------------------- #
@@ -377,16 +378,6 @@ def _write_json(path: Path, payload: Any) -> None:
         json.dump(payload, fh, ensure_ascii=False, indent=2)
 
 
-def _safe_extract_text(fp: str) -> Dict[str, Any]:
-    """线程池里的提取入口。extract_text 契约上永不抛异常，这里再兜一层防御。"""
-    try:
-        return extract_text(str(Path(fp).expanduser()))
-    except Exception as exc:                        # pragma: no cover
-        return {"status": "error", "text": "", "md5": "", "size": 0,
-                "kind": None, "backend": "none", "elapsed_ms": 0, "ext": None,
-                "error": "提取线程异常 %s: %s" % (type(exc).__name__, exc)}
-
-
 def _load_vision_patch(raw_path: str) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
     """P4a：读 agent 多模态兜底补丁 json（--apply-vision-patch）。
 
@@ -555,15 +546,8 @@ def reset_table(tbl: AITable, table_key: str) -> Dict[str, Any]:
 
 def run(args: argparse.Namespace) -> int:
     console = IntakeConsole()
-    t_start = time.monotonic()
-    budget = float(getattr(args, "wall_budget", None) or WALL_BUDGET_DEFAULT)
-    deadline = t_start + budget
-    budget_stopped = False          # 预算触顶（阶段1截断 / 写库前停 / 附件截断）
-    deferred_files: List[str] = []  # 记录已入库、附件因预算欠传的文件
-    halted = False                  # 写库前 graceful 停止（不再进入任何 dws 写阶段）
-
-    def over_budget() -> bool:
-        return time.monotonic() >= deadline
+    budget = WallBudget(args, WALL_BUDGET_DEFAULT)
+    runner = ExtractionRunner(EXTRACT_CONCURRENCY, console)
 
     batch_id = args.batch_id or _new_batch_id()
     out_dir = Path(args.out_dir).expanduser() if args.out_dir else \
@@ -638,29 +622,8 @@ def run(args: argparse.Namespace) -> int:
     # ------------------------------------------------------------------ #
     entries: List[Dict[str, Any]] = []
     t_extract = time.monotonic()
-    ex_by_idx: Dict[int, Dict[str, Any]] = {}
-    if files:
-        workers = max(1, min(EXTRACT_CONCURRENCY, len(files)))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = {pool.submit(_safe_extract_text, fp): i
-                    for i, fp in enumerate(files)}
-            for fut in as_completed(futs):
-                i = futs[fut]
-                try:
-                    ex_by_idx[i] = fut.result()
-                except Exception as exc:            # pragma: no cover（防御）
-                    ex_by_idx[i] = {
-                        "status": "error", "text": "", "md5": "", "size": 0,
-                        "kind": None, "backend": "none", "elapsed_ms": 0,
-                        "ext": None,
-                        "error": "提取线程异常 %s: %s" % (type(exc).__name__, exc)}
-                if over_budget():
-                    for f2 in futs:
-                        f2.cancel()                 # 只取消还没开始的；在跑的会跑完
-                    budget_stopped = True
-                    break
-    budget_reason = ("墙钟预算 %.0fs 耗尽，本次未处理；checkpoint 已落盘，"
-                     "重跑同一命令续跑（幂等，不产生重复记录）" % budget)
+    ex_by_idx = runner.run(files, budget)
+    budget_reason = budget.pending_reason()
     for i, fp in enumerate(files):
         p = Path(fp).expanduser()
         fname = p.name
@@ -724,8 +687,7 @@ def run(args: argparse.Namespace) -> int:
     summary["needs_agent_vision"] = len(vision_needed)
     vision_gated = bool(entries) and \
         (len(vision_needed) / float(len(entries))) > VISION_GATE_RATIO
-    console.extract_summary(len(entries), min(EXTRACT_CONCURRENCY, max(1, len(files))),
-                            n_ok, n_pending, len(vision_needed), extract_ms)
+    runner.summarize(entries, files, n_ok, n_pending, len(vision_needed), extract_ms)
     if vision_needed and not vision_gated:
         # 单行、空格分隔的绝对路径清单——agent 兜底协议触发器（见 HOTPATH.md）
         console.vision_needed(vision_needed_paths)
@@ -733,7 +695,7 @@ def run(args: argparse.Namespace) -> int:
     if vision_gated:
         # 20% 闸门：疑似整批格式问题 → 不写任何记录（halted 拦掉全部 dws 写阶段），
         # 退出码 0、报告 ok=true、partial=true、reason="vision_gate"
-        halted = True
+        budget.halted = True
         console.vision_gate(len(vision_needed), len(entries))
         for e in vision_needed:
             console.vision_gate_file(e["file_name"], e["path"])
@@ -746,16 +708,13 @@ def run(args: argparse.Namespace) -> int:
 
     # ---- 预算检查点 A：写库前。已触顶 → graceful 停止，不进入任何 dws 写阶段 ----
     # done_md5 里的文件不标「未完成」：阶段 2 的本地跳过/补附件判定照常给它们结果
-    if budget_stopped or over_budget():
-        halted = True
-        budget_stopped = True
+    if budget.budget_stopped or budget.over_budget():
+        budget.halt_before_write(console)
         for ent in entries:
             if ent["result"] is None and ent["md5"] not in done_md5:
                 ent["result"] = "未完成"
                 ent["writable"] = False
-                ent["reason"] = ("墙钟预算 %.0fs 耗尽（未进入写库阶段），本次未处理；"
-                                 "重跑同一命令续跑" % budget)
-        console.budget_halt(budget)
+                ent["reason"] = budget.halt_reason()
 
     # ------------------------------------------------------------------ #
     # 阶段 2：去重（checkpoint 与本批内部走**真 MD5**；库内附件 P4b 起也走真 MD5——
@@ -860,7 +819,7 @@ def run(args: argparse.Namespace) -> int:
         console.old_lib_dedupe_fallback()
     lib_deduper = (ContentHashDeduper(attach_md5_field) if attach_md5_field
                    else NameSizeDeduper())
-    if tbl is not None and need_lib_scan and not args.no_dedupe_scan and not halted:
+    if tbl is not None and need_lib_scan and not args.no_dedupe_scan and not budget.halted:
         try:
             t0 = time.monotonic()
             scan = lib_deduper.scan(tbl, "resume",
@@ -1069,9 +1028,9 @@ def run(args: argparse.Namespace) -> int:
         calls0 = counter.calls
         truncated_at = len(to_write)
         for ci in range(0, len(to_write), chunk_n):
-            if over_budget():
+            if budget.over_budget():
                 truncated_at = ci
-                budget_stopped = True
+                budget.budget_stopped = True
                 break
             chunk = to_write[ci:ci + chunk_n]
             results = tbl.upload_attachments([e["path"] for e in chunk],
@@ -1101,11 +1060,10 @@ def run(args: argparse.Namespace) -> int:
         if truncated_at < len(to_write):
             for ent in to_write[truncated_at:]:
                 ent["attachment_status"] = "deferred"
-                msg = ("墙钟预算（%.0fs）耗尽，附件本轮未上传；记录将先入库，"
-                       "重跑同一命令自动只补附件（不重建记录）" % budget)
+                msg = budget.deferred_attachment_msg()
                 ent["warnings"].append(msg)
                 warnings.append("《%s》%s" % (ent["file_name"], msg))
-                deferred_files.append(ent["file_name"])
+                budget.mark_deferred(ent["file_name"])
         console.upload_summary(args.concurrency, summary["attachment_uploaded"],
                                summary["attachment_failed"],
                                len(to_write) - truncated_at,
@@ -1131,7 +1089,7 @@ def run(args: argparse.Namespace) -> int:
                 ent["reason"] = ("记录上次已入库；补传附件队列 %d 份超过单轮上限 %d，"
                                  "本份顺延到下一轮——重跑同一命令续补（RESUME，幂等）"
                                  % (n_all, FIXUP_ROUND_MAX))
-                deferred_files.append(ent["file_name"])
+                budget.mark_deferred(ent["file_name"])
             console.fixup_deferred(n_all, FIXUP_ROUND_MAX, len(fixups), len(deferred_fix))
         t0 = time.monotonic()
         calls0 = counter.calls
@@ -1452,10 +1410,10 @@ def run(args: argparse.Namespace) -> int:
     report = IntakeReport(console, report_path, candidates_path,
                           OLD_TURNS_PER_FILE, NEW_TURNS, VISION_GATE_RATIO)
     ok = report.assemble(
-        args=args, budget=budget, t_start=t_start, counter=counter,
+        args=args, budget=budget.budget, t_start=budget.t_start, counter=counter,
         entries=entries, files=files, to_write=to_write, rows=rows,
         summary=summary, warnings=warnings, fatal=fatal,
-        deferred_files=deferred_files, budget_stopped=budget_stopped,
+        deferred_files=budget.deferred_files, budget_stopped=budget.budget_stopped,
         vision_needed_paths=vision_needed_paths, vision_gated=vision_gated,
         fixups=fixups)
     store.finalize(ok, summary, report.dws_calls, report.elapsed_ms)
