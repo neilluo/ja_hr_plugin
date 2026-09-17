@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """表值/文本归一小工具 —— **build_match_input（C2）一侧的语义**（P8 第一刀搬入）。
 
-⚠️ 同名不同义，禁止合并（分析报告 §B.7#4，本刀红线）：
+⚠️ 同名不同义，禁止合并（分析报告 §B.7#4，红线）：
   * `as_list`：build 侧 dict 元素取 name/text/value 且过 `clean_ws`；
-    apply_decisions.as_list（L111）dict 元素走它自己的 as_text、只 strip。
+    apply_decisions.as_list（原 L111）dict 元素走它自己的 as_text、只 strip。
   * `as_text`：build 侧 dict 兜底 `compact(v)`；apply 侧兜底 `json.dumps(v)`。
   两侧兜底/归一化强度不同 → 「抽公共实现统一两侧」本身就是行为变更。
-  P9 动 apply 侧时必须逐案裁定以哪边为准（逐案裁定表见 P8 报告），
-  在此之前本模块**只服务 build 侧**，apply/verify 不得 import 这里的 as_list/as_text。
+  **P9a 终裁：不合并**——apply 侧独立实现在 match/applyvalues.py（逐案裁定表见
+  P8 报告 §4a）。本模块只服务 build 侧，apply/verify 不得 import 这里的 as_list/as_text。
 """
 
 import json

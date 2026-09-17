@@ -1,12 +1,81 @@
 # -*- coding: utf-8 -*-
-"""评分口径文案（内嵌进 digest 的 SCORING_RULES 大 dict）。
+"""评分口径：SCORING_RULES 文案（内嵌进 digest）+ ScoreCalculator 实现体。
 
-⚠️ 文案与实现两处漂移是已知风险：本 dict 是**文案**，真正实现分数的
-verify_decisions.compute_scores / apply_decisions 消费面各有一份口径
-（verify L93 注释原文：「与 build_match_input.SCORING_RULES / apply_decisions
-三处必须一致」）。P9 抽 ScoreCalculator 时应落到本模块并加一致性测试，
-杜绝漂移；在那之前**逐字保留**（键序即 digest 字节，无 sort_keys）。
+⚠️ 文案与实现两处漂移是已知风险：SCORING_RULES 是**文案**，真正实现分数的
+ScoreCalculator（P9a 搬入，原 verify_decisions.round_half_up L95 / compute_scores
+L102-143）在本模块；apply 侧消费面走 verify 的 passed_audit[].recomputed，
+不再各持一份实现（verify L93 注释「三处必须一致」的漂移面已收敛为文案 vs 本类）。
+SCORING_RULES **逐字保留**（键序即 digest 字节，无 sort_keys），一个字节都不能动。
+
+推荐档位判定（总分 ≥80 推荐 / 60~79 待定 / <60 不推荐）经构造注入 `recommend_of`：
+verify_decisions 入口的 `_recommend_of` 是裁判篡改自证 threshold 的定位锚点，
+必须留在入口且行为支配（模式同 build 入口的 REQUIREMENTS_LIMIT / jobparse 的
+requirements_limit）；缺省 `_default_recommend` 与锚点行同口径。
 """
+
+import math
+from typing import Any, Dict, List, Optional, Sequence
+
+
+def round_half_up(x: float) -> int:
+    """四舍五入（**不是** python3 的 banker's rounding：round(66.5)=66 会算错）。"""
+    if x is None:
+        return 0
+    return int(math.floor(float(x) + 0.5))
+
+
+def _default_recommend(total: int) -> str:
+    return "推荐" if total >= 80 else ("待定" if total >= 60 else "不推荐")
+
+
+class ScoreCalculator:
+    """D16 重算口径的唯一实现体（分数一律脚本算，模型输出只作对照）。"""
+
+    def __init__(self, recommend_of: Any = None):
+        self._recommend_of = recommend_of or _default_recommend
+
+    def compute(self, skill_hits: Sequence[str], bonus_hits: Sequence[str],
+                must_skills: Sequence[str], bonus_skills: Sequence[str],
+                weights: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """按老插件口径重算四个数字（契约 D16：分数一律脚本算）。
+
+        技能得分   = 命中必备技能数 / 岗位必备技能总数 × 100，四舍五入取整
+        加分项得分 = 命中加分项数 / 岗位加分项总数 × 100，四舍五入取整；**岗位加分项为空记 100**
+        匹配总分   = 技能得分 × weights.must + 加分项得分 × weights.bonus，四舍五入取整
+        推荐状态   = 总分 ≥80 推荐 / 60~79 待定 / <60 不推荐
+        """
+        w = weights or {}
+        try:
+            wm = float(w.get("must", 0.7))
+        except (TypeError, ValueError):
+            wm = 0.7
+        try:
+            wb = float(w.get("bonus", 0.3))
+        except (TypeError, ValueError):
+            wb = 0.3
+
+        st = len(must_skills or [])
+        bt = len(bonus_skills or [])
+        sh = len(skill_hits or [])
+        bh = len(bonus_hits or [])
+        notes: List[str] = []
+        if st:
+            skill_score = round_half_up(sh * 100.0 / st)
+        else:
+            skill_score = 0
+            notes.append("岗位必备技能为空 → 技能得分分母缺失，记 0（岗位数据有问题，需人工确认）")
+        if bt:
+            bonus_score = round_half_up(bh * 100.0 / bt)
+        else:
+            bonus_score = 100
+            notes.append("岗位加分项为空 → 加分项得分记 100（沿用已验证口径；"
+                         "老插件 system-config §6 要求这种情况先与用户确认）")
+        total = round_half_up(skill_score * wm + bonus_score * wb)
+        recommend = self._recommend_of(total)
+        return {"skill_total": st, "bonus_total": bt, "skill_hits": sh, "bonus_hits": bh,
+                "skill_score": skill_score, "bonus_score": bonus_score,
+                "weights": {"must": wm, "bonus": wb},
+                "total_score": total, "recommend": recommend, "notes": notes}
 
 # ---------------------------------------------------------------------------
 # 评分口径原文（内嵌进 digest，让 LLM 不必去读别的文件）
