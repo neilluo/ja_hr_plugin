@@ -108,7 +108,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
 import re
 import shlex
@@ -128,7 +127,7 @@ for _p in (str(_SHARED_DIR), str(_VENDOR_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from aitable.client import DwsCallCounter, DwsClient, DwsError, now_iso  # noqa: E402
+from aitable.client import DwsCallCounter, DwsClient, DwsError  # noqa: E402
 from aitable.table import AITable                   # noqa: E402
 from aitable.values import sanitize_text, values_equal  # noqa: E402
 from dedupe.base import UNSET                       # noqa: E402
@@ -143,6 +142,7 @@ from extract_text import detect_scanned, extract_text  # noqa: E402
 from fields.identity import IDENTITY_EVIDENCE_KEYS, identity_evidence  # noqa: E402
 from fields.merger import FieldMerger               # noqa: E402
 from fields.regex_ext import RegexFieldExtractor    # noqa: E402
+from intake.checkpoint import CheckpointStore       # noqa: E402
 from intake.console import IntakeConsole            # noqa: E402
 from intake.report import IntakeReport              # noqa: E402
 
@@ -377,23 +377,6 @@ def _write_json(path: Path, payload: Any) -> None:
         json.dump(payload, fh, ensure_ascii=False, indent=2)
 
 
-def _write_json_atomic(path: Path, payload: Any) -> None:
-    """tmp + os.replace：进程在任意瞬间被 SIGKILL 也不会留下半截 JSON。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with open(str(tmp), "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False, indent=2)
-    os.replace(str(tmp), str(path))
-
-
-def _persist_checkpoint(checkpoint_path: Path, checkpoint: Dict[str, Any]) -> None:
-    """P3 增量 checkpoint：每份文件的「写库」「附件上传」状态一确立就整文件原子落盘
-    （旧实现只在流程末尾写一次，被杀即全丢，N≈150 撞 120s 工具超时悬崖）。"""
-    checkpoint["generated_at"] = now_iso()
-    checkpoint["done_count"] = len(checkpoint.get("done") or {})
-    _write_json_atomic(checkpoint_path, checkpoint)
-
-
 def _safe_extract_text(fp: str) -> Dict[str, Any]:
     """线程池里的提取入口。extract_text 契约上永不抛异常，这里再兜一层防御。"""
     try:
@@ -482,32 +465,6 @@ def _agent_vision_entry(ent: Dict[str, Any],
                          "请人工确认简历里的联系方式后补录（不硬造字段）")
     else:
         ent["writable"] = True
-
-
-def _done_entry(ent: Dict[str, Any], prev: Dict[str, Any],
-                result_str: Optional[str] = None) -> Dict[str, Any]:
-    """checkpoint.done 条目（v3 §9#6 语义）：「记录已写」与「附件已传」分开记状态，
-    并存派生字段供跳过重跑时恢复 candidates.json 完整性。阶段 8 逐条落盘与阶段 9
-    终稿共用本构造，保证两处内容一致。"""
-    row = ent.get("row") or {}
-    return {
-        "md5": ent["md5"],
-        "file_name": ent["file_name"],
-        "record_written": True,
-        "attachment_uploaded": ent["attachment_status"] == "uploaded",
-        "record_id": ent.get("record_id") or prev.get("record_id"),
-        "phone": row.get("phone") or prev.get("phone"),
-        "dedupe": ent["dedupe"],
-        "result": (result_str if result_str in ("新入库", "已覆盖")
-                   else prev.get("result") or "已入库"),
-        "attachment_status": ent["attachment_status"],
-        "org_guess": ent.get("org_guess") or prev.get("org_guess"),
-        "org_confidence": ent.get("org_confidence") or prev.get("org_confidence"),
-        "category_guess": ent.get("category_guess") or prev.get("category_guess"),
-        "skills": list(row.get("skills") or prev.get("skills") or []),
-        "expected_location": row.get("expected_location") or prev.get("expected_location"),
-        "at": now_iso(),
-    }
 
 
 # --------------------------------------------------------------------------- #
@@ -646,18 +603,12 @@ def run(args: argparse.Namespace) -> int:
                           tbl.table_name("resume"), tbl.table_id("resume"))
 
     files: List[str] = list(args.files or [])
-    checkpoint: Dict[str, Any] = {"version": 2,
-                                  "batch_id": batch_id, "out_dir": str(out_dir),
-                                  "config_path": str(Path(args.config).resolve()),
-                                  "generated_at": now_iso(), "done": {}, "done_md5": [],
-                                  # progress = 尚未写库文件的中间状态（提取完成/附件已传），
-                                  # P3 增量落盘用；done/done_md5 语义与旧版完全一致
-                                  "progress": {}}
+    store = CheckpointStore(checkpoint_path, batch_id, out_dir, args.config)
 
     if args.reset:
         # --reset 先把 checkpoint 清成空骨架并立即落盘：清表与重跑之间被杀也不会
         # 留下「表已清空但旧 done 还在」的假断点
-        _persist_checkpoint(checkpoint_path, checkpoint)
+        store.persist()
     if tbl is not None and args.reset:
         r = reset_table(tbl, "resume")
         console.reset_result(r.get("found", 0), r.get("deleted", 0),
@@ -667,25 +618,8 @@ def run(args: argparse.Namespace) -> int:
                             % (len(r["failed"]), json.dumps(r["failed"], ensure_ascii=False)[:300]))
 
     # ---- checkpoint（契约 D12 幂等续跑；P3 起逐条落盘，格式 version=2）----
-    # 重跑兼容：旧格式（无 version/progress）照常读 done/done_md5；整个文件读不懂
-    # （坏 JSON / 结构不认识）→ 告警并按空 checkpoint 处理，绝不崩溃。
-    if checkpoint_path.exists() and not args.reset:
-        try:
-            old = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-            if isinstance(old, dict) and isinstance(old.get("done"), dict):
-                checkpoint["done"] = old["done"]
-                checkpoint["done_md5"] = old.get("done_md5") or []
-                if isinstance(old.get("progress"), dict):
-                    checkpoint["progress"] = old["progress"]
-                console.checkpoint_loaded(len(checkpoint["done"]))
-            else:
-                warnings.append("checkpoint.json 结构不认识（缺 done 映射，可能是更旧的"
-                                "格式或半截文件），本次按空 checkpoint 处理；已入库项靠"
-                                "手机号查重兜底，不会产生重复记录")
-        except (ValueError, OSError) as exc:
-            warnings.append("checkpoint.json 读取失败（%s），本次按全新批次处理" % exc)
-
-    done_md5 = set(checkpoint.get("done_md5") or [])
+    store.load(args.reset, console, warnings)
+    done_md5 = store.done_md5
 
     # ---- P4a：agent 多模态兜底补丁（--apply-vision-patch，可缺省）----
     vision_patch: Dict[str, Dict[str, Any]] = {}
@@ -807,12 +741,8 @@ def run(args: argparse.Namespace) -> int:
     # 提取进度即刻落盘（record_written=False 的 progress 条目：只作断点可见性，
     # 不参与 done/done_md5 的跳过判定，重跑语义不变）
     for ent in entries:
-        md5 = ent["md5"]
-        if md5 and md5 not in done_md5:
-            prog = checkpoint["progress"].setdefault(md5, {"md5": md5})
-            prog.update({"file_name": ent["file_name"], "record_written": False,
-                         "parse_status": ent["parse_status"], "at": now_iso()})
-    _persist_checkpoint(checkpoint_path, checkpoint)
+        store.mark_progress(ent)
+    store.persist()
 
     # ---- 预算检查点 A：写库前。已触顶 → graceful 停止，不进入任何 dws 写阶段 ----
     # done_md5 里的文件不标「未完成」：阶段 2 的本地跳过/补附件判定照常给它们结果
@@ -839,7 +769,7 @@ def run(args: argparse.Namespace) -> int:
         if ent["result"] == "失败":
             continue
         if md5 and md5 in done_md5:
-            prev = (checkpoint["done"] or {}).get(md5) or {}
+            prev = (store.done or {}).get(md5) or {}
             # v3 §9#6：checkpoint 把「记录已写」与「附件已传」分开记状态。
             # 兼容旧格式：done 里只记过写库成功的行 → record_written 缺省视为 True；
             # attachment_uploaded 缺省从旧的 attachment_status 推导。
@@ -1166,15 +1096,8 @@ def run(args: argparse.Namespace) -> int:
                                     % (ent["file_name"], res.get("category"), res.get("code"),
                                        str(res.get("error"))[:200]))
                 # 附件状态一确立就落盘（progress 条目；record_written 仍为 False）
-                md5 = ent["md5"]
-                if md5 and md5 not in done_md5:
-                    prog = checkpoint["progress"].setdefault(md5, {"md5": md5})
-                    prog.update({"file_name": ent["file_name"], "record_written": False,
-                                 "parse_status": ent["parse_status"],
-                                 "attachment_uploaded": ent["attachment_status"] == "uploaded",
-                                 "attachment_status": ent["attachment_status"],
-                                 "at": now_iso()})
-            _persist_checkpoint(checkpoint_path, checkpoint)
+                store.mark_attachment(ent)
+            store.persist()
         if truncated_at < len(to_write):
             for ent in to_write[truncated_at:]:
                 ent["attachment_status"] = "deferred"
@@ -1269,13 +1192,7 @@ def run(args: argparse.Namespace) -> int:
                     summary["attachment_uploaded"] += 1
                     summary["attachment_fixup_uploaded"] += 1
                     # 补传成功即刻落盘（P3 增量 checkpoint：附件状态一确立就持久化）
-                    md5 = ent["md5"]
-                    if md5 and (checkpoint["done"] or {}).get(md5):
-                        prev = checkpoint["done"][md5]
-                        prev.update({"attachment_uploaded": True,
-                                     "attachment_status": "uploaded", "at": now_iso()})
-                        checkpoint["progress"].pop(md5, None)
-                        _persist_checkpoint(checkpoint_path, checkpoint)
+                    store.mark_fixup_uploaded(ent)
                 else:
                     ent["result"] = "失败"
                     ent["attachment_status"] = "failed"
@@ -1351,13 +1268,7 @@ def run(args: argparse.Namespace) -> int:
             # 写库状态一确认（回读到 record_id）就逐条落盘（P3 增量 checkpoint）：
             # 之后任意瞬间被杀，重跑都能按 done 条目整条跳过 / 只补附件
             if ent["record_id"] and ent["md5"]:
-                prev = (checkpoint["done"] or {}).get(ent["md5"]) or {}
-                checkpoint["done"][ent["md5"]] = _done_entry(
-                    ent, prev, "新入库" if ent["dedupe"] == "new" else "已覆盖")
-                if ent["md5"] not in checkpoint["done_md5"]:
-                    checkpoint["done_md5"].append(ent["md5"])
-                checkpoint["progress"].pop(ent["md5"], None)
-                _persist_checkpoint(checkpoint_path, checkpoint)
+                store.confirm_written(ent, "新入库" if ent["dedupe"] == "new" else "已覆盖")
         console.readback_summary(verify.get("requested", 0), verify.get("found", 0),
                                  len(verify.get("mismatch") or []),
                                  len(verify.get("attachment_missing") or []),
@@ -1521,31 +1432,20 @@ def run(args: argparse.Namespace) -> int:
         # 保证 candidates.json 跨次运行字段完整（W-G 修复的接缝 bug）。
         # 新入库/已覆盖 → 记全新条目；补传附件路径（fix_attachment）→ 合并更新旧条目。
         # P3：写库成功的条目在阶段 8 回读确认后已**逐条落盘**；这里是终稿重建（内容
-        # 由同一个 _done_entry 构造，两处一致），随收尾整体再写一次。
+        # 由同一个 CheckpointStore.done_entry 构造，两处一致），随收尾整体再写一次。
         if ent["md5"] and (ent["result"] in ("新入库", "已覆盖")
                            or (ent.get("fix_attachment") and ent["result"] in ("跳过", "失败"))):
-            prev = (checkpoint["done"] or {}).get(ent["md5"]) or {}
-            checkpoint["done"][ent["md5"]] = _done_entry(ent, prev, ent["result"])
-            if ent["md5"] not in checkpoint["done_md5"]:
-                checkpoint["done_md5"].append(ent["md5"])
-        elif ent["md5"] and ent["result"] == "跳过" and (checkpoint["done"] or {}).get(ent["md5"]):
-            # 纯跳过：把本次恢复/重算出的派生字段合并回旧条目（旧格式 checkpoint 就地升级）
-            prev = checkpoint["done"][ent["md5"]]
-            prev.update({
-                "record_written": bool(prev.get("record_written", True)),
-                "attachment_uploaded": bool(prev.get("attachment_uploaded",
-                                                     prev.get("attachment_status") == "uploaded")),
-                "org_guess": prev.get("org_guess") or ent.get("org_guess"),
-                "org_confidence": prev.get("org_confidence") or ent.get("org_confidence"),
-                "category_guess": prev.get("category_guess") or ent.get("category_guess"),
-            })
-            if prev.get("skills") is None:
-                f9 = ent.get("fields") or {}
-                sk9 = [str(s).strip() for s in (f9.get("skills") or []) if str(s).strip()]
-                prev["skills"] = list(dict.fromkeys(sk9))[:SKILLS_MAX]
-            if prev.get("expected_location") is None and ent["parse_status"] == "ok":
-                prev["expected_location"] = normalize_location(
-                    (ent.get("fields") or {}).get("expected_location"), known_locs)[0]
+            store.mark_written(ent, ent["result"])
+        elif ent["md5"] and ent["result"] == "跳过" and (store.done or {}).get(ent["md5"]):
+            # 纯跳过：把本次恢复/重算出的派生字段合并回旧条目（旧格式 checkpoint 就地升级；
+            # 兜底值与首次写库同一套纯函数，零 dws，结果一致）
+            f9 = ent.get("fields") or {}
+            sk9 = [str(s).strip() for s in (f9.get("skills") or []) if str(s).strip()]
+            store.merge_skipped(
+                ent,
+                list(dict.fromkeys(sk9))[:SKILLS_MAX],
+                normalize_location((ent.get("fields") or {}).get("expected_location"),
+                                   known_locs)[0])
         for w in ent.get("warnings") or []:
             warnings.append("《%s》%s" % (ent["file_name"], w))
 
@@ -1558,19 +1458,10 @@ def run(args: argparse.Namespace) -> int:
         deferred_files=deferred_files, budget_stopped=budget_stopped,
         vision_needed_paths=vision_needed_paths, vision_gated=vision_gated,
         fixups=fixups)
-    checkpoint.update({
-        "generated_at": now_iso(),
-        "batch_id": batch_id,
-        "ok": ok,
-        "summary": summary,
-        "dws_calls": report.dws_calls,
-        "elapsed_ms": report.elapsed_ms,
-        "done_count": len(checkpoint["done"]),
-        "done_md5": sorted(checkpoint["done_md5"]),
-    })
+    store.finalize(ok, summary, report.dws_calls, report.elapsed_ms)
     report.write(tbl, batch_id,
                  str(Path(args.config).expanduser().resolve()), candidates)
-    _write_json(checkpoint_path, checkpoint)
+    store.write_final()
 
     # ---- 人读清单（沿用老插件「清单式留痕」铁律）----
     report.emit(extract_ms, checkpoint_path, _resume_cmd)

@@ -10,8 +10,9 @@
   emit()      尾部人读清单 + 协议行（全部经 IntakeConsole，输出字节冻结）
 
 checkpoint 的终稿 update 与非原子落盘**不在本类**（P7 刀2 CheckpointStore 的
-范围）：编排层在 assemble() 与 write() 之间、write() 之后自行完成，保持原脚本
-的 now_iso() 调用顺序与「report → candidates → checkpoint」文件写入顺序。
+范围）：编排层在 assemble() 与 write() 之间、write() 之后经 CheckpointStore
+（finalize() / write_final()）完成，保持原脚本的 now_iso() 调用顺序与
+「report → candidates → checkpoint」文件写入顺序。
 """
 
 import json
