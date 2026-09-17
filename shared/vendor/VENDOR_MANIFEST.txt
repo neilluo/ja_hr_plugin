@@ -1,0 +1,84 @@
+========================================================================
+recruit-match-suite-fast / shared / vendor  —— 第三方源码清单（vendoring manifest）
+========================================================================
+本目录下所有代码均为「vendor 进来的第三方纯 python 源码」，不是本项目原创。
+项目本身零 pip 依赖：extract_text.py 通过 sys.path 注入本目录后直接 import，
+不需要 pip install 任何东西，也不需要 C 扩展 / 二进制 wheel。
+
+------------------------------------------------------------------------
+1) olefile 0.47
+------------------------------------------------------------------------
+   路径       : vendor/olefile/  (__init__.py + olefile.py)
+   上游       : https://pypi.org/project/olefile/  (Philippe Lagadec)
+   许可       : BSD-2-Clause  ->  原文见 vendor/olefile/LICENSE.txt
+                                  及 vendor/LICENSE-olefile.txt
+   版权       : Copyright (c) 2005-2023 Philippe Lagadec
+                部分基于 PIL 1.1.7 的 OleFileIO
+                Copyright (c) 1997-2009 Secret Labs AB
+                Copyright (c) 1995-2009 Fredrik Lundh
+   贡献者     : vendor/olefile/CONTRIBUTORS.txt
+   体积       : 单文件 olefile.py ~125 KB / 2696 行
+   依赖       : 无（纯标准库，零 C 扩展）
+   用途       : 读取 .doc（OLE2/CFB 复合文档）的 WordDocument / 0Table /
+                1Table 流，供 MS-DOC piece table（CLX/PlcPcd）解析。
+   为何 vendor: 客户机器 python 版本与 pip 权限不可控；olefile 是单文件纯
+                python、BSD-2 明确允许再分发（保留版权声明即可），vendor
+                成本与风险都最低。
+   降级方案   : 若 vendor 目录缺失/损坏，extract_text.py 会退回自带的
+                ~120 行 stdlib CFB 读取器（backend 记为 "ole_stdlib"）。
+   未 vendor 的上游文件（文档/HTML，与运行无关，按最小体积原则剔除）:
+                README.rst README.html olefile.html olefile2.py olefile2.html doc/
+
+------------------------------------------------------------------------
+2) pypdf 6.19.0
+------------------------------------------------------------------------
+   路径       : vendor/pypdf/
+   上游       : https://pypi.org/project/pypdf/
+   许可       : BSD-3-Clause  ->  原文见 vendor/pypdf/LICENSE
+                                  及 vendor/LICENSE-pypdf.txt
+   版权       : Copyright (c) 2006-2008 Mathieu Fenniak
+                Some contributions copyright (c) 2007 Ashish Kulkarni
+                Some contributions copyright (c) 2014 Steve Witham
+   体积       : ~1.7 MB 源码 / 59 个 .py（已剔除全部 __pycache__）
+   依赖       : 运行时唯一硬依赖是 typing_extensions（仅 python < 3.11
+                需要，见下条）；cryptography / Pillow / fonttools 等都是
+                optional extra，本项目不触发。
+   用途       : PDF 文本层提取的第一梯队后端（backend="pypdf"）。
+   为何不用 pdfplumber:
+                pdfplumber 的依赖链含 pdfminer.six + Pillow + pypdfium2 +
+                cryptography 二进制 wheel，客户机器最容易装挂（契约 D9 明令
+                禁止）。pypdf 实测 19/19 成功、40,223 字符、0.7s，比
+                pdfplumber 少 5.7% 字符，属可接受代价。
+
+------------------------------------------------------------------------
+3) typing_extensions 4.15.0
+------------------------------------------------------------------------
+   路径       : vendor/typing_extensions.py（单文件）
+   上游       : https://pypi.org/project/typing_extensions/  (Python 官方)
+   许可       : PSF-2.0（Python Software Foundation License）
+                ->  原文见 vendor/LICENSE-typing_extensions.txt
+   体积       : ~157 KB 单文件
+   依赖       : 无
+   为何必须 vendor:
+                pypdf 6.19.0 在 python < 3.11 分支上执行
+                `from typing_extensions import Self / TypeAlias / TypeGuard`
+                （运行时 import，不是 TYPE_CHECKING），其 METADATA 也写明
+                `Requires-Dist: typing_extensions >= 4.0; python_version < '3.11'`。
+                客户机器可能是 3.8/3.9/3.10 且无网，若不 vendor 就会
+                ImportError。vendor 后 python 3.9 / 3.14 均实测可 import。
+
+------------------------------------------------------------------------
+许可合规
+------------------------------------------------------------------------
+BSD-2 / BSD-3 / PSF-2.0 三种许可都允许在保留版权声明与许可全文的前提下再
+分发（含商用、含修改）。本目录已逐库保留原始 LICENSE 全文：
+    vendor/LICENSE-olefile.txt           (BSD-2, olefile)
+    vendor/olefile/LICENSE.txt           (BSD-2, olefile 包内副本)
+    vendor/LICENSE-pypdf.txt             (BSD-3, pypdf)
+    vendor/pypdf/LICENSE                 (BSD-3, pypdf 包内副本)
+    vendor/LICENSE-typing_extensions.txt (PSF-2.0, typing_extensions)
+未对上游源码做任何功能性修改（仅删除 __pycache__ 与文档文件）。
+
+------------------------------------------------------------------------
+体积合计：~2.1 MB（vendor 目录），全部纯 python，无 .so / .pyd / .dylib。
+------------------------------------------------------------------------

@@ -1,0 +1,232 @@
+{
+  "_说明": "config.json 示例（不可直接运行）。真实 config.json 由「复刻部署」技能反查真实 ID 后生成，**存放位置冻结在插件根目录**（与本示例文件同级，即 $PLUGIN_ROOT/config.json，契约 v3 §9#8；脚本只认 --config 传入的绝对路径），不进版本库。所有 REPLACE_ME_* 占位符必须替换为实查到的真实 ID；options 段是单选/多选选项的 id 缓存，选项名以实查为准。脚本内零硬编码 ID，本文件是唯一 ID 源（契约 D8）。",
+  "_可选字段键": {
+    "fields.job.submitter": "可选键（契约 v3 §9#5）：客户岗位JD表里有「需求提交人」(user 类型) 列时，在 fields.job 里补 \"submitter\": \"<fieldId>\"（并在 field_names.job / types.job 里补对应项）。配置后 intake_job.py Turn 1 自动取当前登录用户（dws contact +me）回填；**不配置时脚本把该列留空并在 report.warnings 里说明**。这是相对老插件的一处业务语义弱化（老插件「需求提交人」必填），是否补该列由客户决定。"
+  },
+  "base_name": "招聘筛选",
+  "base_id": "REPLACE_ME_base_id",
+  "tables": {
+    "resume": { "table_id": "REPLACE_ME_tbl_resume", "name": "简历库管理" },
+    "job":    { "table_id": "REPLACE_ME_tbl_job",    "name": "岗位JD表" },
+    "match":  { "table_id": "REPLACE_ME_tbl_match",  "name": "智能匹配" },
+    "perm":   { "table_id": "REPLACE_ME_tbl_perm",   "name": "权限配置" }
+  },
+  "fields": {
+    "resume": {
+      "name": "REPLACE_ME_fld", "phone": "REPLACE_ME_fld", "email": "REPLACE_ME_fld",
+      "education": "REPLACE_ME_fld", "school": "REPLACE_ME_fld", "school_rank": "REPLACE_ME_fld",
+      "years_experience": "REPLACE_ME_fld", "major": "REPLACE_ME_fld", "certificates": "REPLACE_ME_fld",
+      "expected_position": "REPLACE_ME_fld", "expected_location": "REPLACE_ME_fld",
+      "expected_salary": "REPLACE_ME_fld", "skills": "REPLACE_ME_fld",
+      "attachment": "REPLACE_ME_fld", "upload_time": "REPLACE_ME_fld",
+      "category": "REPLACE_ME_fld", "comm_status": "REPLACE_ME_fld",
+      "org": "REPLACE_ME_fld", "full_text": "REPLACE_ME_fld"
+    },
+    "job": {
+      "job_id": "REPLACE_ME_fld", "job_name": "REPLACE_ME_fld", "department": "REPLACE_ME_fld",
+      "org": "REPLACE_ME_fld", "status": "REPLACE_ME_fld", "work_location": "REPLACE_ME_fld",
+      "responsibilities": "REPLACE_ME_fld", "requirements": "REPLACE_ME_fld",
+      "hard_gates": "REPLACE_ME_fld", "must_skills": "REPLACE_ME_fld", "bonus_skills": "REPLACE_ME_fld",
+      "must_weight": "REPLACE_ME_fld", "bonus_weight": "REPLACE_ME_fld",
+      "submit_time": "REPLACE_ME_fld", "attachment": "REPLACE_ME_fld",
+      "stat_total": "REPLACE_ME_fld", "stat_recommend": "REPLACE_ME_fld",
+      "stat_pending": "REPLACE_ME_fld", "stat_reject": "REPLACE_ME_fld"
+    },
+    "match": {
+      "name": "REPLACE_ME_fld", "phone": "REPLACE_ME_fld", "job_name": "REPLACE_ME_fld",
+      "job_id": "REPLACE_ME_fld", "org": "REPLACE_ME_fld", "source": "REPLACE_ME_fld",
+      "cand_skills": "REPLACE_ME_fld", "must_skills": "REPLACE_ME_fld", "bonus_skills": "REPLACE_ME_fld",
+      "hard_gates": "REPLACE_ME_fld", "expected_position": "REPLACE_ME_fld",
+      "years_experience": "REPLACE_ME_fld",
+      "skill_score": "REPLACE_ME_fld", "bonus_score": "REPLACE_ME_fld", "total_score": "REPLACE_ME_fld",
+      "recommend": "REPLACE_ME_fld", "update_time": "REPLACE_ME_fld", "evidence": "REPLACE_ME_fld"
+    },
+    "perm": {
+      "user": "REPLACE_ME_fld", "org": "REPLACE_ME_fld"
+    }
+  },
+  "field_names": {
+    "resume": {
+      "name": "姓名", "phone": "手机号", "email": "邮箱", "education": "最高学历",
+      "school": "院校", "school_rank": "院校排名", "years_experience": "工作年限",
+      "major": "专业", "certificates": "证书", "expected_position": "期望职位",
+      "expected_location": "期望地点", "expected_salary": "期望薪资", "skills": "技能标签",
+      "attachment": "简历附件", "upload_time": "上传时间", "category": "简历库分类",
+      "comm_status": "沟通状态", "org": "简历库所属组织", "full_text": "简历全文"
+    },
+    "job": {
+      "job_id": "岗位ID", "job_name": "岗位名称", "department": "所属部门", "org": "组织分类",
+      "status": "状态", "work_location": "工作地点", "responsibilities": "岗位职责",
+      "requirements": "任职要求", "hard_gates": "硬性门槛", "must_skills": "必备技能",
+      "bonus_skills": "加分项", "must_weight": "必备技能权重", "bonus_weight": "加分项权重",
+      "submit_time": "提交时间", "attachment": "JD附件", "stat_total": "候选人总数",
+      "stat_recommend": "推荐数", "stat_pending": "待定数", "stat_reject": "不推荐数"
+    },
+    "match": {
+      "name": "候选人姓名", "phone": "手机号", "job_name": "匹配岗位", "job_id": "岗位ID",
+      "org": "组织分类", "source": "匹配来源", "cand_skills": "候选人技能",
+      "must_skills": "岗位必备技能", "bonus_skills": "岗位加分项", "hard_gates": "硬性门槛",
+      "expected_position": "期望职位", "years_experience": "工作年限",
+      "skill_score": "技能得分", "bonus_score": "加分项得分", "total_score": "匹配总分",
+      "recommend": "推荐状态", "update_time": "更新时间", "evidence": "匹配依据"
+    },
+    "perm": {
+      "user": "用户", "org": "组织分类"
+    }
+  },
+  "types": {
+    "resume": {
+      "name": "text", "phone": "telephone", "email": "email", "education": "singleSelect",
+      "school": "text", "school_rank": "singleSelect", "years_experience": "number",
+      "major": "text", "certificates": "text", "expected_position": "text",
+      "expected_location": "singleSelect", "expected_salary": "text", "skills": "multipleSelect",
+      "attachment": "attachment", "upload_time": "date", "category": "singleSelect",
+      "comm_status": "singleSelect", "org": "singleSelect", "full_text": "text"
+    },
+    "job": {
+      "job_id": "text", "job_name": "text", "department": "singleSelect", "org": "singleSelect",
+      "status": "singleSelect", "work_location": "multipleSelect", "responsibilities": "richText",
+      "requirements": "richText", "hard_gates": "text", "must_skills": "text", "bonus_skills": "text",
+      "must_weight": "number", "bonus_weight": "number", "submit_time": "date",
+      "attachment": "attachment", "stat_total": "number", "stat_recommend": "number",
+      "stat_pending": "number", "stat_reject": "number"
+    },
+    "match": {
+      "name": "text", "phone": "telephone", "job_name": "text", "job_id": "text",
+      "org": "singleSelect", "source": "singleSelect", "cand_skills": "text",
+      "must_skills": "text", "bonus_skills": "text", "hard_gates": "text",
+      "expected_position": "text", "years_experience": "text",
+      "skill_score": "number", "bonus_score": "number", "total_score": "number",
+      "recommend": "singleSelect", "update_time": "date", "evidence": "text"
+    },
+    "perm": {
+      "user": "text", "org": "singleSelect"
+    }
+  },
+  "formatters": {
+    "resume": { "years_experience": "INT" },
+    "job": {
+      "must_weight": "PERCENT", "bonus_weight": "PERCENT",
+      "stat_total": "INT", "stat_recommend": "INT", "stat_pending": "INT", "stat_reject": "INT"
+    },
+    "match": { "skill_score": "INT", "bonus_score": "INT", "total_score": "INT" },
+    "perm": {}
+  },
+  "options": {
+    "resume": {
+      "education": [
+        { "id": "REPLACE_ME_opt", "name": "博士" },
+        { "id": "REPLACE_ME_opt", "name": "硕士" },
+        { "id": "REPLACE_ME_opt", "name": "本科" },
+        { "id": "REPLACE_ME_opt", "name": "大专" }
+      ],
+      "school_rank": [
+        { "id": "REPLACE_ME_opt", "name": "985" },
+        { "id": "REPLACE_ME_opt", "name": "211" },
+        { "id": "REPLACE_ME_opt", "name": "双一流" },
+        { "id": "REPLACE_ME_opt", "name": "普通本科" },
+        { "id": "REPLACE_ME_opt", "name": "大专" }
+      ],
+      "expected_location": [
+        { "id": "REPLACE_ME_opt", "name": "北京" },
+        { "id": "REPLACE_ME_opt", "name": "上海" },
+        { "id": "REPLACE_ME_opt", "name": "深圳" },
+        { "id": "REPLACE_ME_opt", "name": "杭州" },
+        { "id": "REPLACE_ME_opt", "name": "成都" },
+        { "id": "REPLACE_ME_opt", "name": "广州" },
+        { "id": "REPLACE_ME_opt", "name": "南京" },
+        { "id": "REPLACE_ME_opt", "name": "武汉" },
+        { "id": "REPLACE_ME_opt", "name": "曲靖" },
+        { "id": "REPLACE_ME_opt", "name": "不限" }
+      ],
+      "skills": [
+        { "id": "REPLACE_ME_opt", "name": "暖通运维" },
+        { "id": "REPLACE_ME_opt", "name": "PLC编程" },
+        { "id": "REPLACE_ME_opt", "name": "CAD" }
+      ],
+      "category": [
+        { "id": "REPLACE_ME_opt", "name": "技术类" },
+        { "id": "REPLACE_ME_opt", "name": "产品类" },
+        { "id": "REPLACE_ME_opt", "name": "市场类" },
+        { "id": "REPLACE_ME_opt", "name": "运营类" },
+        { "id": "REPLACE_ME_opt", "name": "其他" }
+      ],
+      "comm_status": [
+        { "id": "REPLACE_ME_opt", "name": "已入职" },
+        { "id": "REPLACE_ME_opt", "name": "流程中" },
+        { "id": "REPLACE_ME_opt", "name": "待筛选" },
+        { "id": "REPLACE_ME_opt", "name": "简历未通过" },
+        { "id": "REPLACE_ME_opt", "name": "面试未通过" }
+      ],
+      "org": [
+        { "id": "REPLACE_ME_opt", "name": "职能中心" },
+        { "id": "REPLACE_ME_opt", "name": "制造中心" }
+      ]
+    },
+    "job": {
+      "department": [
+        { "id": "REPLACE_ME_opt", "name": "技术部" },
+        { "id": "REPLACE_ME_opt", "name": "产品部" },
+        { "id": "REPLACE_ME_opt", "name": "市场部" },
+        { "id": "REPLACE_ME_opt", "name": "运营部" },
+        { "id": "REPLACE_ME_opt", "name": "厂务管理部" },
+        { "id": "REPLACE_ME_opt", "name": "EHS管理部" },
+        { "id": "REPLACE_ME_opt", "name": "单晶制造部-设备部" },
+        { "id": "REPLACE_ME_opt", "name": "单晶制造部-生产部" },
+        { "id": "REPLACE_ME_opt", "name": "数据信息部-系统组" },
+        { "id": "REPLACE_ME_opt", "name": "财经管理部" },
+        { "id": "REPLACE_ME_opt", "name": "硅片制造部-工艺部" },
+        { "id": "REPLACE_ME_opt", "name": "硅片制造部-设备部" },
+        { "id": "REPLACE_ME_opt", "name": "组件制造部-工艺部" },
+        { "id": "REPLACE_ME_opt", "name": "组件制造部-设备部" },
+        { "id": "REPLACE_ME_opt", "name": "电池制造部-工艺部" },
+        { "id": "REPLACE_ME_opt", "name": "电池制造部-设备部" }
+      ],
+      "org": [
+        { "id": "REPLACE_ME_opt", "name": "职能中心" },
+        { "id": "REPLACE_ME_opt", "name": "制造中心" }
+      ],
+      "status": [
+        { "id": "REPLACE_ME_opt", "name": "招聘中" },
+        { "id": "REPLACE_ME_opt", "name": "草稿" },
+        { "id": "REPLACE_ME_opt", "name": "已关闭" }
+      ],
+      "work_location": [
+        { "id": "REPLACE_ME_opt", "name": "北京" },
+        { "id": "REPLACE_ME_opt", "name": "上海" },
+        { "id": "REPLACE_ME_opt", "name": "深圳" },
+        { "id": "REPLACE_ME_opt", "name": "杭州" },
+        { "id": "REPLACE_ME_opt", "name": "成都" },
+        { "id": "REPLACE_ME_opt", "name": "广州" },
+        { "id": "REPLACE_ME_opt", "name": "南京" },
+        { "id": "REPLACE_ME_opt", "name": "武汉" },
+        { "id": "REPLACE_ME_opt", "name": "曲靖" },
+        { "id": "REPLACE_ME_opt", "name": "不限" }
+      ]
+    },
+    "match": {
+      "org": [
+        { "id": "REPLACE_ME_opt", "name": "职能中心" },
+        { "id": "REPLACE_ME_opt", "name": "制造中心" }
+      ],
+      "source": [
+        { "id": "REPLACE_ME_opt", "name": "系统匹配" },
+        { "id": "REPLACE_ME_opt", "name": "人工匹配" }
+      ],
+      "recommend": [
+        { "id": "REPLACE_ME_opt", "name": "推荐" },
+        { "id": "REPLACE_ME_opt", "name": "待定" },
+        { "id": "REPLACE_ME_opt", "name": "不推荐" }
+      ]
+    },
+    "perm": {
+      "org": [
+        { "id": "REPLACE_ME_opt", "name": "职能中心" },
+        { "id": "REPLACE_ME_opt", "name": "制造中心" }
+      ]
+    }
+  },
+  "options_cache_generated_at": "REPLACE_ME_ISO8601",
+  "generated_by": "replicate 技能（阶段③接线）",
+  "note": "业务名→真实 ID 映射，脚本唯一 ID 源（契约 D8）。system-config.md 为人读视图，双写同步。本示例文件不可直接运行。"
+}
