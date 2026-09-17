@@ -76,8 +76,9 @@ for _p in (str(_SHARED_DIR), str(_VENDOR_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from aitable_io import AITable, values_equal            # noqa: E402
-from dws_util import DwsCallCounter, DwsError, DwsRunner, now_iso  # noqa: E402
+from aitable.client import DwsCallCounter, DwsClient, DwsError, now_iso  # noqa: E402
+from aitable.table import AITable                      # noqa: E402
+from aitable.values import values_equal                # noqa: E402
 from extract_fields import extract_job_fields           # noqa: E402
 from extract_text import detect_scanned, extract_text   # noqa: E402
 
@@ -400,8 +401,8 @@ def fetch_current_user_cell(tbl: AITable,
     获取失败不致命：返回 (None, None)，该列留空并进 warnings（D6 失败可见）。
     """
     try:
-        res = tbl.runner.call(["contact", "+me"], yes=False)
-        # dws_util.unwrap 已统一识别 `+` 命令的双层信封 {"ok","outcome","data"}
+        res = tbl.client.call(["contact", "+me"], yes=False)
+        # aitable.client.unwrap 已统一识别 `+` 命令的双层信封 {"ok","outcome","data"}
         # （缺陷4 修复，2026-09-17）：这里拿到的 res["data"] 就是内层业务数据，
         # 不再需要（也不允许）在调用方做局部剥壳 workaround。
         d = (res or {}).get("data") or {}
@@ -1113,7 +1114,7 @@ def run_apply(args: argparse.Namespace, tbl: AITable, counter: DwsCallCounter,
                  len(res.get("failed") or []), time.monotonic() - t0, counter.calls - calls0),
               flush=True)
         # ---- 迟到的传播延迟二次复核（1 次调用，不空转）----
-        # W-B 实测（aitable_io 模块文档第 8 条）：对「不久前刚批量写过的 job 表记录」
+        # W-B 实测（aitable/table.py 模块文档第 8 条）：对「不久前刚批量写过的 job 表记录」
         # 再发 update，会返回 success 但读回要几分钟后才见到新值，当场怎么重试都没用。
         # batch_update_verified 只做**有界**重试然后如实报 failed（D6）。这里在全部片
         # 写完后补一次「迟到复核」：短延迟（十几秒内可见）的情况能就地救回来，
@@ -1189,7 +1190,7 @@ def run(args: argparse.Namespace) -> int:
     draft_path = out_dir / "jobs_draft.json"
 
     counter = DwsCallCounter()
-    runner = DwsRunner(counter=counter, timeout=300, http_timeout=180)
+    client = DwsClient(counter=counter, timeout=300, http_timeout=180)
 
     mode = "apply" if args.apply else "turn1"
     print("== 岗位入库 %s（脚本内一次做完，零 agent 回合）=="
@@ -1197,7 +1198,7 @@ def run(args: argparse.Namespace) -> int:
     print("batch_id=%s  out_dir=%s" % (batch_id, out_dir), flush=True)
 
     try:
-        tbl = AITable(args.config, runner=runner)
+        tbl = AITable(args.config, client=client)
     except Exception as exc:
         _write_json(report_path, {
             "ok": False, "elapsed_ms": int((time.monotonic() - t_start) * 1000),

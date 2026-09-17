@@ -1,7 +1,9 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-dws_util.py —— 钉钉 `dws` CLI 的最小封装层（零第三方 pip 依赖，只用标准库 + subprocess）。
+"""`dws` CLI 的最小封装层（零第三方 pip 依赖，只用标准库 + subprocess）。
+
+原 `shared/dws_util.py` 全文收拢到这里（P2：`dws_util.py` 已删除，能力全在本模块），
+`DwsRunner` 更名为 `DwsClient`，其余常量、退避参数、重试次数、错误分类关键字、
+三种响应信封的剥壳逻辑一律**原值搬迁**。
 
 为什么需要这一层（实测结论，写代码前先读）：
   1. **一次 dws 网络调用的固定开销 ≈ 1.0~1.3s**（进程启动 ~0.27s + 鉴权/网络 ~0.7s）。
@@ -42,11 +44,24 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 __all__ = [
     "DwsError",
     "DwsCallCounter",
-    "DwsRunner",
+    "DwsClient",
     "unwrap",
     "classify_error",
     "write_json_file",
     "now_iso",
+    "default_client",
+    "global_stats",
+    "DWS_BIN",
+    "DEFAULT_TIMEOUT",
+    "DEFAULT_HTTP_TIMEOUT",
+    "DEFAULT_RETRIES",
+    "DEFAULT_BACKOFF",
+    "MAX_BACKOFF",
+    "MAX_RECORDS_PER_CALL",
+    "MAX_QUERY_LIMIT",
+    "MAX_RECORD_IDS_PER_CALL",
+    "MAX_FIELDS_PER_CALL",
+    "MAX_FIELD_IDS_PER_GET",
 ]
 
 # ---------------------------------------------------------------------------
@@ -324,14 +339,14 @@ def _cmd_key(argv: Sequence[str]) -> str:
     return " ".join(str(p) for p in parts[:3]) or "dws"
 
 
-class DwsRunner:
+class DwsClient:
     """执行 `dws` 子命令的封装：计数、超时、JSON 解析、错误归类、指数退避重试。
 
     用法::
 
-        runner = DwsRunner()
-        data = runner.call(["aitable", "record", "query", "--base-id", b, "--table-id", t])
-        print(runner.counter.snapshot()["dws_calls"])
+        client = DwsClient()
+        data = client.call(["aitable", "record", "query", "--base-id", b, "--table-id", t])
+        print(client.counter.snapshot()["dws_calls"])
 
     所有 args 都是**参数列表**，绝不经过 shell（契约 §0.5 / 实测坑：dws 在复杂 shell 结构下不稳定）。
     """
@@ -509,7 +524,7 @@ class DwsRunner:
 
     def _log(self, msg: str) -> None:
         if self.verbose:
-            print("[dws_util] %s" % msg, flush=True, file=sys.stderr)
+            print("[aitable.client] %s" % msg, flush=True, file=sys.stderr)
 
     # -- 大 payload -------------------------------------------------------
     def call_with_payload(self, args: Sequence[str], payload: Any, *,
@@ -556,14 +571,14 @@ class DwsRunner:
             yield items[i:i + size]
 
 
-#: 进程级默认 runner（上层想要全局计数时共享同一个 counter）
+#: 进程级默认计数器（上层想要全局计数时共享同一个 counter）
 _GLOBAL_COUNTER = DwsCallCounter()
 
 
-def default_runner(**kwargs) -> DwsRunner:
-    """返回一个共享全局计数器的 DwsRunner（便于跨模块汇总 dws_calls）。"""
+def default_client(**kwargs) -> DwsClient:
+    """返回一个共享全局计数器的 DwsClient（便于跨模块汇总 dws_calls）。"""
     kwargs.setdefault("counter", _GLOBAL_COUNTER)
-    return DwsRunner(**kwargs)
+    return DwsClient(**kwargs)
 
 
 def global_stats() -> Dict[str, Any]:

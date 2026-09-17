@@ -70,8 +70,10 @@ _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-from aitable_io import AITable, AITableConfigError  # noqa: E402
-from dws_util import DwsError, now_iso  # noqa: E402
+from aitable.client import DwsError, now_iso  # noqa: E402
+from aitable.schema import AITableConfigError  # noqa: E402
+from aitable.table import AITable  # noqa: E402
+from aitable.values import sanitize_text  # noqa: E402
 from verify_decisions import EVIDENCE_MAX_LEN, RECOMMEND_VALUES, load_json, norm_item  # noqa: E402
 
 MATCH_SOURCE_SYSTEM = "系统匹配"        # 老插件口径：只有「系统匹配」参与删旧建新
@@ -79,7 +81,7 @@ MATCH_SOURCE_MANUAL = "人工匹配"        # 人工匹配一律不动，但要�
 COMM_STATUS_ONBOARDED = "已入职"        # 老插件铁律
 JOB_STATUS_OPEN = "招聘中"
 FILTER_VALUE_CHUNK = 60                 # 单次 filter 的值个数（dws operands 上限 100，留余量）
-CREATE_CHUNK = 100                      # 契约要求：batch_create ≤100/片（aitable_io 内部也会分片）
+CREATE_CHUNK = 100                      # 契约要求：batch_create ≤100/片（aitable.writer 内部也会分片）
 
 
 def _now() -> str:
@@ -498,7 +500,7 @@ def find_stale_match_records(table: AITable, names: Sequence[str],
     **一次批量查**（filter 里 name 传多值），不逐条查。人工匹配不动。
 
     ⚠️ 实测坑（本 worker 发现，W-B 层无法改，只能在这里绕）：
-    dws 的 filters **不支持嵌套 or**。`aitable_io.build_filter` 对
+    dws 的 filters **不支持嵌套 or**。`aitable.schema.TableSchema.build_filter` 对
     `{"source":"系统匹配","name":[n1,n2,...]}` 会生成
     `and[ eq(source), or[eq(name,n1), eq(name,n2)...] ]`，服务端直接报
     `INVALID_FILTER_OPERATOR: Invalid filter operator: 'or'. Supported operators:
@@ -841,7 +843,7 @@ def apply(config_path: str, decisions_path: str, out_dir: str,
                                   "dws_calls": 0, "elapsed_ms": 0, "submitted": 0,
                                   "isolate_extra_calls": 0}
     if table is not None and rows_to_create:
-        # 契约要求 ≤100 条/片：这里显式分片（aitable_io 内部也会兜底再切一次）
+        # 契约要求 ≤100 条/片：这里显式分片（aitable.writer 内部也会兜底再切一次）
         for piece in chunks(rows_to_create, CREATE_CHUNK):
             r = table.batch_create("match", piece)
             create_res["created"] += r.get("created", 0)
@@ -912,9 +914,9 @@ def apply(config_path: str, decisions_path: str, out_dir: str,
         want = [w for w in want if w in (table.field_keys("match") or [])]
         expected = {}
         for rid, meta in zip(create_res["record_ids"], row_meta):
-            # ⚠️ 实测坑（aitable_io.sanitize_text 文档串）：写入前会净化文本，
+            # ⚠️ 实测坑（aitable.values.sanitize_text 文档串）：写入前会净化文本，
             # 所以「写入 vs 读回」的比对基准必须拿 sanitize_text(原文)，否则会误判成不一致。
-            expected[rid] = {k: (table.sanitize_text(v) if isinstance(v, str) else v)
+            expected[rid] = {k: (sanitize_text(v) if isinstance(v, str) else v)
                              for k, v in meta["record"].items() if k in want and v is not None}
         rb_match = table.readback_verify("match", create_res["record_ids"], want,
                                          expected=expected, settle_tries=3)

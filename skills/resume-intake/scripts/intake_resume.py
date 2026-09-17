@@ -7,7 +7,8 @@ recruit-match-suite-fast / skills / resume-intake / scripts / intake_resume.py
 简历入库编排层（契约 §2 Turn 1 / §6 W-C1）。**一个进程内做完全部确定性工作，
 零 agent 回合**：
 
-    提取文本 → 扫描件判定 → 正则抽字段 → MD5 去重 → 一次批量手机号查重
+    提取文本 → 扫描件判定 → 正则抽字段 → 去重（本批内/checkpoint 走真 MD5，
+    库内走「文件名+字节大小」比对）→ 一次批量手机号查重
     → 组织/分类预判 → 一次 ensure_options 补技能标签 → 并发上传附件
     → 一次批量 upsert 写简历库 → 回读校验 → 产出 candidates.json /
       intake_report.json / checkpoint.json
@@ -26,12 +27,12 @@ recruit-match-suite-fast / skills / resume-intake / scripts / intake_resume.py
 设计纪律（每条都是实测/契约换来的，改代码前先读）
 ------------------------------------------------
 1. **dws 调用次数是第一优化目标**（契约 §0.5、W-B 实测单次固定开销 ≈1.0~1.3s）。
-   本脚本对一个批次只发这么几次：库内附件 MD5 扫描 1 次 + 手机号批量查重 1 次
+   本脚本对一个批次只发这么几次：库内附件「文件名+字节大小」扫描 1 次 + 手机号批量查重 1 次
    + ensure_options(技能标签/期望地点) 各 1 次起 + 批量 upsert 1 次/100 条
    + 回读 1 次/100 条（+ 传播延迟轮询）+ 附件 1 次/文件（无批量接口，只能并发）。
    全部计数进 report 的 `dws_calls`。
 2. **附件先上传、随 create 一起写入，不做事后 update**。W-B 实测最阴的坑
-   （aitable_io 模块文档第 8 条）：对「刚批量创建出来的记录」发 record update，
+   （aitable/table.py 模块文档第 8 条）：对「刚批量创建出来的记录」发 record update，
    返回 success 但写入可能要几分钟后才可读，期间怎么重试都没用（一轮 41 次调用
    /70 秒全废）。所以本脚本把 fileToken 直接塞进 upsert 的 cells，一次写完；
    只有在回读发现附件缺失时才补一次 batch_update（正常路径不会触发）。
@@ -79,10 +80,14 @@ for _p in (str(_SHARED_DIR), str(_VENDOR_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from aitable_io import AITable, values_equal            # noqa: E402
-from dws_util import DwsCallCounter, DwsError, DwsRunner, now_iso  # noqa: E402
-from extract_fields import extract_resume_fields        # noqa: E402
-from extract_text import detect_scanned, extract_text   # noqa: E402
+from aitable.client import DwsCallCounter, DwsClient, DwsError, now_iso  # noqa: E402
+from aitable.table import AITable                   # noqa: E402
+from aitable.values import sanitize_text, values_equal  # noqa: E402
+from dedupe.base import UNSET                       # noqa: E402
+from dedupe.name_size import NameSizeDeduper        # noqa: E402
+from dedupe.phone import PhoneDeduper               # noqa: E402
+from extract_fields import extract_resume_fields    # noqa: E402
+from extract_text import detect_scanned, extract_text  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # 常量
@@ -103,6 +108,9 @@ OLD_TURNS_PER_FILE = 25
 NEW_TURNS = 1
 #: 写后读回传播延迟（W-B 实测：create 后按条件查 ≈2.7s 才可命中）
 SETTLE_WAITS = (1.5, 3.0, 4.5)
+#: 库内去重扫描的翻页上限（100 页 × 100 条/页 ≈ 10000 条）。存量打满就会截断，
+#: 而去重是按「扫回来的这批」判的 → 截断即漏判重复，所以必须报出来（缺陷2）。
+DEDUPE_SCAN_MAX_PAGES = 100
 
 # 组织归属关键词（老插件口径，见 v0.1.0/skills/recruit-model/references/system-config.md:28
 # 与 resume-intake/SKILL.md:24）
@@ -380,9 +388,9 @@ def run(args: argparse.Namespace) -> int:
     fatal: Optional[str] = None
 
     counter = DwsCallCounter()
-    runner = DwsRunner(counter=counter, timeout=300, http_timeout=180)
+    client = DwsClient(counter=counter, timeout=300, http_timeout=180)
     try:
-        tbl = AITable(args.config, runner=runner)
+        tbl = AITable(args.config, client=client)
     except Exception as exc:                      # config 缺失/格式错 → 立刻可见地失败
         fatal = "读取 config.json 失败：%s: %s" % (type(exc).__name__, exc)
         tbl = None
@@ -471,7 +479,7 @@ def run(args: argparse.Namespace) -> int:
           % (len(entries), n_ok, len(entries) - n_ok, extract_ms), flush=True)
 
     # ------------------------------------------------------------------ #
-    # 阶段 2：MD5 去重（checkpoint → 本批内部 → 库内附件）
+    # 阶段 2：去重（checkpoint 与本批内部走**真 MD5**；库内附件走「文件名+字节大小」）
     # ------------------------------------------------------------------ #
     seen_md5: Dict[str, Tuple[int, str]] = {}
     need_lib_scan = False
@@ -555,112 +563,80 @@ def run(args: argparse.Namespace) -> int:
             seen_md5[md5] = (ent["seq"], ent["file_name"])
         need_lib_scan = True
 
-    lib_attach: Dict[Tuple[str, Any], str] = {}
+    name_size_deduper = NameSizeDeduper()
     if tbl is not None and need_lib_scan and not args.no_dedupe_scan:
         try:
             t0 = time.monotonic()
-            recs = tbl.query_records("resume", fields=["attachment"], all_pages=True,
-                                     max_pages=100)
-            for r in recs:
-                att = (r.get("cells") or {}).get("attachment") or []
-                if not isinstance(att, list):
-                    continue
-                for a in att:
-                    if isinstance(a, dict) and a.get("filename"):
-                        lib_attach[(str(a["filename"]), a.get("size"))] = r["record_id"]
-            print("库内附件 MD5 比对索引：%d 条记录 / %d 个附件（%.2fs，%d 次调用）"
-                  % (len(recs), len(lib_attach), time.monotonic() - t0,
-                     tbl.dws_calls), flush=True)
+            scan = name_size_deduper.scan(tbl, "resume",
+                                          max_pages=DEDUPE_SCAN_MAX_PAGES)
+            print("库内附件「%s」比对索引：%d 条记录 / %d 个附件（%.2fs，%d 次调用）"
+                  % (name_size_deduper.key_label, scan.records, scan.indexed,
+                     time.monotonic() - t0, tbl.dws_calls), flush=True)
+            if scan.truncated:
+                # 缺陷2：翻页打满 max_pages 时旧实现静默截断，去重就此失效而用户无从得知
+                warnings.append(
+                    "库内去重扫描被截断：翻到 max_pages=%d（%d 页）仍有下一页，"
+                    "只取回 %d 条记录，库内实际存量更多 → 本次「%s」比对不完整，"
+                    "漏判重复上传的风险高。可加 --no-dedupe-scan 跳过库内比对"
+                    "（此时只靠手机号查重兜底），或调大 DEDUPE_SCAN_MAX_PAGES 后重跑"
+                    % (scan.max_pages, scan.pages, scan.records,
+                       name_size_deduper.key_label))
+                print("⚠️ 库内去重扫描不完整：max_pages=%d 已翻满，只取回 %d 条记录；"
+                      "可加 --no-dedupe-scan 跳过库内比对"
+                      % (scan.max_pages, scan.records), flush=True)
+            else:
+                # 缺陷3 的行数护栏：这次全表扫描已经**免费**给出了行数，喂给写前护栏，
+                # 省掉一次 record stats 调用（截断时数字不可信，就不喂）
+                tbl.set_row_count("resume", scan.records)
         except DwsError as exc:
-            warnings.append("库内附件查重扫描失败（%s/%s）：%s；本次跳过 MD5 与库内比对"
-                            % (exc.category, exc.code, exc.message[:200]))
+            warnings.append("库内附件查重扫描失败（%s/%s）：%s；本次跳过「%s」的库内比对"
+                            % (exc.category, exc.code, exc.message[:200],
+                               name_size_deduper.key_label))
 
     for ent in entries:
         if ent["result"] is not None or not ent["writable"]:
             continue
-        k = (ent["file_name"], ent["size"])
-        if k in lib_attach:
+        d = name_size_deduper.decide(ent["file_name"], ent["size"])
+        if d.action == "skip":
             ent["result"] = "跳过"
             ent["writable"] = False
-            ent["dedupe"] = "overwrite"
-            ent["record_id"] = lib_attach[k]
-            ent["reason"] = ("库内已存在同名同大小的简历附件（MD5 去重命中，"
-                             "record_id=%s），判为重复上传，已跳过" % lib_attach[k])
+            ent["dedupe"] = d.dedupe
+            ent["record_id"] = d.record_id
+            ent["reason"] = d.reason
 
     # ------------------------------------------------------------------ #
     # 阶段 3：一次批量手机号查重（契约要求：单次 filter 查询判 new/overwrite/conflict）
     # ------------------------------------------------------------------ #
-    phone_index: Dict[str, List[Dict[str, Any]]] = {}
+    phone_deduper = PhoneDeduper()
     pend = [e for e in entries if e["result"] is None and e["writable"]]
     if tbl is not None and pend:
         phones = sorted({str(_clean(e["fields"].get("phone"))) for e in pend})
         try:
             t0 = time.monotonic()
             calls0 = counter.calls
-            recs: List[Dict[str, Any]] = []
-            for i in range(0, len(phones), 100):      # OR 条件 ≤100/次，超出自己分片
-                recs.extend(tbl.query_records("resume", filter={"phone": phones[i:i + 100]},
-                                              fields=["phone", "name"], limit=100,
-                                              all_pages=True))
-            for r in recs:
-                cells = r.get("cells") or {}
-                ph = cells.get("phone")
-                ph = ph.strip() if isinstance(ph, str) else ph
-                if not ph:
-                    continue
-                phone_index.setdefault(str(ph), []).append(
-                    {"record_id": r["record_id"], "name": _clean(cells.get("name"))})
+            scan = phone_deduper.scan(tbl, phones, "resume")
             print("批量手机号查重：%d 个手机号 → 库内命中 %d 个（%.2fs，%d 次调用）"
-                  % (len(phones), len(phone_index), time.monotonic() - t0,
+                  % (len(phones), scan.indexed, time.monotonic() - t0,
                      counter.calls - calls0), flush=True)
         except DwsError as exc:
             fatal = "批量手机号查重失败（%s/%s）：%s" % (exc.category, exc.code, exc.message[:300])
             warnings.append(fatal)
 
-    batch_phone_seen: Dict[str, int] = {}
     for ent in entries:
         if ent["result"] is not None or not ent["writable"]:
             continue
         phone = str(_clean(ent["fields"].get("phone")))
         name = _clean(ent["fields"].get("name"))
-        if phone in batch_phone_seen:
+        d = phone_deduper.decide(phone, name, ent["seq"], ent["file_name"])
+        warnings.extend(d.warnings)
+        if d.dedupe is not None:
+            ent["dedupe"] = d.dedupe
+        if d.record_id is not UNSET:
+            ent["record_id"] = d.record_id
+        if d.action == "fail":
             ent["result"] = "失败"
-            ent["dedupe"] = "conflict"
             ent["writable"] = False
-            ent["reason"] = ("本批内第 %d 份《%s》已用了同一个手机号 %s，"
-                             "已停下不自动覆盖，请确认是否同一人"
-                             % (batch_phone_seen[phone], ent["file_name"], phone))
-            warnings.append("本批内手机号重复：%s（%s 与第 %d 份）"
-                            % (phone, ent["file_name"], batch_phone_seen[phone]))
-            continue
-        batch_phone_seen[phone] = ent["seq"]
-        hits = phone_index.get(phone) or []
-        if not hits:
-            ent["dedupe"] = "new"
-        elif len(hits) > 1:
-            ent["result"] = "失败"
-            ent["dedupe"] = "conflict"
-            ent["writable"] = False
-            ent["record_id"] = None
-            ent["reason"] = ("库内手机号 %s 命中 %d 条记录（%s），已停下不自动选择，"
-                             "请确认保留哪一条后再重跑"
-                             % (phone, len(hits),
-                                ", ".join(str(h["record_id"]) for h in hits[:5])))
-            warnings.append("同手机号多条冲突：%s → %d 条，需人工确认" % (phone, len(hits)))
-        else:
-            h = hits[0]
-            ent["record_id"] = h["record_id"]
-            if name and h["name"] and name != h["name"]:
-                ent["result"] = "失败"
-                ent["dedupe"] = "conflict"
-                ent["writable"] = False
-                ent["reason"] = ("手机号 %s 已在库内（姓名 %s），但本次简历姓名是 %s，"
-                                 "疑似重录或错录，已停下等你确认（record_id=%s）"
-                                 % (phone, h["name"], name, h["record_id"]))
-                warnings.append("疑似重录：手机号 %s 库内姓名 %r ≠ 本次 %r，需用户确认"
-                                % (phone, h["name"], name))
-            else:
-                ent["dedupe"] = "overwrite"
+            ent["reason"] = d.reason
 
     # ------------------------------------------------------------------ #
     # 阶段 4：组织/分类预判 + 字段整理（纯本地）
@@ -688,7 +664,7 @@ def run(args: argparse.Namespace) -> int:
             skills = [str(s).strip() for s in (f.get("skills") or []) if str(s).strip()]
             skills = list(dict.fromkeys(skills))[:SKILLS_MAX]
             certs = [str(c).strip() for c in (f.get("certificates") or []) if str(c).strip()]
-            full_text = AITable.sanitize_text(text or "")
+            full_text = sanitize_text(text or "")
             if len(full_text) > FULL_TEXT_MAX:
                 full_text = full_text[:FULL_TEXT_MAX]
                 ent["warnings"].append("简历全文超过 %d 字，已截断写入（原文 %d 字）"

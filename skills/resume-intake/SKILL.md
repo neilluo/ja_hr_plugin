@@ -1,7 +1,7 @@
 ---
 name: resume-intake
 version: 0.2.0
-description: Fast resume ingestion - one bundled Python script does text extraction, field pre-fill, MD5+phone dedupe, batch write (<=100/call), concurrent attachment upload and readback in a single turn; the agent only reviews the report and confirms low-confidence orgs. Matching then continues via match-verify.
+description: Fast resume ingestion - one bundled Python script does text extraction, field pre-fill, dedupe (real content MD5 within the batch/checkpoint, filename+byte-size against library attachments) + phone dedupe, batch write (<=100/call), concurrent attachment upload and readback in a single turn; the agent only reviews the report and confirms low-confidence orgs. Matching then continues via match-verify.
 name_en: Resume Intake
 name_zh: 简历入库
 description_en: Upload resumes (single or batch). One script call parses, dedupes, batch-writes and attaches; agent reviews the intake report only.
@@ -45,7 +45,7 @@ py -3 scripts\intake_resume.py --config <config.json绝对路径> --files <文�
 - `--out-dir`：本批产物目录（建议工作区下专用目录），同一批次的后续步骤复用同一目录。
 - `--no-attachment`：用户明确说"先不传附件"时加；之后"补传附件"= **重跑同一命令不带此参数**——checkpoint 把「记录已写」与「附件已传」分开记状态（契约 v3 §9#6），重跑时已完整成功的文件整条跳过，只欠附件的文件**仅补传附件**（按 record_id 更新附件字段并回读，绝不重复建记录）。
 - `--reset`：仅用户明确要求"从头重来"时加。
-- 脚本内部完成：提取文本 → 正则预抽字段 → MD5 → 一次批量查重（手机号主键）→ 批量写简历库（≤100 条/次，命中即覆盖更新）→ 技能标签只增不删补选项 → 期望地点兜底「不限」→ 并发上传附件（原始文件名）→ 写后回读。
+- 脚本内部完成：提取文本 → 正则预抽字段 → 去重（本批内/checkpoint 走真 MD5；库内附件走「文件名+字节大小」，**不是**内容级比对，转述时别说成"MD5 相同"）→ 一次批量查重（手机号主键）→ 批量写简历库（≤100 条/次，命中即覆盖更新）→ 技能标签只增不删补选项 → 期望地点兜底「不限」→ 并发上传附件（原始文件名）→ 写后回读。
 - 产物：`<out-dir>/candidates.json`、`intake_report.json`、`checkpoint.json`；stdout 末行 `ARTIFACT:<绝对路径>/intake_report.json`。
 
 **产物凭证校验（D7，必做）**：读取 ARTIFACT 指向的 `intake_report.json`，确认文件存在且 `ok == true` 才能进 Turn 2。不存在或非 ok → 重跑本步（checkpoint 幂等续跑，最多 2 次）；仍失败 → 如实告知用户失败原因与已完成部分，**禁止跳过或假装成功**。

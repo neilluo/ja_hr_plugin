@@ -68,8 +68,9 @@ for _p in (_ROOT / "shared", _ROOT / "shared" / "vendor"):
     if _p.is_dir() and _s not in sys.path:
         sys.path.insert(0, _s)
 
-from aitable_io import AITable, AITableConfigError  # noqa: E402
-from dws_util import DwsError, now_iso  # noqa: E402
+from aitable.client import DwsError, now_iso  # noqa: E402
+from aitable.schema import AITableConfigError  # noqa: E402
+from aitable.table import AITable  # noqa: E402
 
 try:                                    # W-A 的 JD 归一化（缺失时降级，不致命）
     from extract_fields import extract_job_fields
@@ -723,7 +724,7 @@ def fetch_candidates_from_table(table: AITable, org: Optional[str] = None,
     """契约 v3 §9#7：从简历库表批量导出**存量候选人**，映射成与 candidates.json
     完全相同的 candidates 结构（key 用 c01/c02…，record_id 用表里的真实 id）。
 
-    * 一次 filter 查询取全量（≤100/页由 aitable_io 自动翻页）；`--org` 时在服务端过滤。
+    * 一次 filter 查询取全量（≤100/页由 aitable.query 自动翻页）；`--org` 时在服务端过滤。
     * evidence 从「简历全文」text 列取，按 D4 保留教育/证书段：全文可用 → 用 W-A 的
       同一套分段规则（extract_resume_fields）切；切不出来 → 整段截断进 work_text，
       并在 meta 里标注 evidence_source="full_text_fallback"（后续 enrich_evidence
