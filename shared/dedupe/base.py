@@ -7,8 +7,10 @@
     decide(...)           对**一条**待入库项给判定，返回 DedupeDecision；不改调用方数据
 
 `key_label` 是这个去重器实际用的键的**业务话名称**，给用户看的理由串必须用它——
-缺陷1 的教训：文案写「MD5 去重命中」而实际键是 (文件名, 字节大小)，
-用户会以为做了内容级比对（P4 才会接真 MD5）。
+缺陷1 的教训：文案写「MD5 去重命中」而实际键是 (文件名, 字节大小)，用户会以为做了
+内容级比对。P4b 起内容级比对真的有了（`content_hash.py`，键 = 库内「附件内容MD5」
+字段），于是两档文案必须各说各的键：内容级说「附件内容MD5 比对命中」，老库回退档
+说「文件名+字节大小 比对命中」，不许互相借用。
 """
 
 from __future__ import annotations
@@ -52,6 +54,8 @@ class DedupeDecision:
     dedupe: Optional[str] = None
     #: UNSET = 不碰；None = 显式清空；str = 指向库内那条记录
     record_id: Any = UNSET
+    #: action=skip/fail 时 = 给用户看的判定理由；action=pass 且非空时 = **不判重复
+    #: 但要在清单说明**的原因（P4b：「同名同大小但内容不同 → 走覆盖更新」用这一档）
     reason: Optional[str] = None
     warnings: List[str] = field(default_factory=list)
 
@@ -87,8 +91,9 @@ class Deduper(ABC):
         """自己发查询 + `build_index`，并把截断状态收进 ScanResult。
 
         两个子类的查询形态天生不同，签名也就不同（这是维度差异，不是设计漏洞）：
-        NameSizeDeduper 是**全表扫**（要看完所有附件才知道有没有同名同大小的），
-        PhoneDeduper 是**按待查键分片查**（一次 OR filter 查完 N 个手机号）。
+        NameSizeDeduper / ContentHashDeduper 是**全表扫**（要看完所有附件才知道有没有
+        同内容或同名同大小的），PhoneDeduper 是**按待查键分片查**（一次 OR filter
+        查完 N 个手机号）。
         """
         raise NotImplementedError
 

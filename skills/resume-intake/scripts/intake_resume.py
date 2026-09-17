@@ -8,7 +8,8 @@ recruit-match-suite-fast / skills / resume-intake / scripts / intake_resume.py
 零 agent 回合**：
 
     提取文本 → 扫描件判定 → 正则抽字段 → 去重（本批内/checkpoint 走真 MD5，
-    库内走「文件名+字节大小」比对）→ 一次批量手机号查重
+    库内走「附件内容MD5」内容级比对；老库无该字段则回退「文件名+字节大小」并告警）
+    → 一次批量手机号查重
     → 组织/分类预判 → 一次 ensure_options 补技能标签 → 并发上传附件
     → 一次批量 upsert 写简历库 → 回读校验 → 产出 candidates.json /
       intake_report.json / checkpoint.json
@@ -32,7 +33,8 @@ recruit-match-suite-fast / skills / resume-intake / scripts / intake_resume.py
 设计纪律（每条都是实测/契约换来的，改代码前先读）
 ------------------------------------------------
 1. **dws 调用次数是第一优化目标**（契约 §0.5、W-B 实测单次固定开销 ≈1.0~1.3s）。
-   本脚本对一个批次只发这么几次：库内附件「文件名+字节大小」扫描 1 次 + 手机号批量查重 1 次
+   本脚本对一个批次只发这么几次：库内附件「附件内容MD5」内容级扫描 1 次（多读一个
+   字段，**不增加调用次数**）+ 手机号批量查重 1 次
    + ensure_options(技能标签/期望地点) 各 1 次起 + 批量 upsert 1 次/100 条
    + 回读 1 次/100 条（+ 传播延迟轮询）+ 附件 1 次/文件（无批量接口，只能并发）。
    全部计数进 report 的 `dws_calls`。
@@ -87,6 +89,19 @@ recruit-match-suite-fast / skills / resume-intake / scripts / intake_resume.py
    partial=true、reason="vision_gate"，请用户确认后重试或提供文字版。
    `RECRUIT_NO_VISION=1`（仅测试用）令 Vision OCR 梯队恒不受理，用于在非 macOS
    语义下演练本通道。
+12. **库内附件去重 = 真内容 MD5（P4b）**：简历库多一个 text 字段「附件内容MD5」
+    （config.json 的 `fields.resume.attach_md5`，**可选键**）。三层判定见
+    `shared/dedupe/content_hash.py`：① 本地文件真 MD5 命中库内哈希 → 判重复跳过
+    （理由如实说"内容 MD5 相同"，修掉了老键的**漏判**：同一内容换文件名也命中）；
+    ② 未命中但 (文件名,大小) 命中且库内那条有哈希 → 内容确实不同 → **不判重复**，
+    按同一候选人的简历新版本走覆盖更新（new/overwrite 由手机号查重定），说明进清单
+    （修掉了老键的**误判**：改一版重投不再被静默跳过）；③ 命中的老记录没有哈希
+    （P4b 之前写入）→ 无从比内容，按老键回退判重复 + 告警。
+    写入侧：附件上传成功后把本地文件真 MD5 随记录写入该字段；**懒回填** = 覆盖更新
+    老记录 / 6b 补传附件 / 回读补附件时一并把哈希补上，库随之收敛到内容级去重。
+    **老库容忍（硬要求）**：config/schema 里找不到该字段（客户现存库）→ 自动回退
+    `NameSizeDeduper` + 一条 warning（说明未启用内容级去重与启用方法），**不崩溃、
+    不自建字段**（建字段是 replicate 部署时的事）。
 """
 
 from __future__ import annotations
@@ -117,6 +132,10 @@ from aitable.client import DwsCallCounter, DwsClient, DwsError, now_iso  # noqa:
 from aitable.table import AITable                   # noqa: E402
 from aitable.values import sanitize_text, values_equal  # noqa: E402
 from dedupe.base import UNSET                       # noqa: E402
+from dedupe.content_hash import (                   # noqa: E402
+    ATTACH_MD5_FIELD_KEY,
+    ContentHashDeduper,
+)
 from dedupe.name_size import NameSizeDeduper        # noqa: E402
 from dedupe.phone import PhoneDeduper               # noqa: E402
 from extract_fields import extract_resume_fields    # noqa: E402
@@ -152,6 +171,16 @@ SETTLE_WAITS = (1.5, 3.0, 4.5)
 #: 库内去重扫描的翻页上限（100 页 × 100 条/页 ≈ 10000 条）。存量打满就会截断，
 #: 而去重是按「扫回来的这批」判的 → 截断即漏判重复，所以必须报出来（缺陷2）。
 DEDUPE_SCAN_MAX_PAGES = 100
+#: P4b 老库容忍：简历库没有「附件内容MD5」字段（config.json 的 fields.resume.attach_md5
+#: 缺失 / 表里没建这一列）时，库内去重自动回退 (文件名, 字节大小) 并给这一条 warning。
+#: **不得崩溃、不得自建字段**——建字段是 replicate 部署时的事，脚本只如实说明怎么启用。
+OLD_LIB_DEDUPE_WARNING = (
+    "当前简历库没有「附件内容MD5」字段（config.json 的 fields.resume.attach_md5 缺失），"
+    "库内附件去重**未启用内容级比对**，已回退到「文件名+字节大小」：同一文件名同一大小、"
+    "内容改过一版重投会被误判成重复跳过；同一份内容换个文件名会漏判（靠手机号查重兜底）。"
+    "启用方法：在简历库管理表加一个 text 字段「附件内容MD5」，把它的 fieldId 写进 "
+    "config.json 的 fields.resume.attach_md5（并同步 field_names/types），重跑即生效；"
+    "存量记录会在被覆盖更新/补传附件时自动回填哈希（脚本绝不自建字段）")
 #: P4a 20% 闸门（用户拍板）：needs_agent_vision 份数 / 总份数 > 此比例 →
 #: 疑似整批格式问题，不写任何记录，报告 reason="vision_gate"。
 VISION_GATE_RATIO = 0.20
@@ -805,7 +834,8 @@ def run(args: argparse.Namespace) -> int:
               "（checkpoint 已落盘，退出码 0）" % budget, flush=True)
 
     # ------------------------------------------------------------------ #
-    # 阶段 2：去重（checkpoint 与本批内部走**真 MD5**；库内附件走「文件名+字节大小」）
+    # 阶段 2：去重（checkpoint 与本批内部走**真 MD5**；库内附件 P4b 起也走真 MD5——
+    #         比对键是库内「附件内容MD5」字段，老库无该字段则回退「文件名+字节大小」）
     # ------------------------------------------------------------------ #
     seen_md5: Dict[str, Tuple[int, str]] = {}
     need_lib_scan = False
@@ -889,15 +919,37 @@ def run(args: argparse.Namespace) -> int:
             seen_md5[md5] = (ent["seq"], ent["file_name"])
         need_lib_scan = True
 
-    name_size_deduper = NameSizeDeduper()
+    # ---- P4b：库内去重**选档**（内容级 MD5 优先；老库无该字段 → 回退「文件名+字节大小」）----
+    # 硬要求：config/schema 里找不到「附件内容MD5」字段（客户现存库）时**不得崩溃、
+    # 不得自建字段**——回退 NameSizeDeduper + 一条 warning（说明未启用内容级去重与
+    # 如何启用）。建字段是 replicate 部署时的事。
+    attach_md5_field: Optional[str] = None
+    if tbl is not None:
+        try:
+            if ATTACH_MD5_FIELD_KEY in tbl.field_keys("resume"):
+                attach_md5_field = ATTACH_MD5_FIELD_KEY
+        except Exception as exc:                    # 防御：读 config 出问题也只回退，不崩
+            warnings.append("读取简历库字段清单失败（%s: %s）→ 库内去重按老库回退处理"
+                            % (type(exc).__name__, str(exc)[:120]))
+    if tbl is not None and attach_md5_field is None:
+        warnings.append(OLD_LIB_DEDUPE_WARNING)
+        print("⚠️ 简历库没有「附件内容MD5」字段 → 库内附件去重**未启用内容级比对**，"
+              "回退「文件名+字节大小」（启用方法与影响见 report.warnings）", flush=True)
+    lib_deduper = (ContentHashDeduper(attach_md5_field) if attach_md5_field
+                   else NameSizeDeduper())
     if tbl is not None and need_lib_scan and not args.no_dedupe_scan and not halted:
         try:
             t0 = time.monotonic()
-            scan = name_size_deduper.scan(tbl, "resume",
-                                          max_pages=DEDUPE_SCAN_MAX_PAGES)
-            print("库内附件「%s」比对索引：%d 条记录 / %d 个附件（%.2fs，%d 次调用）"
-                  % (name_size_deduper.key_label, scan.records, scan.indexed,
+            scan = lib_deduper.scan(tbl, "resume",
+                                    max_pages=DEDUPE_SCAN_MAX_PAGES)
+            print("库内附件「%s」比对索引：%d 条记录 / %d 个附件%s（%.2fs，%d 次调用）"
+                  % (lib_deduper.key_label, scan.records, scan.indexed,
+                     ("，" + lib_deduper.coverage_note())
+                     if isinstance(lib_deduper, ContentHashDeduper) else "",
                      time.monotonic() - t0, tbl.dws_calls), flush=True)
+            if isinstance(lib_deduper, ContentHashDeduper):
+                # 老记录容忍：库里有 P4b 之前写入（无哈希）的记录 → 如实告警一条
+                warnings.extend(lib_deduper.legacy_warning())
             if scan.truncated:
                 # 缺陷2：翻页打满 max_pages 时旧实现静默截断，去重就此失效而用户无从得知
                 warnings.append(
@@ -906,7 +958,7 @@ def run(args: argparse.Namespace) -> int:
                     "漏判重复上传的风险高。可加 --no-dedupe-scan 跳过库内比对"
                     "（此时只靠手机号查重兜底），或调大 DEDUPE_SCAN_MAX_PAGES 后重跑"
                     % (scan.max_pages, scan.pages, scan.records,
-                       name_size_deduper.key_label))
+                       lib_deduper.key_label))
                 print("⚠️ 库内去重扫描不完整：max_pages=%d 已翻满，只取回 %d 条记录；"
                       "可加 --no-dedupe-scan 跳过库内比对"
                       % (scan.max_pages, scan.records), flush=True)
@@ -917,18 +969,23 @@ def run(args: argparse.Namespace) -> int:
         except DwsError as exc:
             warnings.append("库内附件查重扫描失败（%s/%s）：%s；本次跳过「%s」的库内比对"
                             % (exc.category, exc.code, exc.message[:200],
-                               name_size_deduper.key_label))
+                               lib_deduper.key_label))
 
     for ent in entries:
         if ent["result"] is not None or not ent["writable"]:
             continue
-        d = name_size_deduper.decide(ent["file_name"], ent["size"])
+        d = lib_deduper.decide(ent["file_name"], ent["size"], ent.get("md5"))
+        warnings.extend(d.warnings)
         if d.action == "skip":
             ent["result"] = "跳过"
             ent["writable"] = False
             ent["dedupe"] = d.dedupe
             ent["record_id"] = d.record_id
             ent["reason"] = d.reason
+        elif d.reason:
+            # P4b：同名同大小但**内容不同** → 不判重复，走覆盖更新语义
+            # （new/overwrite 由下面的手机号查重决定），说明进清单该行
+            ent["dedupe_note"] = d.reason
 
     # ---- P4a 20% 闸门执行：进入任何 dws 写阶段之前，本轮**零写入** ----
     # （库内扫描已被 halted 拦掉；这里把仍未定论的条目全部转「未完成」并清空
@@ -1104,6 +1161,12 @@ def run(args: argparse.Namespace) -> int:
             for ent, res in zip(chunk, results):
                 if res.get("ok") and res.get("cell"):
                     ent["row"]["attachment"] = res["cell"]
+                    # P4b 写入侧：附件上传成功后，把**本地文件真 MD5**（提取层已算好，
+                    # 与上传的是同一个文件）随记录写进「附件内容MD5」字段——库内内容级
+                    # 去重就靠它。字段不存在（老库）时 attach_md5_field 为 None，一个
+                    # 键都不写（build_cells 遇到没映射的键会报错，绝不硬塞）。
+                    if attach_md5_field and ent.get("md5"):
+                        ent["row"][attach_md5_field] = ent["md5"]
                     ent["attachment_status"] = "uploaded"
                     summary["attachment_uploaded"] += 1
                 else:
@@ -1168,8 +1231,12 @@ def run(args: argparse.Namespace) -> int:
         updates: List[Dict[str, Any]] = []
         for ent, res in zip(fixups, results):
             if res.get("ok") and res.get("cell"):
-                updates.append({"record_id": ent["record_id"],
-                                "cells": {"attachment": res["cell"]}})
+                fix_cells: Dict[str, Any] = {"attachment": res["cell"]}
+                # P4b 懒回填：补传附件时顺带把「附件内容MD5」补上——P4b 之前入库的
+                # 老记录（无哈希、只能按文件名+大小回退判重）就此收敛到内容级去重
+                if attach_md5_field and ent.get("md5"):
+                    fix_cells[attach_md5_field] = ent["md5"]
+                updates.append({"record_id": ent["record_id"], "cells": fix_cells})
             else:
                 ent["result"] = "失败"
                 ent["attachment_status"] = "failed"
@@ -1274,13 +1341,13 @@ def run(args: argparse.Namespace) -> int:
     written = [e for e in to_write if e["result"] is None]
     if tbl is not None and written and not fatal:
         rb_fields = ["name", "phone", "education", "org", "full_text", "attachment",
-                     "expected_location", "skills"]
+                     "expected_location", "skills", ATTACH_MD5_FIELD_KEY]
         rb_fields = [k for k in rb_fields if k in tbl.field_keys("resume")]
         expected: Dict[str, Dict[str, Any]] = {}
         for ent in written:
             exp = {}
             for fk in ("name", "phone", "education", "org", "full_text",
-                       "expected_location", "skills"):
+                       "expected_location", "skills", ATTACH_MD5_FIELD_KEY):
                 if fk in rb_fields and ent["row"].get(fk) is not None:
                     exp[fk] = ent["row"][fk]
             expected[str(_clean(ent["row"]["phone"]))] = exp
@@ -1327,8 +1394,12 @@ def run(args: argparse.Namespace) -> int:
             for ent in written:
                 ph = str(_clean(ent["row"]["phone"]))
                 if ph in amiss and ent["row"].get("attachment"):
-                    fixes.append({"record_id": ent["record_id"],
-                                  "cells": {"attachment": ent["row"]["attachment"]}})
+                    fix_cells2: Dict[str, Any] = {"attachment": ent["row"]["attachment"]}
+                    # 附件与它的「附件内容MD5」必须同步写回（P4b：只补附件不补哈希
+                    # 会让这条记录永远停在老键回退档）
+                    if attach_md5_field and ent["row"].get(attach_md5_field):
+                        fix_cells2[attach_md5_field] = ent["row"][attach_md5_field]
+                    fixes.append({"record_id": ent["record_id"], "cells": fix_cells2})
             if fixes:
                 r = tbl.batch_update("resume", fixes)
                 warnings.append("回读发现 %d 条附件缺失，已补一次 batch_update（updated=%s failed=%d）"
@@ -1369,6 +1440,9 @@ def run(args: argparse.Namespace) -> int:
             summary["fail"] += 1
 
         extra = []
+        # P4b：「同名同大小但内容不同 → 不判重复、按新版本覆盖更新」的说明进清单该行
+        if ent.get("dedupe_note"):
+            extra.append(ent["dedupe_note"])
         if ent.get("org_guess"):
             extra.append("%s%s" % (ent["org_guess"],
                                    "" if ent.get("org_confidence") == "high" else "(待确认)"))

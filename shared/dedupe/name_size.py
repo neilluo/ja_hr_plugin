@@ -1,13 +1,19 @@
 # -*- coding: utf-8 -*-
-"""库内附件去重：键 = (附件文件名, 附件字节大小)。
+"""库内附件去重（**回退档**）：键 = (附件文件名, 附件字节大小)。
 
-⚠️ 这**不是内容级比对**（缺陷1 的诚实化口径）：库内索引来自 `attachment` 字段读回的
-`filename` / `size`，本地侧用的是 `file_name` 与 `stat().st_size`。同名同大小即判重复，
-改一个字节内容也照样命中；反过来，同一份内容换个文件名就漏掉。真 MD5 去重是 P4 的事
-（钉钉附件读回不带内容哈希，要做就得下载附件重算）。
+⚠️ 这**不是内容级比对**：库内索引来自 `attachment` 字段读回的 `filename` / `size`，
+本地侧用的是 `file_name` 与 `stat().st_size`。同名同大小即判重复，改一个字节内容也
+照样命中（误判）；反过来，同一份内容换个文件名就漏掉（漏判）。
 
-扫描口径原值保留：`fields=["attachment"]`、`all_pages=True`、`max_pages=100`
-（≈10000 条上限；截断由 `ScanResult.truncated` 报出去，见缺陷2）。
+P4b 起内容级比对走 `dedupe/content_hash.py` 的 `ContentHashDeduper`（读库内
+「附件内容MD5」字段）。本类只剩两个用途：
+  ① **老库回退**：config/schema 里没有「附件内容MD5」字段时，编排层直接用本类并告警
+     （绝不自建字段——建字段是 replicate 部署时的事）；
+  ② `ContentHashDeduper` 的父类：(文件名, 大小) 索引仍是「同名同大小但内容不同」
+     与「老记录无哈希」两层判定的依据。
+
+扫描口径原值保留：`all_pages=True`、`max_pages=100`（≈10000 条上限；截断由
+`ScanResult.truncated` 报出去，见缺陷2）。
 """
 
 from __future__ import annotations
@@ -50,7 +56,10 @@ class NameSizeDeduper(Deduper):
     def find(self, file_name: str, size: Any) -> Optional[str]:
         return self.index.get((file_name, size))
 
-    def decide(self, file_name: str, size: Any) -> DedupeDecision:
+    def decide(self, file_name: str, size: Any,
+               md5: Optional[str] = None) -> DedupeDecision:
+        """`md5` 参数**本类不看**（老库回退档就是没有内容哈希可比）；收它是为了与
+        `ContentHashDeduper.decide` 同签名，编排层可以多态调用。"""
         rid = self.find(file_name, size)
         if rid is None:
             return DedupeDecision()
