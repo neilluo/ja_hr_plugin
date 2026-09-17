@@ -140,6 +140,7 @@ from dedupe.name_size import NameSizeDeduper        # noqa: E402
 from dedupe.phone import PhoneDeduper               # noqa: E402
 from extract_fields import extract_resume_fields    # noqa: E402
 from extract_text import detect_scanned, extract_text  # noqa: E402
+from fields.identity import IDENTITY_EVIDENCE_KEYS, identity_evidence  # noqa: E402
 from fields.merger import FieldMerger               # noqa: E402
 from fields.regex_ext import RegexFieldExtractor    # noqa: E402
 
@@ -238,7 +239,10 @@ CANDIDATE_FIELDS = (
 )
 #: 契约 D13 要求额外透传的工作年限来源（text|filename|estimated）；
 #: P4a 只增：needs_review（agent 兜底草稿字段复核清单）与 field_sources（逐字段来源）
-CANDIDATE_EXTRA_FIELDS = ("years_source", "needs_review", "field_sources")
+#: P5 只增：email（身份阀判据+原文行）、name_source / parse_backend（姓名复核判据，
+#: C2 的 normalize_candidate 据此决定 needs_review 是否追加 "name"）
+CANDIDATE_EXTRA_FIELDS = ("years_source", "needs_review", "field_sources",
+                          "email", "name_source", "parse_backend")
 
 EVIDENCE_KEYS = ("education_text", "cert_text", "work_text", "skill_text")
 
@@ -1467,12 +1471,22 @@ def run(args: argparse.Namespace) -> int:
         loc_out = (ent.get("row") or {}).get("expected_location")
         if not loc_out and ent["parse_status"] == "ok":
             loc_out = normalize_location(f.get("expected_location"), known_locs)[0]
+        # P5 身份原文行（安全阀的原文保留面，判据见 shared/fields/identity.py）：
+        # 用**抽取原值**在简历全文里搜命中行（期望地点用归一前的原值——串栏垃圾值
+        # 恰恰要在原文里看得见）；解析不可用的文件不给行（下方统一置空）。
+        if ent["parse_status"] == "ok":
+            ident_lines = identity_evidence(ent.get("text") or "", f.get("name"),
+                                            f.get("email"), f.get("expected_location"))
+        else:
+            ident_lines = {k: "" for k in IDENTITY_EVIDENCE_KEYS}
         cand: Dict[str, Any] = {
             "key": "c%02d" % ent["seq"],
             "record_id": ent.get("record_id"),
             "file_name": ent["file_name"],
             "name": _clean(f.get("name")),
             "phone": _clean(f.get("phone")),
+            # P5 只增键：邮箱值 + 姓名来源 + 解析 backend（C2 身份阀判据）
+            "email": _clean(f.get("email")),
             "education": _clean(f.get("education")),
             "school": _clean(f.get("school")),
             "school_rank": _clean(f.get("school_rank")),
@@ -1489,8 +1503,10 @@ def run(args: argparse.Namespace) -> int:
             "parse_status": ent["parse_status"],
             "dedupe": ent["dedupe"],
             "attachment_status": ent["attachment_status"],
-            "evidence": {k: _truncate(secs.get(k), EVIDENCE_LIMITS.get(k, 2000))
-                         for k in EVIDENCE_KEYS},
+            "evidence": dict(
+                {k: _truncate(secs.get(k), EVIDENCE_LIMITS.get(k, 2000))
+                 for k in EVIDENCE_KEYS},
+                **ident_lines),
             # 契约 D13：工作年限来源必须透传给 C2 / Turn 2
             "years_source": f.get("years_experience_source"),
             # P4a（只增键）：agent 多模态兜底的复核清单与逐字段来源。
@@ -1498,11 +1514,15 @@ def run(args: argparse.Namespace) -> int:
             # 回合 2 必须用 evidence 原文复核；未经补丁的候选人两键为空。
             "needs_review": [str(x) for x in (f.get("needs_review") or [])],
             "field_sources": dict(f.get("field_sources") or {}),
+            # P5 只增键（姓名复核判据的另一半；见 CANDIDATE_EXTRA_FIELDS 注释）
+            "name_source": f.get("name_source"),
+            "parse_backend": ent.get("backend"),
         }
         if ent["parse_status"] != "ok" or ent["result"] == "未完成":
             # 契约 D11：不硬造字段 → 一律留空；「未完成」（预算内未处理）同样不给字段
-            for k in ("name", "phone", "education", "school", "school_rank", "major",
-                      "years_experience", "expected_position", "expected_location"):
+            for k in ("name", "phone", "email", "education", "school", "school_rank",
+                      "major", "years_experience", "expected_position",
+                      "expected_location"):
                 cand[k] = None
             cand["certificates"] = []
             cand["skills"] = []
@@ -1511,7 +1531,9 @@ def run(args: argparse.Namespace) -> int:
             cand["years_source"] = None
             cand["needs_review"] = []
             cand["field_sources"] = {}
-            cand["evidence"] = {k: "" for k in EVIDENCE_KEYS}
+            cand["name_source"] = None
+            cand["parse_backend"] = ent.get("backend")
+            cand["evidence"] = {k: "" for k in EVIDENCE_KEYS + IDENTITY_EVIDENCE_KEYS}
         candidates.append(cand)
 
         # checkpoint（v3 §9#6）：「记录已写」与「附件已传」分开记状态；

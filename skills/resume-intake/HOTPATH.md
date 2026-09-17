@@ -123,6 +123,10 @@ Read `SHARD:` 指向的 `digest_batch_NN.json`。单片场景就是**一次 Read
 分片文件里已按你的组织做了岗位预筛、并裁掉了判定用不到的岗位字段，所以它比 `digest.json` 小得多。
 `shard.jobs_org_prefiltered` / `shard.jobs_slimmed` / `shard.job_count_all` 会告诉你裁了什么；
 **这不影响判定口径**，`combo_count` 与全量时完全一致。
+P5 起候选人还可能带两类复核信号（处置规则见回合 3 的规则 3 / 规则 5）：
+`prefilter_suspicious`（组织预筛删掉的、**全部通过机械门槛**（学历/年限/证书）的跨组织岗位
+清单——预筛可能错杀该候选人的正确组织）与 `evidence.name_text / email_text / location_text`
+（姓名/邮箱/期望地点的**命中行原文**，供身份字段复核）。
 
 ## 3. 回合 3 —— 你亲自做一次批量语义判定（唯一真正用算力的回合）
 
@@ -166,13 +170,32 @@ Read `SHARD:` 指向的 `digest_batch_NN.json`。单片场景就是**一次 Read
    `needs_review` 含**字段名**（如 `"phone"`、`"school"`，来自 agent 多模态兜底补丁的
    `field_source="agent_vision"` 字段）→ 同样必须用 evidence 原文逐个复核，发现误读在
    `candidate_overrides` 里回填修正值，并把「该字段来自图片识别草稿、已复核」照转。
+   **P5 身份安全阀**：`needs_review` 含 `"name"` / `"email"`（姓名来自文件名/OCR/agent
+   草稿，或邮箱命中 OCR 噪声规则——域名无点、TLD 含非字母、域名主体字母数字混排如
+   qq.com 误读成 q9.com）→ 必须对照 `evidence.name_text` / `email_text` **原文逐字比对**；
+   `candidate_overrides` 没有 name/email 键——确认误读就业务话照转请用户人工修正库内记录，
+   且无论对错都要把复核结论（如「姓名已按原文复核无误」「邮箱疑似 OCR 误读已照转」）写进
+   该人**任一条目**的 `evidence`（apply 内置校验以此确认复核做过，缺了会出
+   `sem_name_review_missing` / `sem_email_review_missing` 告警）。
+   `evidence.location_text` 是期望地点的命中行原文：发现串栏垃圾值（地点串里混着电话/
+   微信/标签）→ 按 D14 处置，`candidate_overrides.expected_location` 覆盖成干净城市，
+   或原文确无明确城市时保持「不限」并在 evidence 注明。
 4. **稀疏字段补齐**：`evidence` 里有明确城市 → `candidate_overrides.expected_location`；
    证书缺失 → 从 `evidence.cert_text` 补 `certificates_extra`；漏抽技能 → `skills_extra`。
    没有要修正的字段就**不要**给这个人出 `candidate_overrides` 条目。
-5. **组织复核**：`org_confidence=="low"` 的候选人依 evidence 判定 ——
+5. **组织复核**：`org_confidence=="low"` 的候选人，以及 **P5 起带 `prefilter_suspicious`
+   / `needs_review` 含 `"org"` 的候选人**（组织预筛把「学历/年限/证书**全部机械达标**」的
+   跨组织岗位删掉了——预筛可能错杀了该候选人的正确组织），都必须依 evidence 复核组织 ——
    制造基地 / 厂务 / 设备 / EHS → **制造中心**；财务 / 行政 / 人力 / 数据信息 → **职能中心**。
-   结果回填 `candidate_overrides.org` + `org_reason`。**判不了才问用户，不猜。**
-   （组织是匹配的前提：简历组织必须等于岗位组织，否则匹配不到任何岗位。）
+   - 复核**确认无误** → 该人 `candidate_overrides.org_reason` 写清依据（apply 内置校验以
+     org/org_reason 为复核落点，缺了会出 `sem_org_review_missing` 告警）。
+   - 复核**确认有误**（组织判错）→ 写 `candidate_overrides.org` + `org_reason`；该人新组织的
+     组合本轮分片里没有，按 `prefilter_suspicious` 列出的 `job_key` 合并进 `rejected`
+     （reason 写「组织已改判为X，待预筛按新组织重切后补判」，别硬造门槛结论），让 apply
+     把改判组织写回简历库，然后**重跑同一条生成判定输入的命令**——脚本以库内组织为准
+     重切分片（stdout 会有一条「以库内组织为准」的 WARN），对新分片里该候选人的新组合
+     补判、更新 decisions 后再跑一次 apply（幂等，旧系统匹配记录自动清理）。
+   - **判不了才问用户，不猜。**（组织是匹配的前提：简历组织必须等于岗位组织，否则匹配不到任何岗位。）
 6. **不进判定、必须先停下问用户**：`dedupe=="conflict"`（手机号相同但姓名不同 = 疑似重名/错录）
    → 停止该候选人后续流程，业务话请用户确认，**不自动选第一条**。
    `parse_status != "ok"`（`needs_agent_vision` 补丁未覆盖 / 加密 / 乱码）→ 如实进 ❌ 清单，

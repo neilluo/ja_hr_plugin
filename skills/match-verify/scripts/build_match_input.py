@@ -29,6 +29,13 @@
 * D14   `期望地点` 缺失时脚本兜底填「不限」，agent 若从 evidence 看出明确城市则在
         candidate_overrides 里覆盖
 * D18   同时兼容 python 3.9 与 3.14（禁 match 语句 / 禁 `X | None` 运行时标注 / 禁 3.10+ API）
+* P5    组织预筛错杀可见化 + 身份字段安全阀（W6 召回审计的 13 条盲区里的 org/name/email/
+        地点四类）：① 对每个候选人**跨组织**的在招岗位做机械硬门槛复查（学历 ordinal /
+        年限数值 / 证书非空粗筛，专业跳过），全过 → 分片候选人加 `prefilter_suspicious`
+        + needs_review 追加 "org" + 聚合 warning（不把被删岗位 JD 塞回分片，O4 收益不动）；
+        ② evidence 只增 name_text / email_text / location_text（命中行原文 ≤60 字），
+        name 来源 filename/OCR/agent 草稿、email 命中 OCR 噪声规则 → needs_review 追加。
+        判据在 shared/fields/identity.py；消费面规则见 HOTPATH.md 回合 2。
 
 用法（CLI 接口面：--candidates 与 --from-table 二选一，其余冻结）
 -----------------------------------------------------------------
@@ -82,6 +89,14 @@ try:                                    # W-A 的简历分段（--from-table 切
 except Exception:                       # pragma: no cover
     extract_resume_fields = None
 
+from fields.identity import (           # P5 身份安全阀判据（纯函数，零第三方依赖）
+    IDENTITY_EVIDENCE_KEYS,
+    IDENTITY_LINE_LIMIT,
+    email_ocr_noise,
+    identity_evidence,
+    name_review_reason,
+)
+
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -99,12 +114,14 @@ SKILL_TEXT_LIMIT = 500
 REQUIREMENTS_LIMIT = 600
 
 #: 契约 §3.3 candidates 元素的字段清单（只增不减：C1 多给的字段原样透传）
+#: P5 只增：email（身份阀的判据与原文面要用）/ name_source / parse_backend（姓名复核判据）
 CANDIDATE_PASS_THROUGH = (
     "record_id", "file_name", "name", "phone", "email", "education", "school",
     "school_rank", "major", "years_experience", "certificates", "skills",
     "expected_position", "expected_location", "expected_salary",
     "org_guess", "org_confidence", "category_guess",
     "parse_status", "dedupe", "attachment_status",
+    "name_source", "parse_backend",
 )
 
 # ---------------------------------------------------------------------------
@@ -454,6 +471,9 @@ def build_evidence(cand: Dict[str, Any]) -> Dict[str, str]:
     """D4：education_text / cert_text **完整保留**；work_text / skill_text 可截断。
 
     兼容 C1 把原文段放在 `evidence` 里或放在 `sections` 里（W-A extract_fields 用 `sections`）。
+    P5 只增：身份字段原文行 name_text / email_text / location_text（≤60 字，判据见
+    shared/fields/identity.py）——上游给了就透传（再封顶一次），没给先置空串，
+    有全文时由 enrich_evidence 兜底补。
     """
     src = cand.get("evidence")
     if not isinstance(src, dict):
@@ -466,7 +486,10 @@ def build_evidence(cand: Dict[str, Any]) -> Dict[str, str]:
         # 兜底：C1 只给了简历全文
         ft = full(cand.get("full_text") or cand.get("resume_text"))
         work = clip(ft, WORK_TEXT_LIMIT)
-    return {"education_text": edu, "cert_text": cert, "work_text": work, "skill_text": skill}
+    ev = {"education_text": edu, "cert_text": cert, "work_text": work, "skill_text": skill}
+    for k in IDENTITY_EVIDENCE_KEYS:
+        ev[k] = clip(clean_ws(src.get(k)), IDENTITY_LINE_LIMIT, "…")
+    return ev
 
 
 def evidence_truncated(cand: Dict[str, Any], ev: Dict[str, str]) -> Dict[str, bool]:
@@ -542,6 +565,17 @@ def enrich_evidence(cand: Dict[str, Any], full_text: str) -> List[str]:
             prov["work_text"] = "full_text_head"
             notes.append("%s(%s)：evidence.work_text 兜底也找不到段落标题，改取简历全文头部 %d 字"
                          % (cand.get("name") or "?", cand.get("key"), len(head)))
+    # P5：身份原文行兜底——旧版 candidates.json / 模式 B 可能没带 name_text 等三键，
+    # 有全文就按同一套判据补上（命中行原文；姓名未命中取抬头行；地点未命中留空不标记）。
+    if any(not (ev.get(k) or "").strip() for k in IDENTITY_EVIDENCE_KEYS):
+        loc_raw = cand.get("expected_location")
+        if clean_ws(loc_raw) == DEFAULT_LOCATION:
+            loc_raw = None            # 「不限」是 D14 兜底值，不是原文词，不拿它去搜行
+        lines = identity_evidence(ft, cand.get("name"), cand.get("email"), loc_raw)
+        for k in IDENTITY_EVIDENCE_KEYS:
+            if not (ev.get(k) or "").strip() and lines.get(k):
+                ev[k] = lines[k]
+                prov[k] = "full_text_fallback"
     cand["evidence"] = ev
     cand["evidence_chars"] = sum(len(v or "") for v in ev.values())
     return notes
@@ -593,6 +627,23 @@ def normalize_candidate(cand: Dict[str, Any], idx: int, warnings: List[str]) -> 
                         "已标 needs_review=[years]；agent 必须用 evidence 原文复核后在 "
                         "candidate_overrides.years_experience 回填，不要直接当硬门槛用"
                         % (out.get("name") or "?", key, out.get("years_experience")))
+
+    # P5 身份安全阀（判据在 shared/fields/identity.py）：姓名来源 filename/OCR/agent 草稿
+    # → needs_review 追加 "name"；邮箱命中 OCR 噪声规则 → 追加 "email"。只标记不拦截
+    # （尺度同 D13）；逐人 warning 会按分片数复制、撑大 shard 体积，这里把判据记在
+    # 临时键 _p5_identity_notes 上，由 build_digest 汇成聚合 warning 后弹出。
+    p5_notes: List[str] = []
+    n_reason = name_review_reason(cand.get("name_source"), cand.get("parse_backend"),
+                                  cand.get("field_sources"))
+    if n_reason and clean_ws(out.get("name")) and "name" not in needs:
+        needs.append("name")
+        p5_notes.append("name：%s" % n_reason)
+    e_reason = email_ocr_noise(out.get("email"))
+    if e_reason and "email" not in needs:
+        needs.append("email")
+        p5_notes.append("email：%s" % e_reason)
+    if p5_notes:
+        out["_p5_identity_notes"] = p5_notes
     out["needs_review"] = needs
 
     # evidence（D4）
@@ -682,7 +733,7 @@ def check_onboarded(table: AITable, candidates: List[Dict[str, Any]],
     try:
         recs = table.query_records("resume", record_ids=ids,
                                    fields=["name", "phone", "comm_status", "org", "category",
-                                           "full_text"])
+                                           "email", "full_text"])
     except (DwsError, AITableConfigError) as exc:
         warnings.append("核对「沟通状态」失败（%s），本批全部按参与处理" % str(exc)[:160])
         return candidates, []
@@ -693,10 +744,25 @@ def check_onboarded(table: AITable, candidates: List[Dict[str, Any]],
         if cells:
             cs = clean_ws(as_text(cells.get("comm_status")))
             c["comm_status"] = cs or None
+            tbl_org = clean_ws(as_text(cells.get("org"))) or None
             if not c.get("org_guess"):
-                c["org_guess"] = clean_ws(as_text(cells.get("org"))) or None
+                c["org_guess"] = tbl_org
+            elif tbl_org and tbl_org != clean_ws(c.get("org_guess")):
+                # P5：表是唯一事实源——apply_decisions 写回组织改判（或用户人工改库）后，
+                # 重跑同一命令必须按**表里的新组织**重切预筛与组合（HOTPATH 回合 2
+                # 规则 5「组织判错 → 回填 override → 重跑同命令」依赖本语义）。改动显式报告。
+                warnings.append("%s(%s)：简历库组织=%s 与 candidates.json 的 org_guess=%s "
+                                "不一致 → 以库内为准（表是唯一事实源），本轮组织预筛与组合"
+                                "按库内值重切"
+                                % (c.get("name") or "?", c.get("key"), tbl_org,
+                                   c.get("org_guess")))
+                c["org_guess"] = tbl_org
             if not c.get("category_guess"):
                 c["category_guess"] = clean_ws(as_text(cells.get("category"))) or None
+            if not c.get("email"):
+                # P5：邮箱身份阀要在 C2 判 OCR 噪声；旧版 candidates.json 没带 email 时
+                # 从表里回补（同一次查询顺带取，零额外调用）
+                c["email"] = clean_ws(as_text(cells.get("email"))) or None
             ft = as_text(cells.get("full_text"))
             if ft:
                 c["_full_text_from_table"] = ft
@@ -716,7 +782,8 @@ def check_onboarded(table: AITable, candidates: List[Dict[str, Any]],
 
 #: --from-table 导出的候选人字段集合：**与 C1 intake_resume.py 产出的 candidates.json
 #: 元素完全同构**（契约 v3 §9#7 的验收断言就是「两种模式产出的键集合完全一致」）。
-#: 表里独有的 email / 期望薪资列不导出（不在匹配判定范围内，导出会破坏键集合一致性）。
+#: P5 起 email 也导出（身份阀判据），并补 name_source / parse_backend 两键
+#: （表里不存来源，置 None）保持键集合与模式 A 一致。
 def fetch_candidates_from_table(table: AITable, org: Optional[str] = None,
                                 exclude_onboarded: bool = False,
                                 warnings: Optional[List[str]] = None
@@ -769,6 +836,9 @@ def fetch_candidates_from_table(table: AITable, org: Optional[str] = None,
             "file_name": fname or ("%s（在库简历）" % name if name else None),
             "name": name,
             "phone": clean_ws(as_text(cells.get("phone"))) or None,
+            # P5：邮箱导出（身份阀要在 C2 判 OCR 噪声 + 取原文行）；表里不存姓名来源
+            # 与解析 backend，两键置 None 只为与模式 A 键集合一致（契约 v3 §9#7）
+            "email": clean_ws(as_text(cells.get("email"))) or None,
             "education": clean_ws(as_text(cells.get("education"))) or None,
             "school": clean_ws(as_text(cells.get("school"))) or None,
             "school_rank": clean_ws(as_text(cells.get("school_rank"))) or None,
@@ -785,7 +855,12 @@ def fetch_candidates_from_table(table: AITable, org: Optional[str] = None,
             "dedupe": "existing",                # 存量导出，不是本批 new/overwrite/conflict
             "attachment_status": "uploaded" if att else "missing",
             "years_source": None,                # 表里不存来源；估算值复核以 evidence 原文为准
-            "evidence": {"education_text": "", "cert_text": "", "work_text": "", "skill_text": ""},
+            "name_source": None,
+            "parse_backend": None,
+            "evidence": {"education_text": "", "cert_text": "", "work_text": "",
+                         "skill_text": "",
+                         # P5 身份原文行：有「简历全文」时由 enrich_evidence 统一兜底补
+                         "name_text": "", "email_text": "", "location_text": ""},
         }
         y = as_number(cells.get("years_experience"), None)
         if y is not None:
@@ -941,6 +1016,144 @@ def select_shard_jobs(shard: Sequence[Dict[str, Any]],
     return kept, "prefiltered"
 
 
+# --------------------------------------------------------------------------- #
+# P5：组织预筛「错杀」的机械复查（零 token、零语义——只做 ordinal/数值/非空比较）
+#
+# 背景（W6 实测最严重盲区）：org_confidence=high 时 L3 预筛把跨组织岗位删出分片，
+# 且判定组合本来就只在同组织内发生——组织一旦判错（任旒：信息技术工程师被判
+# 「制造中心/high」，真值职能中心），正确组织的全部组合**静默错杀**，Turn 2 不可补救。
+#
+# P5 对策（设计第 1 条）：对每个候选人**跨组织**的在招岗位，用 digest 里现成的数据做
+# 机械硬门槛筛查：学历 ordinal 比较（博士>硕士>本科>大专>中专）/ 年限数值比较 /
+# 证书「无要求或持证者优先视为过，否则候选人证书非空视为过（粗筛）」；**专业跳过**
+# （语义项，机械判不了）。全部通过 → 该岗位「本来很有可能是该候选人的正确组织」→
+# 分片候选人加 prefilter_suspicious + needs_review 追加 "org" + 聚合 warning。
+#
+# 实现口径（在派工设计内的两点细化，报告有说明）：
+#   * 跨组织岗位按**全量在招岗位**算，不只按「本片分片缺了什么」：分片预筛是并集口径
+#     （片里只要有一个人属于该组织，岗位就保留），但组合层只在同组织内配对——跨组织
+#     岗位对高置信候选人**永远不进组合**，错杀面与分片删光完全一致。
+#   * org_confidence=low 的候选人不标：其分片必然保留全部岗位，且 HOTPATH 规则 5
+#     已强制 agent 复核组织，再标属重复噪声。
+# **不把被删岗位的 JD 塞进分片**（O4 的 token 收益不动）；可见即可，复核走
+# candidate_overrides.org + 重跑同一命令（消费面规则见 HOTPATH.md 回合 2）。
+# --------------------------------------------------------------------------- #
+
+#: 学历 ordinal（设计口径：博士>硕士>本科>大专>中专；常见同义词归到同档）。
+#: 顺序无关：取命中档的最小值当「岗位下限」、最大值当「候选人学历」。
+EDU_ORDINAL = (("博士", 5), ("硕士", 4), ("研究生", 4), ("本科", 3), ("学士", 3),
+               ("大学", 3), ("大专", 2), ("专科", 2), ("高职", 2), ("中专", 1),
+               ("中职", 1), ("高中", 0))
+
+_YEARS_REQ_RE = re.compile(r"(\d{1,2})\s*年")
+
+
+def _edu_rank(s: Any, mode: str) -> Optional[int]:
+    """学历 → ordinal。mode="req" 取命中档最小值（岗位下限），"cand" 取最大值。"""
+    t = str(s or "")
+    if not t.strip():
+        return None
+    hits = [o for w, o in EDU_ORDINAL if w in t]
+    if not hits:
+        return None
+    return min(hits) if mode == "req" else max(hits)
+
+
+def _years_req_of(job: Dict[str, Any]) -> Optional[float]:
+    """岗位经验年限下限：优先 years_req_min（W-A 抽取），缺失时从 hard_gates.years
+    文本里抓「N年」。抓不到/≤0 → None（= 无年限要求）。"""
+    n = as_number(job.get("years_req_min"), None)
+    if n is None:
+        raw = clean_ws((job.get("hard_gates") or {}).get("years"))
+        if raw and raw not in _EMPTY_GATE:
+            m = _YEARS_REQ_RE.search(raw)
+            if m:
+                n = float(m.group(1))
+    if n is None or n <= 0:
+        return None
+    return n
+
+
+def mechanical_hard_gates(cand: Dict[str, Any], job: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """对一个 候选人×被预筛删掉的岗位 做机械硬门槛筛查。返回 (是否全过, 过闸明细)。
+
+    从严口径（与 Turn 2「证据不足按不达标」一致）：任一项**无法确认通过**即 False——
+    岗位要求存在但候选人数据缺失/解析不出 → 不过；专业是语义项，不参与（设计口径）。
+    """
+    hg = job.get("hard_gates") or {}
+    gates: List[str] = []
+
+    # ① 学历：ordinal 比较；要求为空/不限 → 过
+    req_s = clean_ws(hg.get("education"))
+    if not req_s or req_s in _EMPTY_GATE or "不限" in req_s or "无" in req_s:
+        gates.append("学历(无要求)")
+    else:
+        r_req = _edu_rank(req_s, "req")
+        r_cand = _edu_rank(cand.get("education"), "cand")
+        if r_req is None or r_cand is None or r_cand < r_req:
+            return False, []
+        gates.append("学历(%s≥%s)" % (clip(clean_ws(cand.get("education")), 6, ""),
+                                      clip(req_s, 6, "")))
+
+    # ② 年限：数值比较（候选人 years vs 岗位下限）
+    req_y = _years_req_of(job)
+    cand_y = as_number(cand.get("years_experience"), None)
+    if req_y is None:
+        gates.append("年限(无要求)")
+    elif cand_y is None or cand_y < req_y:
+        return False, []
+    else:
+        gates.append("年限(%g≥%g)" % (cand_y, req_y))
+
+    # ③ 证书：要求为「无/空/持证者优先」→ 过；否则候选人证书非空视为过（粗筛即可）
+    c_req = clean_ws(hg.get("certificates"))
+    if (not c_req or c_req in _EMPTY_GATE or "无" in c_req or "优先" in c_req
+            or job.get("cert_is_preferred_not_required")):
+        gates.append("证书(无要求或持证者优先)")
+    elif as_list(cand.get("certificates")):
+        gates.append("证书(候选人持证,粗筛过)")
+    else:
+        return False, []
+
+    return True, gates
+
+
+def find_prefilter_suspicious(candidates: Sequence[Dict[str, Any]],
+                              jobs: Sequence[Dict[str, Any]],
+                              org_prefilter: bool = True) -> Dict[str, List[Dict[str, Any]]]:
+    """P5：找出「组织预筛可能错杀」的 候选人×跨组织岗位 组合。
+
+    返回 {candidate_key: [entry,…]}，entry = {"job_key","job_name","dropped_org",
+    "passed_mechanical_gates"}；命中的候选人**就地**把 needs_review 追加 "org"。
+    只查 org_confidence != low 且有 org_guess 的候选人（口径见上方注释块）。
+    """
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    if not org_prefilter:
+        return out
+    for c in candidates:
+        corg = clean_ws(c.get("org_guess"))
+        if not corg:
+            continue
+        if str(c.get("org_confidence") or "").strip().lower() == "low":
+            continue
+        entries: List[Dict[str, Any]] = []
+        for j in jobs:
+            jorg = clean_ws(j.get("org"))
+            if not jorg or jorg == corg:
+                continue
+            ok, gates = mechanical_hard_gates(c, j)
+            if ok:
+                entries.append({"job_key": j.get("key"), "job_name": j.get("job_name"),
+                                "dropped_org": jorg, "passed_mechanical_gates": gates})
+        if entries:
+            out[c["key"]] = entries
+            nr = dedupe_keep_order(as_list(c.get("needs_review")))
+            if "org" not in nr:
+                nr.append("org")
+            c["needs_review"] = nr
+    return out
+
+
 #: L4-c 的 stdout 预算（字节）。实测 qodercli 对 Bash tool_result 有**硬上限**：
 #: 30,002 字节（≈29.3 KB）处**静默切断、不留任何截断标记**（W-I 实测：一次
 #: intake+auto-match 的 stdout 被切在第 15 个岗位的 requirements_text 中间，
@@ -1069,6 +1282,37 @@ def build_digest(config_path: str, candidates_path: Optional[str], out_dir: str,
                         "学历门槛只能靠 education 字段判，agent 判 fail 前请特别小心（D4 误杀坑）"
                         % (len(empty_edu), ",".join(empty_edu[:8])))
 
+    # P5：身份复核聚合 warning（逐人判据在 normalize_candidate 的临时键里；聚合是
+    # 为了控制分片体积——meta.warnings 会按分片数复制。复核动作由 needs_review +
+    # evidence.name_text/email_text 驱动，消费面规则见 HOTPATH.md 回合 2）
+    p5_name_flagged: List[str] = []
+    p5_email_flagged: List[str] = []
+    for c in active:
+        notes = list(c.pop("_p5_identity_notes", None) or [])
+        # 旧版 candidates.json 不带 email：check_onboarded 在 normalize **之后**才从表里
+        # 回补，邮箱噪声阀对回补值再判一次（新版 C1 已在 normalize 里判过，去重不重复标）
+        e_reason = email_ocr_noise(c.get("email"))
+        if e_reason and "email" not in as_list(c.get("needs_review")):
+            c["needs_review"] = dedupe_keep_order(as_list(c.get("needs_review")) + ["email"])
+            notes.append("email：%s" % e_reason)
+        for note in notes:
+            label = "%s(%s)" % (c.get("name") or "?", c.get("key"))
+            if note.startswith("name"):
+                p5_name_flagged.append(label)
+            else:
+                p5_email_flagged.append(label)
+    if p5_name_flagged:
+        warnings.append("P5 姓名待复核 %d 人（来源=文件名/OCR/agent 草稿，已标 needs_review+"
+                        "name）：%s%s；Turn 2 必须对照 evidence.name_text 原文复核，"
+                        "误读要业务话照转请用户人工修正"
+                        % (len(p5_name_flagged), "、".join(p5_name_flagged[:10]),
+                           " 等" if len(p5_name_flagged) > 10 else ""))
+    if p5_email_flagged:
+        warnings.append("P5 邮箱疑似 OCR 噪声 %d 人（域名无点/TLD 含非字母/域名主体字母"
+                        "数字混排如 qq.com→q9.com，已标 needs_review+email）：%s；"
+                        "Turn 2 必须对照 evidence.email_text 原文复核并照转"
+                        % (len(p5_email_flagged), "、".join(p5_email_flagged[:10])))
+
     jobs: List[Dict[str, Any]] = []
     if not errors:
         try:
@@ -1098,6 +1342,25 @@ def build_digest(config_path: str, candidates_path: Optional[str], out_dir: str,
         warnings.append("有 %d 个候选人在表里找不到同组织的在招岗位，本轮不产生任何判定：%s"
                         % (len(unmatched), "; ".join(unmatched[:8])))
 
+    # P5：组织预筛错杀的机械复查（零 token；口径与判据见 find_prefilter_suspicious）。
+    # 命中的候选人 needs_review 已就地追加 "org"；prefilter_suspicious 明细只进**分片**
+    # 候选人（Turn 2 消费面），digest.json 候选人只带 needs_review 标记（apply 侧消费面）。
+    suspicious = (find_prefilter_suspicious(active, jobs, org_prefilter=org_prefilter)
+                  if (jobs and not errors) else {})
+    susp_pairs = sum(len(v) for v in suspicious.values())
+    if suspicious:
+        by_key = {c["key"]: c for c in active}
+        sample = "、".join("%s(%s)×%d" % (by_key[k].get("name") or "?", k,
+                                          len(suspicious[k]))
+                           for k in sorted(suspicious)[:6])
+        warnings.append("P5 组织预筛疑似错杀：%d 个候选人共 %d 个跨组织岗位**全部通过机械"
+                        "门槛**（学历/年限/证书；专业是语义项不参与）却被组织预筛删除——%s%s。"
+                        "预筛可能错杀，请复核组织归属：明细见分片候选人 prefilter_suspicious"
+                        "（needs_review 已追加 org）；Turn 2 复核确认有误 → 回填 "
+                        "candidate_overrides.org 并**重跑同一命令**让预筛按新组织重切"
+                        % (len(suspicious), susp_pairs, sample,
+                           " 等%d人" % len(suspicious) if len(suspicious) > 6 else ""))
+
     shards = make_shards(active, max_per_batch)
     in_chars, in_toks = est_tokens({"candidates": active, "jobs": jobs})
     meta = {
@@ -1122,6 +1385,11 @@ def build_digest(config_path: str, candidates_path: Optional[str], out_dir: str,
                            % (WORK_TEXT_LIMIT, SKILL_TEXT_LIMIT),
         "requirements_text_limit": REQUIREMENTS_LIMIT,
         "needs_review_years": sorted([c["key"] for c in active if "years" in c.get("needs_review", [])]),
+        # P5：组织预筛机械复查的汇总（逐人明细在分片候选人 prefilter_suspicious 里；
+        # digest 候选人只带 needs_review 追加的 "org" 标记，供 apply/verify 侧消费）
+        "prefilter_suspicious": {"candidate_count": len(suspicious),
+                                 "job_pair_count": susp_pairs,
+                                 "candidate_keys": sorted(suspicious)},
         "evidence_enriched_candidates": n_enriched,
         "evidence_empty_education": empty_edu,
         "dws_calls": table.dws_calls,
@@ -1161,6 +1429,9 @@ def build_digest(config_path: str, candidates_path: Optional[str], out_dir: str,
     # 逐字节相同——下游 verify/apply 吃 digest.json，输入契约零变化、零回归（任务 3.1 md5 证明）。
     # 裁剪与遥测只作用于**分片文件**（agent 唯一读进上下文的东西）。
     # 两个开关都关时，分片文件也逐字节回到移植前形态（optimize=False → 不写遥测键、jobs 全量）。
+    # （P5 注：本节「逐字节不变」指 W-I 裁剪开关的行为；P5 对 digest 的影响是**只增键**——
+    # 候选人 evidence 三个身份原文键、needs_review 的 org/name/email 标记、meta 汇总键，
+    # 下游 verify/apply 按只增不减契约兼容。）
     optimize = bool(org_prefilter or slim_jobs)
     shard_paths: List[str] = []
     shard_docs: List[Dict[str, Any]] = []
@@ -1172,13 +1443,20 @@ def build_digest(config_path: str, candidates_path: Optional[str], out_dir: str,
         shard_jobs, pf_note = select_shard_jobs(sh, jobs, org_prefilter)
         if slim_jobs:
             shard_jobs = [slim_job(j) for j in shard_jobs]
-        sm_shard = shard_meta(sh, shard_jobs, i, len(shards))
+        # P5：prefilter_suspicious 明细只挂**分片**候选人（dict 浅拷贝，digest.json 的
+        # 候选人对象不被污染）；sm_shard 用挂载后的副本算，输入 chars 遥测才诚实。
+        shard_cands = [(dict(c, prefilter_suspicious=suspicious[c["key"]])
+                        if c["key"] in suspicious else c) for c in sh]
+        sm_shard = shard_meta(shard_cands, shard_jobs, i, len(shards))
         if optimize:
             sm_shard["job_count_all"] = len(jobs)
             sm_shard["jobs_org_prefiltered"] = (pf_note == "prefiltered")
             sm_shard["jobs_prefilter_note"] = pf_note
             sm_shard["jobs_slimmed"] = bool(slim_jobs)
             sm_shard["dropped_job_fields"] = list(SLIM_DROP_JOB_FIELDS) if slim_jobs else []
+        n_susp_shard = sum(len(suspicious.get(c["key"]) or []) for c in sh)
+        if n_susp_shard:
+            sm_shard["prefilter_suspicious_count"] = n_susp_shard
         shard_doc = {
             "batch_id": bid,
             "generated_at": digest["generated_at"],
@@ -1186,7 +1464,7 @@ def build_digest(config_path: str, candidates_path: Optional[str], out_dir: str,
             "errors": errors,
             "shard": sm_shard,
             "scoring_rules": SCORING_RULES,
-            "candidates": list(sh),
+            "candidates": shard_cands,
             "jobs": shard_jobs,
             "meta": {k: v for k, v in meta.items() if k != "shards"},
         }
@@ -1302,6 +1580,26 @@ def report_and_emit(res: Dict[str, Any], emit_stdout: bool = False,
     if m["needs_review_years"]:
         print("D13 needs_review=[years]（工作年限是估算的，agent 必须复核）: %s"
               % ",".join(m["needs_review_years"]))
+    # P5：组织预筛疑似错杀的逐人清单（明细在分片候选人 prefilter_suspicious 里；
+    # 这里只打人名+被删岗位名，控制 stdout 体量——Bash 输出 ~30KB 处会被静默截断）
+    susp_meta = m.get("prefilter_suspicious") or {}
+    if susp_meta.get("candidate_count"):
+        print("P5 组织预筛疑似错杀 %d 人 / %d 个跨组织岗位组合（全部通过机械门槛却被删；"
+              "Turn 2 必须依 evidence 复核组织，判错 → candidate_overrides.org + 重跑）："
+              % (susp_meta["candidate_count"], susp_meta.get("job_pair_count", 0)))
+        for doc in shard_docs:
+            for c in doc.get("candidates") or []:
+                ps = c.get("prefilter_suspicious") or []
+                if ps:
+                    shown = "；".join("%s[%s|%s]" % (e.get("job_name") or "?",
+                                                    e.get("job_key") or "?",
+                                                    e.get("dropped_org") or "?")
+                                     for e in ps[:5])
+                    if len(ps) > 5:
+                        shown += "；等%d岗" % len(ps)
+                    print("  PREFILTER_SUSPICIOUS: %s(%s) org=%s → 被删 %d 岗: %s"
+                          % (c.get("name") or "?", c.get("key"), c.get("org_guess") or "?",
+                             len(ps), shown))
     if m["excluded_onboarded"]:
         print("已入职剔除（老插件铁律）: %s"
               % ",".join(str(o["name"]) for o in m["excluded_onboarded"]))

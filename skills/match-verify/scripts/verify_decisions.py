@@ -506,6 +506,67 @@ def semantic_guardrails(digest: Dict[str, Any], decisions: Dict[str, Any],
                                    "W-F 实测 9/9 标记、agent 执行率不满：P0 8/9、run1 4/9）；"
                                    "必须补做复核或向用户说明"
                                    % (len(need_years), ",".join(need_years[:10]))})
+
+    # ---------------- SEM-P（P5）：身份/组织安全阀的复核没有落点 ----------------
+    # digest 里 needs_review 含 org/name/email 的候选人（P5：组织预筛机械复查命中 /
+    # 姓名来源文件名/OCR/agent 草稿 / 邮箱疑似 OCR 噪声），decisions 里必须有复核动作：
+    #   org   = candidate_overrides 给了 org 或 org_reason（或条目 evidence 里有组织说明）；
+    #   name/email = 该人任一条目的 evidence/reason 文本里出现复核关键词——契约 v3 §9#1
+    #     的 candidate_overrides 没有 name/email 键，复核结论只能落在 evidence 里
+    #     （HOTPATH 回合 2 已写明该落点）。
+    # 两者皆无 → warning 强制人工复核（尺度同 SEM-O / sem_years_review_missing，不拒写库）。
+    identity_review = (("org", ("组织", "org")),
+                       ("name", ("姓名", "name")),
+                       ("email", ("邮箱", "email", "邮件")))
+    ovr_by_ck: Dict[str, Dict[str, Any]] = {}
+    for o in ovr:
+        if o.get("candidate_key") is not None:
+            ovr_by_ck.setdefault(str(o.get("candidate_key")), o)
+    text_by_ck: Dict[str, str] = {}
+    for p in decisions.get("passed") or []:
+        if isinstance(p, dict) and p.get("candidate_key") is not None:
+            k = str(p.get("candidate_key"))
+            text_by_ck[k] = "%s %s" % (text_by_ck.get(k, ""), str(p.get("evidence") or ""))
+    for rj in decisions.get("rejected") or []:
+        if isinstance(rj, dict) and rj.get("candidate_key") is not None:
+            k = str(rj.get("candidate_key"))
+            text_by_ck[k] = "%s %s" % (text_by_ck.get(k, ""), str(rj.get("reason") or ""))
+    for fld, kws in identity_review:
+        need = [str(c.get("key")) for c in (digest.get("candidates") or [])
+                if isinstance(c, dict) and fld in (c.get("needs_review") or [])]
+        if not need:
+            continue
+        missing = []
+        for k in need:
+            o = ovr_by_ck.get(k) or {}
+            if fld == "org" and (o.get("org") or o.get("org_reason")):
+                continue
+            txt = text_by_ck.get(k, "").lower()
+            if any(w.lower() in txt for w in kws):
+                continue
+            missing.append(k)
+        metrics.update(**{"needs_review_%s" % fld: len(need),
+                          "%s_review_missing" % fld: len(missing)})
+        if missing:
+            if fld == "org":
+                act = ("candidate_overrides 里没有任何 org / org_reason 复核结论，条目 "
+                       "evidence 也无组织说明 → 组织归属复核没做（P5 预筛错杀阀形同虚设）；"
+                       "必须依 evidence 复核：确认无误写 org_reason，确认有误写 "
+                       "candidate_overrides.org 并重跑 build_match_input")
+            elif fld == "name":
+                act = ("decisions 里没有一处「姓名」复核说明 → evidence.name_text 原文"
+                       "比对没做；必须复核并把结论写进该人任一条目 evidence（误读要业务话"
+                       "照转请用户人工修正库内记录；candidate_overrides 无 name 键）")
+            else:
+                act = ("decisions 里没有一处「邮箱」复核说明 → evidence.email_text 原文"
+                       "比对没做；必须复核并把结论写进该人任一条目 evidence（疑似 OCR "
+                       "误读如 qq.com→q9.com 要照转请用户人工修正）")
+            warnings.append({"code": "sem_%s_review_missing" % fld,
+                             "key": "candidate_overrides",
+                             "detail": "digest 标记 needs_review 含 \"%s\" 的候选人有 %d 个"
+                                       "（%s%s），但 %s"
+                                       % (fld, len(need), ",".join(missing[:10]),
+                                          " 等" if len(missing) > 10 else "", act)})
     return errors, warnings, metrics
 
 
