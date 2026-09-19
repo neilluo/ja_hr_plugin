@@ -2,7 +2,7 @@
 
 **极速版里 agent 不再手写解析代码、也不再 `pip install` 任何东西。**文本提取与字段预抽全部由脚本内部完成（`shared/extract_text.py` + `shared/extract_fields.py`，零第三方 pip 依赖，olefile 与 pypdf 已 vendor 进 `shared/vendor/`）。本文件说明脚本的提取机制与各状态的业务口径，供 agent 转述失败原因、以及维护者排查用。
 
-> 运行时唯一前提：机器上存在 Python 3（3.9~3.14）。Windows 用 `py -3`，`python` 别名可能静默失败（退出码 49）。
+> 运行时唯一前提：机器上存在 Python 3（3.9+）。Windows 用 `py -3`，`python` 别名可能静默失败（退出码 49）。
 
 ## 提取梯队（按文件类型）
 
@@ -32,14 +32,14 @@
    `{"<文件绝对路径>": {"text": "...", "fields_draft": {"name": "...", "phone": "...", ...}, "confidence": 0.0, "notes": "..."}}`
 3. **重跑同一条命令**加 `--apply-vision-patch <补丁.json>`。合并规则（`shared/fields/merger.py` FieldMerger）：先对 `patch.text` 跑 RegexFieldExtractor；**regex 有值的字段用 regex**；regex 为空的字段才取 `fields_draft`；凡取自草稿的字段打 `field_source="agent_vision"` 并追加进该候选人 `needs_review`（回合 2 用 evidence 原文复核）；`patch.text` 写入简历全文字段并记 `backend="agent_vision"`。之后按正常候选走查重/写库/回读。
 4. **agent 只产出结构化补丁，绝不写库**；补丁没覆盖的文件维持失败清单语义（如实告知，不硬造）。
-5. **20% 闸门（用户拍板）**：`needs_agent_vision` 份数 / 总份数 > 0.20 → 疑似整批格式问题，**不写任何记录**，stdout 业务话「本批 X/Y 份读不出文字，超过 20% 阈值，疑似整批格式问题，请确认后重试或提供文字版」+ 名单，退出码 0、报告 `ok=true`、`partial=true`、`reason="vision_gate"`。agent 转述给用户确认，**不**打补丁。
+5. **20% 闸门（用户拍板）**：本批 ≥5 份且 `needs_agent_vision` 份数 / 总份数 > 0.20 → 本轮**不写任何记录**，stdout 业务话「本批 X/Y 份读不出文字，超过 20% 阈值 → 本轮不写任何记录」+ 名单，退出码 0、报告 `ok=true`、`partial=true`、`reason="vision_gate"`。闸门只拦本轮写入、不拦补救：`VISION_NEEDED:` 照常打印，agent **仍**走上面的补丁协议（一轮读完 → 写补丁 json → 重跑同命令加 `--apply-vision-patch`）即可入库；补丁之后仍读不出的才是真正的疑似整批格式问题，那时再转述给用户请其提供文字版。
 
 ## 提取状态（parse_status）与 agent 的业务话
 
 | 状态 | 含义 | agent 必须怎么做 |
 |---|---|---|
 | `ok` | 提取成功（含 macOS Vision OCR 救回的扫描件/图片 backend=vision_ocr，与 agent 补丁救回的 backend=agent_vision） | 正常进判定；救回件的「可能有小误读」与人工确认警告照转；agent_vision 草稿字段按 `needs_review` 复核 |
-| `needs_agent_vision` | 本机读不出文字（提取终态 `no_text_layer`：非 macOS，或 OCR 文本不可信——水印/重复串/0 数字字符），且本轮补丁未覆盖 | 走 agent 多模态兜底协议（见上节）：一轮读完 `VISION_NEEDED:` 清单 → 写补丁 json → 重跑加 `--apply-vision-patch`。触发 20% 闸门时改为请用户确认整批格式问题 |
+| `needs_agent_vision` | 本机读不出文字（提取终态 `no_text_layer`：非 macOS，或 OCR 文本不可信——水印/重复串/0 数字字符），且本轮补丁未覆盖 | 走 agent 多模态兜底协议（见上节）：一轮读完 `VISION_NEEDED:` 清单 → 写补丁 json → 重跑加 `--apply-vision-patch`。触发 20% 闸门时**不豁免**本协议（闸门只拦本轮写入，清单照打），补丁之后仍读不出的才请用户确认整批格式问题 |
 | `no_text_layer` | 提取层原始终态（extract_text 层面）；入库脚本 P4a 起把它转成 `needs_agent_vision`，候选人层面不再出现 | —（维护者参考） |
 | `garbled` | 提取出文本但乱码 | 进 ❌ 清单：建议重新导出标准 Word/PDF |
 | `encrypted` | WPS/Office 加密 | 告知"文件被加密，请提供未加密版本"，不猜测内容 |

@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """用户可读清单（ApplyReportBuilder）：rows / match_rows / summary 的组装（纯函数面）。
 
-原 apply_decisions.py 的 `_build_rows`(L1029-1126) / `_printable_table`(L1188-1196)
-搬入。rows/match_rows/summary 的键插入序与文案（「已匹配/门槛不符/跳过/失败」四态、
+rows/match_rows/summary 的键插入序与文案（「已匹配/门槛不符/跳过/失败」四态、
 ✅/⏸/❌ 图标行）直接进 apply_report.json 与 stdout 字节面，逐字保留。
 """
 

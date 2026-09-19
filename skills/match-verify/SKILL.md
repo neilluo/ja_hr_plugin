@@ -7,7 +7,7 @@ name_zh: 定向匹配
 description_en: Script-built digest, one batched agent judgement (shards of <=8), script-applied decisions with recomputed scores and job stats. Hard-gate failures never create records.
 description_zh: 定向匹配极速版——脚本生成候选人×同组织在招岗位的判定输入，agent 按 ≤8 人/片做批量语义判定产出稀疏 decisions.json，脚本校验后批量建匹配记录、重算分数与岗位统计并回读。不达标组合根本不建记录；全程禁止逐条敲 dws 命令。
 user-invocable: true
-argument-hint: 说"匹配"或"定向匹配"，可指定候选人/岗位（如"给汪一兵做匹配""重建全部匹配"）
+argument-hint: Say "match" or name a candidate/role; "rebuild all matches" for full recompute
 argument-hint-en: Say "match" or name a candidate/role; "rebuild all matches" for full recompute
 argument-hint-zh: 说"匹配"或"定向匹配"，可指定候选人/岗位（如"给汪一兵做匹配""重建全部匹配"）
 ---

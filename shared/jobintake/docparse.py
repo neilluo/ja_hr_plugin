@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """JobDocParser：Turn 1 阶段 1 的单份 JD 解析（文件 IO 边界）。
 
-自 intake_job.py run_turn1 534–568 逐字搬移（P9b）。红线：
+红线：
   * B 侧**没有** agent 多模态兜底通道——PARSE_FAIL_REASON 只有 5 键（A 侧 6 键，
     多一个 needs_agent_vision），扫描件直接 result="失败"。**禁止**把 A 侧的
-    VisionPatchChannel / AgentPatchExt「顺手」接到 B 上（P6 分析 §2.2①）。
+    VisionPatchChannel / AgentPatchExt「顺手」接到 B 上。
   * B 侧提取是**串行**的（A 侧并发 4）；本类只管单份解析，批量循环与计时留在
     Pipeline（不引入并发 = 不改变行为）。
   * ent 骨架 14 键的键序、失败 reason 的拼接顺序（基础文案 → 扩展名 → 技术细节）

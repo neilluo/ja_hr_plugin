@@ -1,17 +1,16 @@
 # -*- coding: utf-8 -*-
-"""IntakeConsole：intake 入口脚本 stdout/stderr 的唯一出口（P7 刀1）。
+"""IntakeConsole：intake 入口脚本 stdout/stderr 的唯一出口。
 
 从 skills/resume-intake/scripts/intake_resume.py 收拢全部 61 处 print：
 本类持有输出文本的格式契约（分隔线、icon 表、截断长度、协议行前缀），
 不含任何业务判定——只接受编排层已算好的值并打印。
 
-冻结面（net_oracle.parse_report 的 5 个字面锚点 + HOTPATH.md 协议行，
-一个字符都不能变）：
+冻结面（5 个字面锚点 + 协议行，一个字符都不能变）：
   * "── 简历入库结果 ──────────────" / 24 个 U+2500 的 "────────────────────────"
   * 行格式 "%d | %s | %s | %s"、"小计：…"、"墙钟 …dws_calls…"
   * ARTIFACT: / RESUME: / VISION_NEEDED: / FATAL: / SHARD:（后者由 build_match_input 打）
   * icon 表里 "❌ 失败" 的「失败」二字（oracle 据此判失败名单）
-  * flush=True 语义（killcheck_p3 硬杀后读日志，未 flush 的输出会丢）
+  * flush=True 语义（硬杀后读日志，未 flush 的输出会丢）
 """
 
 import sys
@@ -50,7 +49,7 @@ class IntakeConsole:
                   % (found, deleted, failed_n))
 
     def checkpoint_loaded(self, n_done: int) -> None:
-        self._out("读到 checkpoint：%d 份已成功，重跑将跳过（D12 幂等）" % n_done)
+        self._out("读到 checkpoint：%d 份已成功，重跑将跳过（幂等）" % n_done)
 
     def vision_patch_loaded(self, n_entries: int, path: Any) -> None:
         self._out("读到 agent 兜底补丁：%d 个文件条目（%s）" % (n_entries, path))
@@ -75,8 +74,10 @@ class IntakeConsole:
                   "（agent 只产出补丁，绝不写库）" % n)
 
     def vision_gate(self, n_needed: int, n_entries: int) -> None:
-        self._out("⛔ 本批 %d/%d 份读不出文字，超过 20%% 阈值，疑似整批格式问题，"
-                  "请确认后重试或提供文字版（本轮不写任何记录，报告 reason=vision_gate）"
+        self._out("⛔ 本批 %d/%d 份读不出文字，超过 20%% 阈值 → 本轮不写任何记录"
+                  "（报告 reason=vision_gate）。上面 VISION_NEEDED 清单里的文件先走 "
+                  "agent 多模态兜底：打完补丁重跑同一命令即可入库；补丁之后仍读不出的"
+                  "才是真的格式问题，那时再请用户提供文字版"
                   % (n_needed, n_entries))
 
     def vision_gate_file(self, file_name: Any, path: Any) -> None:
@@ -124,7 +125,7 @@ class IntakeConsole:
 
     def fixup_summary(self, n_fixups: int, uploaded: int, failed: int,
                       ms: int, calls: int) -> None:
-        self._out("补传附件（v3 §9#6，记录不重建）：%d 份待补 → %d 成功 / %d 失败，%dms，%d 次调用"
+        self._out("补传附件（记录不重建）：%d 份待补 → %d 成功 / %d 失败，%dms，%d 次调用"
                   % (n_fixups, uploaded, failed, ms, calls))
 
     def upsert_summary(self, created: Any, updated: Any, failed_n: int,
@@ -162,7 +163,7 @@ class IntakeConsole:
         self._out("其中墙钟预算内未完成：%d 份（重跑同一命令续跑，checkpoint 幂等）" % n)
 
     def fixup_note(self, uploaded: int, failed: int) -> None:
-        self._out("其中补传附件（记录未重建，v3 §9#6）：成功 %d | 失败 %d"
+        self._out("其中补传附件（记录未重建）：成功 %d | 失败 %d"
                   % (uploaded, failed))
 
     def wall(self, elapsed_ms: int, dws_calls: int, retries: int, extract_ms: int,
@@ -182,8 +183,9 @@ class IntakeConsole:
     def partial_vision_gate(self, n_vision: int, n_entries: int,
                             ratio_pct: float) -> None:
         self._out("⏸ partial=true：20%% 闸门触发（%d/%d 份读不出文字 > %.0f%%），"
-                  "本轮未写任何记录；请与用户确认整批格式问题后重跑同一命令，"
-                  "或让用户提供文字版简历" % (n_vision, n_entries, ratio_pct))
+                  "本轮未写任何记录；VISION_NEEDED 清单照常给出，agent 打完补丁重跑"
+                  "同一命令即可入库，补丁之后仍读不出的再请用户提供文字版简历"
+                  % (n_vision, n_entries, ratio_pct))
 
     def partial_budget(self, budget: float, n_pending: int, n_deferred: int) -> None:
         self._out("⏸ partial=true：墙钟预算 %.0fs 内未完成 %d 份、附件欠传 %d 份；"

@@ -1,26 +1,24 @@
 # -*- coding: utf-8 -*-
 """OCR 梯队（Tier 1.5）：macOS 自带 Vision framework（backend=vision_ocr，仅 darwin）。
 
-产品化自实测原型 /tmp/jahr-perf-audit/vision_ocr.js（B1 结论：3 份失败件全救回、
-手机号 3/3、单份 1.16~1.58s、3 份并行 1.764s）。零 pip 依赖、零联网、零 API key：
-只走系统自带 `osascript -l JavaScript`（JXA）调 VNRecognizeTextRequest
-（Accurate 档，zh-Hans/zh-Hant/en-US，语言纠错开）。PDF 逐页 2x 缩放渲染提升
-中文小字号识别率，页间用 \\f 分隔；图片直接 NSImage -> CGImage。
+零 pip 依赖、零联网、零 API key：只走系统自带 `osascript -l JavaScript`
+（JXA）调 VNRecognizeTextRequest（Accurate 档，zh-Hans/zh-Hant/en-US，
+语言纠错开）。PDF 逐页 2x 缩放渲染提升中文小字号识别率，页间用 \\f 分隔；
+图片直接 NSImage -> CGImage。
 
-自包含纪律（P1 评审裁决②）：
+自包含纪律：
   - osascript 走 subprocess argv（脚本按行拆成多个 -e 传入），不依赖调用方 cwd、
     不落任何临时文件、不新增 sys.path 操作；
   - 对 detect_scanned 的引用是**函数内延迟 import**（extract_text 门面在本模块
     之后才完成加载，顶层互相 import 会成环）。
 
-护栏（B1 教训：markitdown 的水印噪声曾骗过护栏造成静默假成功）：
+护栏：
   OCR 文本在本梯队内先过两道——①数字字符数为 0 直接判不可信（简历几乎必含
   手机号/年份）；②detect_scanned 同款水印/重复串判定。过不了返回
   no_text_layer 而**不是**假 ok；chain 的 gate 还会对 ok 结果复核一遍。
 
 TCC：osascript 首次读 ~/Desktop、~/Documents、iCloud 下的文件可能触发 macOS
-授权弹窗，需用户点一次允许（部署文档已写明）。超时上限因此设为 60s：弹窗挂起
-时不至于吃满旧 JXA 梯队的 120s。
+授权弹窗，需用户点一次允许。超时上限设为 60s。
 """
 
 from __future__ import annotations
@@ -38,10 +36,9 @@ from extraction.base import TextExtractor, normalize_pdf_text
 
 __all__ = ["VisionOcrExt"]
 
-#: 单份 OCR 超时（秒）。实测单份 1.16~1.58s；上限主要防 TCC 弹窗挂起。
+#: 单份 OCR 超时（秒）。上限主要防 TCC 弹窗挂起。
 VISION_OCR_TIMEOUT_S = 60
-#: 建议的 OCR 并发上限（实测 3 份并行 1.764s vs 串行 3.810s）。
-#: 本梯队自身是同步单文件的；并发由调用方（intake 提取线程池）按此值封顶。
+#: 建议的 OCR 并发上限。本梯队自身是同步单文件的；并发由调用方按此值封顶。
 OCR_CONCURRENCY = 4
 #: 低于此置信度的行计入 lowConfLines（notes 里给人工复核提示用）
 LOW_CONF_THRESHOLD = 0.6
@@ -163,14 +160,14 @@ class VisionOcrExt(TextExtractor):
       - 图片：直接受理（图片没有文本层梯队可言）；
       - PDF：仅当前序梯队全部没拿到可用文本（chain 已把 pypdf/JXA 的失败与
         「提取到文本但被护栏判为扫描件/水印」的降级结果记进 doc.prior）。
-    跨平台兜底（agent 多模态）是 P4 的梯队，不在本模块范围。
+    跨平台兜底（agent 多模态）不在本模块范围。
     """
 
     def can_handle(self, doc: ResumeDocument) -> bool:
-        # RECRUIT_NO_VISION（P4，仅测试用）：置位时本梯队恒不受理，用来在 darwin
-        # 上模拟「非 macOS / Vision 失败或不可信」，验证 agent 多模态兜底通道
+        # RECRUIT_NO_VISION：置位时本梯队恒不受理，用来在 darwin 上模拟
+        # 「非 macOS / Vision 失败或不可信」，验证 agent 多模态兜底通道
         # （needs_agent_vision → VISION_NEEDED → --apply-vision-patch）。
-        # 默认不置位，行为与 P3 完全一致。
+        # 默认不置位。
         if os.environ.get("RECRUIT_NO_VISION"):
             return False
         if sys.platform != "darwin":
@@ -232,6 +229,6 @@ class VisionOcrExt(TextExtractor):
 
     @staticmethod
     def _looks_scanned(text: str, kind: str) -> bool:
-        # 延迟 import 避免与门面成环（见模块 docstring）
+        # 延迟 import 避免与门面成环
         from extract_text import detect_scanned
         return bool(detect_scanned(text, kind))

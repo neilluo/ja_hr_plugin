@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
 """读路径：`record query` 的翻页、record-ids 分片、结果归一化，以及**截断状态**。
 
-设计纪律（实测换来的）：
+设计纪律：
   * **一次调用干完一批**：查重一次 OR filter 查完 N 个键（`build_filter` 在 schema.py）。
   * **`record query --all` 是坏的**：当前 dws 版本带不带 filter 都返回 0 条
     （`hasMore`/`nextCursor` 也都是 null），所以本层一律自己用 `--cursor` 翻页。
   * 每页一次 dws 调用，翻到空页或 `max_pages` 为止。
 
-截断可见（缺陷2）：翻到 `max_pages` 仍有下一页时，除了照旧往 warnings 记一条，
+截断可见：翻到 `max_pages` 仍有下一页时，除了照旧往 warnings 记一条，
 还把状态暴露在 `last_pages` / `last_truncated` / `last_returned` 上，让调用方能
-把「这次扫描不完整、据此做的去重不可信」如实告诉用户 —— 存量 ≥ max_pages×100 条
-时静默截断会让去重整个失效，而调用方原本无从得知。
+把「这次扫描不完整、据此做的去重不可信」如实告诉用户。
 """
 
 from __future__ import annotations
@@ -58,7 +57,7 @@ class RecordQuery(object):
         分页：`limit ≤ 100`（服务端硬限制）。`all_pages=True` 时本层**自己用 `--cursor` 翻页**，
         每页一次 dws 调用，翻到空页或 `max_pages`（默认 50 页 ≈5000 条）为止。
 
-        ⚠️ 实测坑：**`record query --all` 在当前 dws 版本返回 0 条记录**（带 filter、不带
+        ⚠️ **`record query --all` 在当前 dws 版本返回 0 条记录**（带 filter、不带
         filter 都一样，`hasMore`/`nextCursor` 也都是 null），所以本层绝不用 `--all`。
         """
         self.last_pages = 0

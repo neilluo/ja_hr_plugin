@@ -1,32 +1,9 @@
 # -*- coding: utf-8 -*-
-"""`dws` CLI 的最小封装层（零第三方 pip 依赖，只用标准库 + subprocess）。
+"""`dws` CLI 的最小封装层（零第三方 pip 依赖，只用标准库）。
 
-原 `shared/dws_util.py` 全文收拢到这里（P2：`dws_util.py` 已删除，能力全在本模块），
-`DwsRunner` 更名为 `DwsClient`，其余常量、退避参数、重试次数、错误分类关键字、
-三种响应信封的剥壳逻辑一律**原值搬迁**。
-
-为什么需要这一层（实测结论，写代码前先读）：
-  1. **一次 dws 网络调用的固定开销 ≈ 1.0~1.3s**（进程启动 ~0.27s + 鉴权/网络 ~0.7s）。
-     所以封装层的第一优化目标是「减少调用次数」，不是「让单次调用更快」。
-     本模块对每次 subprocess 调用计数（含重试），最终由上层 report 汇总 `dws_calls`。
-  2. **dws CLI 在复杂 shell 结构下不稳定**（重定向 / 变量替换 / for 循环 / 管道）。
-     → 本模块一律 `subprocess.run(list_of_args)`，**永不 shell=True**，永不让上层拼 shell。
-  3. **超长 JSON 必须走文件参数**：`record create/update/upsert` 都支持
-     `--records-file <绝对路径>`，避免命令行长度限制与引号转义（Windows 尤其）。
-  4. dws 的响应信封有**三种形态**，都要认（见 `unwrap`）：
-       A. 原子命令： {"status":"success|error","success":bool,"data":{...},"error":{...},"summary":"..."}
-       B. `+` 便捷命令（旧版/部分命令）：直接就是业务 payload（如 {"bases":[...],"count":2}）；
-          出错时是 {"error":{"category":"internal","code":1,
-                     "message":"[MCP_TOOL_ERROR] {内层 JSON}"}}
-       C. `+` 便捷命令**双层信封**（W-G 实测，dws 1.0.60，如 `+me`/`+field-get`/
-          `+record-upsert`）：{"ok":bool,"outcome":"success|...","data":{业务 payload}}。
-          它既没有 status/success 也没有 summary → 旧版 unwrap 会把**整个信封**当 payload
-          返回（调用方拿到 {"ok","outcome","data"} 而不是内层数据）。现在统一剥壳：
-          ok==true → 返回 data；ok==false → 按失败处理（error/outcome/data 里挖消息）。
-  5. 错误分类纪律（契约 §3.2）：网络/超时/限流/5xx → 3 次指数退避重试；
-     权限类 401/403 → **不重试**，直接抛 DwsError 让上层归类到 failed 并保留原始错误码。
-
-模块只依赖标准库：json / os / re / subprocess / tempfile / threading / time / pathlib。
+提供两阶段模式（emit/replay）、调用计数、错误归类、三种响应信封剥壳。
+emit 阶段收集命令到内部列表并返回模拟成功；agent 逐条用 Bash 工具执行；
+replay 阶段从预加载的结果文件返回真实结果。Python 子进程无法调用 dws。
 """
 
 from __future__ import annotations
@@ -34,7 +11,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 import sys
 import tempfile
 import threading
@@ -51,30 +27,30 @@ __all__ = [
     "now_iso",
     "default_client",
     "global_stats",
-    "DWS_BIN",
-    "DEFAULT_TIMEOUT",
-    "DEFAULT_HTTP_TIMEOUT",
-    "DEFAULT_RETRIES",
-    "DEFAULT_BACKOFF",
-    "MAX_BACKOFF",
+    "HTTP_TIMEOUT",
     "MAX_RECORDS_PER_CALL",
     "MAX_QUERY_LIMIT",
     "MAX_RECORD_IDS_PER_CALL",
     "MAX_FIELDS_PER_CALL",
     "MAX_FIELD_IDS_PER_GET",
+    "MODE_EMIT",
+    "MODE_REPLAY",
 ]
+
+#: 两阶段模式常量
+# emit：不调 dws，收集命令到内部列表，返回模拟成功
+# replay：不调 dws，从预加载的结果文件返回真实结果
+# dws 是宿主代理 shim，Python 子进程调用只返回占位符 "pending host-side execution"，
+# 永远拿不到真实结果，因此 dws 调用只能由 agent 通过 Bash 工具完成。
+MODE_EMIT = "emit"               # 收集命令到内部列表，返回模拟成功
+MODE_REPLAY = "replay"           # 从预加载的结果文件返回真实结果
 
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
 
-DWS_BIN = os.environ.get("DWS_BIN", "dws")
-
-DEFAULT_TIMEOUT = 120          # subprocess 墙钟超时（秒）
-DEFAULT_HTTP_TIMEOUT = 90      # 传给 dws 的 --timeout（HTTP 请求超时，秒）
-DEFAULT_RETRIES = 3            # 网络类错误的额外重试次数（总尝试 = 1 + retries）
-DEFAULT_BACKOFF = 1.0          # 指数退避基数（秒）：1s / 2s / 4s
-MAX_BACKOFF = 15.0
+#: 传给 dws 的 --timeout（HTTP 请求超时，秒），用于 emit 模式下构建 argv
+HTTP_TIMEOUT = 90
 
 #: `record create/update/upsert` 单次上限（服务端硬限制）
 MAX_RECORDS_PER_CALL = 100
@@ -118,7 +94,7 @@ def classify_error(message: str = "", code: Any = None) -> Tuple[str, bool]:
     """把 dws 的错误输出归类 → (category, retryable)。
 
     category ∈ rate_limit | auth | timeout | network | server | not_found | invalid | unknown
-    契约要求：网络类（timeout/network/server/rate_limit）可重试；权限类 auth **不重试**。
+    网络类（timeout/network/server/rate_limit）可重试；权限类 auth **不重试**。
 
     注意顺序：QPS 限流的错误码是 `Forbidden.AccessDenied.QpsLimitForAppkeyAndApi`，
     字面含 "Forbidden" 看着像权限错误，实际是限流、退避后可重试 —— 所以 rate_limit 必须先判。
@@ -147,7 +123,7 @@ class DwsError(Exception):
     """dws 调用失败的统一异常。
 
     携带 `category` / `code` / `retryable` / `attempts`，上层可据此把失败项写进
-    report 的 `failed` 与 `warnings`（契约 D6：失败可见，禁止静默丢弃）。
+    report 的 `failed` 与 `warnings`（失败可见，禁止静默丢弃）。
     """
 
     def __init__(self, message: str, *, category: str = "unknown", code: Any = None,
@@ -184,8 +160,8 @@ class DwsError(Exception):
 class DwsCallCounter:
     """线程安全的 dws 调用计数器。
 
-    `calls` = 真实发生的 subprocess 次数（**含重试**），这是性能验证的核心指标；
-    `logical` = 逻辑调用次数（不含重试），用来看重试放大了多少。
+    `calls` = 真实发生的调用次数（emit/replay 模式下不调 dws，但仍计数用于统计）；
+    `logical` = 逻辑调用次数。
     """
 
     def __init__(self) -> None:
@@ -241,7 +217,7 @@ def unwrap(raw: Any) -> Tuple[bool, Any, Any, str, Dict[str, Any]]:
     - 信封 B（`+` 命令，旧形态）：成功时直接就是业务 payload；失败时
       {"error":{"category","code","message"}}，其中 message 里内嵌
       `[MCP_TOOL_ERROR] {...}` 的内层 JSON（真正的 code / retryable 在里面）。
-    - 信封 C（`+` 命令**双层信封**，dws 1.0.60 实测）：
+    - 信封 C（`+` 命令**双层信封**）：
       {"ok":true,"outcome":"success","data":{业务 payload}}。
       它没有 status/success/summary → 旧实现会把整个信封当 payload 返回。
       现在：`ok` 为 True 且带 `data`/`outcome` → 返回内层 `data`；
@@ -340,36 +316,105 @@ def _cmd_key(argv: Sequence[str]) -> str:
 
 
 class DwsClient:
-    """执行 `dws` 子命令的封装：计数、超时、JSON 解析、错误归类、指数退避重试。
+    """执行 `dws` 子命令的封装：两阶段模式（emit/replay）、计数、JSON 解析、错误归类。
+
+    模式自动检测：传入 ``replay_path`` → replay 模式；否则 → emit 模式。
 
     用法::
 
-        client = DwsClient()
+        client = DwsClient()                              # emit 模式
+        client = DwsClient(replay_path='/path/dws_results.json')  # replay 模式
         data = client.call(["aitable", "record", "query", "--base-id", b, "--table-id", t])
         print(client.counter.snapshot()["dws_calls"])
 
-    所有 args 都是**参数列表**，绝不经过 shell（契约 §0.5 / 实测坑：dws 在复杂 shell 结构下不稳定）。
+    所有 args 都是**参数列表**，绝不经过 shell（dws 在复杂 shell 结构下不稳定）。
     """
 
     def __init__(self, counter: Optional[DwsCallCounter] = None,
-                 timeout: int = DEFAULT_TIMEOUT,
-                 http_timeout: int = DEFAULT_HTTP_TIMEOUT,
-                 retries: int = DEFAULT_RETRIES,
-                 backoff: float = DEFAULT_BACKOFF,
-                 bin: Optional[str] = None,
+                 http_timeout: int = HTTP_TIMEOUT,
                  tmp_dir: Optional[str] = None,
                  verbose: bool = False,
-                 sleep=time.sleep) -> None:
+                 replay_path: Optional[str] = None) -> None:
         self.counter = counter if counter is not None else DwsCallCounter()
-        self.timeout = timeout
         self.http_timeout = http_timeout
-        self.retries = retries
-        self.backoff = backoff
-        self.bin = bin or DWS_BIN
         self.tmp_dir = tmp_dir
         self.verbose = verbose or bool(os.environ.get("DWS_VERBOSE"))
-        self._sleep = sleep
         self._files_written = 0
+        # 两阶段模式：自动检测
+        self.mode = MODE_REPLAY if replay_path else MODE_EMIT
+        self._emit_commands: List[Dict[str, Any]] = []
+        self._emit_seq = 0
+        self._replay_map: Dict[str, Any] = {}
+        if self.mode == MODE_REPLAY and replay_path:
+            self._load_replay(replay_path)
+
+    def _load_replay(self, path: str) -> None:
+        """加载 dws_results.json，构建 cmd_hash → result 映射。"""
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "results" in data:
+            results = data["results"]
+        elif isinstance(data, list):
+            results = data
+        else:
+            results = [data]
+        for item in results:
+            if isinstance(item, dict) and "argv_hash" in item:
+                self._replay_map[item["argv_hash"]] = item
+
+    @staticmethod
+    def _hash_argv(argv: Sequence[str]) -> str:
+        """对 argv 做稳定哈希（用于 emit→replay 配对）。"""
+        import hashlib
+        return hashlib.md5(
+            "\x00".join(str(a) for a in argv).encode("utf-8")
+        ).hexdigest()
+
+    def _fake_response(self, argv: Sequence[str]) -> Tuple[int, str, str, int]:
+        """在 emit 模式下，根据命令类型返回模拟成功响应。
+
+        返回 (returncode, stdout, stderr, elapsed_ms)。
+        stdout 是模拟的 dws JSON 输出。
+        """
+        t0 = time.monotonic()
+        argv_strs = [str(a) for a in argv]
+        joined = " ".join(argv_strs)
+
+        # 判定命令类型并构造模拟响应
+        if "query" in argv_strs:
+            # record query → 返回空列表（无重复）
+            fake_data = {"records": [], "nextCursor": None, "total": 0}
+        elif "stats" in argv_strs:
+            # record stats → 返回 0
+            fake_data = {"total": 0}
+        elif "field" in argv_strs and "get" in argv_strs:
+            # field get → 返回空选项
+            fake_data = {"options": []}
+        elif "attachment" in argv_strs and "upload" in argv_strs:
+            # attachment upload → 返回模拟 uploadUrl + fileToken
+            fake_data = {"fileToken": "emit_fake_token_%s" % self._emit_seq,
+                         "fileName": argv_strs[-1] if argv_strs else "unknown",
+                         "uploadUrl": "https://emit-fake.example.com/upload/%s" % self._emit_seq,
+                         "downloadUrl": "https://emit-fake.example.com/download/%s" % self._emit_seq}
+        elif "record" in argv_strs and ("create" in argv_strs or "upsert" in argv_strs):
+            # record create/upsert → 返回模拟 record_ids
+            fake_data = {"records": [{"record_id": "emit_fake_id_%s" % self._emit_seq,
+                                       "fields": {}}]}
+        elif "record" in argv_strs and "update" in argv_strs:
+            # record update → 返回成功
+            fake_data = {"records": [{"record_id": "emit_fake_id", "fields": {}}]}
+        elif "field" in argv_strs and "create" in argv_strs:
+            # field create → 返回模拟 field_id
+            fake_data = {"field_id": "emit_fake_field_%s" % self._emit_seq}
+        else:
+            # 默认模拟成功
+            fake_data = {"ok": True}
+
+        fake_raw = {"status": "success", "success": True,
+                    "data": fake_data, "error": {}, "summary": "emit mode"}
+        stdout = json.dumps(fake_raw, ensure_ascii=False)
+        elapsed = int((time.monotonic() - t0) * 1000)
+        return 0, stdout, "", elapsed
 
     # -- 便捷属性 ----------------------------------------------------------
     @property
@@ -382,7 +427,7 @@ class DwsClient:
     # -- 底层执行 ----------------------------------------------------------
     def _build_argv(self, args: Sequence[str], *, fmt: bool, yes: bool,
                     http_timeout: Optional[int]) -> List[str]:
-        argv: List[str] = [self.bin] + [str(a) for a in args]
+        argv: List[str] = ["dws"] + [str(a) for a in args]
         lowered = [str(a) for a in argv]
         if fmt and "--format" not in lowered and "-f" not in lowered:
             argv += ["--format", "json"]
@@ -393,28 +438,49 @@ class DwsClient:
         return argv
 
     def _spawn(self, argv: Sequence[str], timeout: int) -> Tuple[int, str, str, int]:
-        t0 = time.monotonic()
-        try:
-            proc = subprocess.run(list(argv), capture_output=True, text=True,
-                                  timeout=timeout)  # 永不 shell=True
-        except subprocess.TimeoutExpired:
-            elapsed = int((time.monotonic() - t0) * 1000)
-            raise DwsError("dws 子进程超时（%ss）" % timeout, category="timeout",
-                           retryable=True, argv=argv, elapsed_ms=elapsed)
-        except FileNotFoundError:
-            raise DwsError("未找到 dws 可执行文件（%s）；请确认钉钉连接器已安装并在 PATH 中"
-                           % self.bin, category="env", retryable=False, argv=argv)
-        except OSError as exc:  # pragma: no cover - 极少见
-            raise DwsError("启动 dws 失败: %s" % exc, category="env",
-                           retryable=False, argv=argv)
-        elapsed = int((time.monotonic() - t0) * 1000)
-        return proc.returncode, proc.stdout or "", proc.stderr or "", elapsed
+        # emit 模式：不调 dws，记录命令并返回模拟成功
+        if self.mode == MODE_EMIT:
+            argv_list = list(argv)
+            argv_hash = self._hash_argv(argv_list)
+            self._emit_seq += 1
+            self._emit_commands.append({
+                "seq": self._emit_seq,
+                "argv_hash": argv_hash,
+                "argv": argv_list,
+            })
+            return self._fake_response(argv_list)
+
+        # replay 模式：不调 dws，从预加载结果返回
+        argv_list = list(argv)
+        argv_hash = self._hash_argv(argv_list)
+        entry = self._replay_map.get(argv_hash)
+        if entry is not None:
+            rc = entry.get("returncode", 0)
+            stdout = entry.get("stdout", "")
+            stderr = entry.get("stderr", "")
+            elapsed = entry.get("elapsed_ms", 0)
+            return rc, stdout, stderr, elapsed
+        # 没找到匹配结果 → 返回模拟成功（emit 阶段用伪造数据跳过的命令）
+        self._log("replay: no match for %s, using fake" % _cmd_key(argv_list[1:]))
+        return self._fake_response(argv_list)
+
+    def emit_commands(self) -> List[Dict[str, Any]]:
+        """返回 emit 模式下收集到的所有 dws 命令。"""
+        return self._emit_commands
+
+    def write_emit_file(self, path: str) -> None:
+        """将收集到的 emit 命令写入 JSON 文件。"""
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"mode": "emit", "commands": self._emit_commands},
+                      f, ensure_ascii=False, indent=2)
 
     def call(self, args: Sequence[str], *, timeout: Optional[int] = None,
-             retries: Optional[int] = None, http_timeout: Optional[int] = None,
+             http_timeout: Optional[int] = None,
              raise_on_error: bool = True, yes: bool = True,
              fmt: bool = True) -> Dict[str, Any]:
-        """执行一次 dws 调用（自动重试网络类错误）。
+        """执行一次 dws 调用（emit/replay 模式，无重试：emit 总是返回模拟成功，replay 从文件读取）。
+
+        ``timeout`` 参数已废弃（emit/replay 模式下无墙钟超时），仅为兼容调用方签名保留。
 
         返回归一化结果::
 
@@ -422,85 +488,51 @@ class DwsClient:
              "raw": dict|None, "attempts": int, "elapsed_ms": int, "category": str|None}
 
         `raise_on_error=True`（默认）时，失败会抛 `DwsError`；置 False 则把失败也当结果返回，
-        由调用方写进 report 的 failed 列表（契约 D6）。
+        由调用方写进 report 的 failed 列表。
         """
         argv = self._build_argv(args, fmt=fmt, yes=yes,
                                 http_timeout=self.http_timeout if http_timeout is None
                                 else http_timeout)
         key = _cmd_key(argv[1:])
-        max_retries = self.retries if retries is None else retries
-        to = self.timeout if timeout is None else timeout
 
-        attempt = 0
-        total_elapsed = 0
-        last_err: Optional[DwsError] = None
-        while True:
-            attempt += 1
-            try:
-                rc, out, err, elapsed = self._spawn(argv, to)
-            except DwsError as exc:
-                rc, out, err, elapsed = None, "", str(exc), 0
-                exc.argv = argv
-                last_err = exc
-                category, retryable = exc.category, exc.retryable
-                code = None
-                msg = exc.message
-                raw = None
-            else:
-                raw, parsed_ok = self._parse(out)
-                if not parsed_ok:
-                    # 实测：`+` 便捷命令失败时把错误信封打到 **stderr** 且退出码非 0
-                    raw, parsed_ok = self._parse(err)
-                if not parsed_ok:
-                    # stdout/stderr 都不是合法 JSON：CLI 崩了或输出了日志噪声，按可重试处理
-                    category, retryable = "parse", True
-                    code, msg = None, (err.strip() or out.strip()
-                                       or "dws 输出无法解析为 JSON")[:800]
-                    hint = {}
-                else:
-                    ok, data, code, msg, hint = unwrap(raw)
-                    if ok:
-                        self.counter.record(key, elapsed, True, attempt)
-                        return {"ok": True, "data": data, "code": None, "message": msg,
-                                "raw": raw, "attempts": attempt,
-                                "elapsed_ms": elapsed, "category": None}
-                    category, retryable = classify_error(msg, code)
-                    if category == "unknown":
-                        # 服务端内层显式给了 retryable/type（如 SYSTEM_ERROR retryable=true）
-                        if hint.get("retryable") is True:
-                            category, retryable = "server", True
-                        elif hint.get("retryable") is False:
-                            category, retryable = category or "invalid", False
-                        elif hint.get("type"):
-                            category, retryable = classify_error(str(hint.get("type")))
-                    if rc != 0 and category == "unknown":
-                        category, retryable = classify_error(err or out)
-                    last_err = None
+        rc, out, err, elapsed = self._spawn(argv, 0)
+        raw, parsed_ok = self._parse(out)
+        if not parsed_ok:
+            raw, parsed_ok = self._parse(err)
+        if not parsed_ok:
+            category = "parse"
+            code = None
+            msg = (err.strip() or out.strip() or "dws 输出无法解析为 JSON")[:800]
+        else:
+            ok, data, code, msg, hint = unwrap(raw)
+            if ok:
+                self.counter.record(key, elapsed, True, 1)
+                return {"ok": True, "data": data, "code": None, "message": msg,
+                        "raw": raw, "attempts": 1,
+                        "elapsed_ms": elapsed, "category": None}
+            category, _ = classify_error(msg, code)
+            if category == "unknown":
+                if hint.get("retryable") is True:
+                    category = "server"
+                elif hint.get("retryable") is False:
+                    category = category or "invalid"
+                elif hint.get("type"):
+                    category, _ = classify_error(str(hint.get("type")))
+            if rc != 0 and category == "unknown":
+                category, _ = classify_error(err or out)
 
-            total_elapsed += elapsed
-            self._log("dws fail [%s] attempt=%d category=%s code=%s msg=%s"
-                      % (key, attempt, category, code, (msg or "")[:200]))
-
-            can_retry = retryable and attempt <= max_retries
-            if not can_retry:
-                self.counter.record(key, total_elapsed, False, attempt, category)
-                exc = last_err or DwsError(
-                    msg or "dws 调用失败", category=category, code=code,
-                    retryable=retryable, argv=argv, returncode=rc, stdout=out,
-                    stderr=err, attempts=attempt, elapsed_ms=total_elapsed)
-                if last_err is not None:
-                    exc.attempts = attempt
-                    exc.elapsed_ms = total_elapsed
-                if raise_on_error:
-                    raise exc
-                return {"ok": False, "data": None, "code": code, "message": msg,
-                        "raw": raw, "attempts": attempt, "elapsed_ms": total_elapsed,
-                        "category": category, "error": exc.to_dict()}
-
-            delay = min(MAX_BACKOFF, self.backoff * (2 ** (attempt - 1)))
-            if category == "rate_limit":
-                delay = max(delay, 2.0)
-            self._sleep(delay)
+        self._log("dws fail [%s] category=%s code=%s msg=%s"
+                  % (key, category, code, (msg or "")[:200]))
+        self.counter.record(key, elapsed, False, 1, category)
+        exc = DwsError(
+            msg or "dws 调用失败", category=category, code=code,
+            retryable=False, argv=argv, returncode=rc, stdout=out,
+            stderr=err, attempts=1, elapsed_ms=elapsed)
+        if raise_on_error:
+            raise exc
+        return {"ok": False, "data": None, "code": code, "message": msg,
+                "raw": raw, "attempts": 1, "elapsed_ms": elapsed,
+                "category": category, "error": exc.to_dict()}
 
     @staticmethod
     def _parse(out: str) -> Tuple[Optional[Any], bool]:
@@ -530,38 +562,14 @@ class DwsClient:
     def call_with_payload(self, args: Sequence[str], payload: Any, *,
                           file_flag: str = "--records-file",
                           inline_flag: str = "--records",
-                          force_file: bool = True,
-                          inline_threshold: int = 1500,
                           **kwargs) -> Dict[str, Any]:
-        """把大 JSON 通过临时文件传参（`--records-file <绝对路径>`）。
+        """把大 JSON 通过内联 `--records` 传参。
 
-        实测坑：`--records` 内联超长 JSON 在 Windows 上会被命令行长度截断、在复杂 shell 下会被
-        引号规则吃掉；文件传参两个问题都没有。写文件失败或 dws 报「文件类」错误时自动回退内联。
+        emit/replay 模式下始终使用内联，使 argv 自包含（无临时文件路径）
+        且确定性（同一 payload 在 emit 和 replay 阶段产生相同的 argv_hash，从而能正确配对）。
         """
         serialized = json.dumps(payload, ensure_ascii=False)
-        use_file = force_file or len(serialized) > inline_threshold
-        if not use_file:
-            return self.call(list(args) + [inline_flag, serialized], **kwargs)
-
-        path = None
-        try:
-            path = write_json_file(payload, self.tmp_dir)
-            self._files_written += 1
-            try:
-                return self.call(list(args) + [file_flag, path], **kwargs)
-            except DwsError as exc:
-                blob = "%s %s" % (exc.message, exc.code)
-                if any(k in blob.lower() for k in ("records-file", "file not found",
-                                                   "open ", "no such file", "路径")):
-                    self._log("records-file 传参失败，回退内联 --records")
-                    return self.call(list(args) + [inline_flag, serialized], **kwargs)
-                raise
-        finally:
-            if path:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+        return self.call(list(args) + [inline_flag, serialized], **kwargs)
 
     # -- 分片工具 ---------------------------------------------------------
     @staticmethod

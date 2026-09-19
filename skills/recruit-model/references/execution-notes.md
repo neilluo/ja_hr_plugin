@@ -7,13 +7,13 @@
 - **只说业务语言**：对用户只讲「岗位 / 候选人 / 匹配结果 / 推荐状态」，绝不出现表ID、字段ID、fieldId、命令、JSON、脚本路径、产物文件名。
 - 覆盖、删除前用业务话讲清"对谁做什么、后果"，得到用户明确指令后执行；用户说"上传并解析"即视为入库授权。
 - 汇报用清单/表格，一张表只说一件事（新岗位 / 新简历 / 匹配结果 / 未达标），不堆砌全部字段。
-- 解析失败（加密/损坏/乱码）如实告知并建议提供文字版，**绝不硬造字段**；失败项不隐藏。P3 起 macOS 上扫描件/图片简历由脚本自动走系统 Vision OCR 救回入库（首次运行可能弹 macOS 授权弹窗，请用户点允许）。**P4a 起 OCR 不可用/不可信（非 macOS 等）的文件不再判死，转 agent 多模态兜底**：脚本 stdout 打印一行 `VISION_NEEDED: <绝对路径...>`（清单同进报告 `vision_needed_files`，entry `parse_status=needs_agent_vision`）→ agent **一轮**多模态读完全部列出文件 → 按 schema（`{"<文件绝对路径>": {"text": "...", "fields_draft": {...}, "confidence": 0.0, "notes": "..."}}`）Write 补丁 json → 重跑同命令加 `--apply-vision-patch <json>`。合并规则：先对 patch.text 跑正则，**regex 有值用 regex、为空才取 fields_draft**；取自草稿的字段打 `field_source=agent_vision` 并进该候选人 `needs_review`（回合 2 用 evidence 原文复核）。**agent 只产出补丁、绝不写库**；补丁未覆盖的文件维持失败清单语义。**20% 闸门（用户拍板）**：`needs_agent_vision` 份数/总份数 >0.20 → 不写任何记录，退出码 0、`ok=true`、`partial=true`、`reason=vision_gate`，业务话「本批 X/Y 份读不出文字，超过 20% 阈值，疑似整批格式问题，请确认后重试或提供文字版」+名单，agent 转述给用户确认而不是打补丁。`RECRUIT_NO_VISION=1` 仅测试用（关 Vision OCR 演练兜底通道），生产不设置。OCR/补丁救回件带「可能有小误读」警告，转述时保留。
+- 解析失败（加密/损坏/乱码）如实告知并建议提供文字版，**绝不硬造字段**；失败项不隐藏。P3 起 macOS 上扫描件/图片简历由脚本自动走系统 Vision OCR 救回入库（首次运行可能弹 macOS 授权弹窗，请用户点允许）。**P4a 起 OCR 不可用/不可信（非 macOS 等）的文件不再判死，转 agent 多模态兜底**：脚本 stdout 打印一行 `VISION_NEEDED: <绝对路径...>`（清单同进报告 `vision_needed_files`，entry `parse_status=needs_agent_vision`）→ agent **一轮**多模态读完全部列出文件 → 按 schema（`{"<文件绝对路径>": {"text": "...", "fields_draft": {...}, "confidence": 0.0, "notes": "..."}}`）Write 补丁 json → 重跑同命令加 `--apply-vision-patch <json>`。合并规则：先对 patch.text 跑正则，**regex 有值用 regex、为空才取 fields_draft**；取自草稿的字段打 `field_source=agent_vision` 并进该候选人 `needs_review`（回合 2 用 evidence 原文复核）。**agent 只产出补丁、绝不写库**；补丁未覆盖的文件维持失败清单语义。**20% 闸门（用户拍板）**：本批 ≥5 份且 `needs_agent_vision` 份数/总份数 >0.20 → 本轮不写任何记录，退出码 0、`ok=true`、`partial=true`、`reason=vision_gate`。闸门只拦本轮写入、不拦补救：`VISION_NEEDED:` 照常打印，agent 仍一轮读完清单、Write 补丁 json、重跑同命令加 `--apply-vision-patch` 即可入库；补丁之后仍读不出的才是真正的「疑似整批格式问题」，那时再转述给用户请其提供文字版。`RECRUIT_NO_VISION=1` 仅测试用（关 Vision OCR 演练兜底通道），生产不设置。OCR/补丁救回件带「可能有小误读」警告，转述时保留。
 
 ## 三段式流水线纪律（性能的全部来源）
 
 - 每批工作固定三个回合：**Turn 1 跑脚本 → Turn 2 agent 一次批量语义判定 → Turn 3 跑脚本**。
 - **⛔ Turn 2 禁止规则脚本代跑（W-F run3 实测事故后新增，2026-09-17）**：简历侧 Turn 2（批量语义判定）与岗位侧 Turn 2（JD 语义归一化）**必须由 agent 自己（大模型）完成**，禁止编写或调用任何规则脚本/关键词匹配脚本（如自写 `generate_decisions.py`、`normalize_jobs.py`）代替语义判定。理由（实测）：run3 里 agent 用自写规则脚本跑两个 Turn 2，`verify_decisions` PASS、`apply_decisions`/`--apply` ok=true、**全部形式校验通过，但业务结果崩塌**——0 条推荐（run1/run2=22 条）、skill_hits 普遍 ≤3、evidence 同人同模板跨岗位复用、3 个岗位错归职能中心导致组合面改变。这是本架构最危险的失效模式：**静默产出看起来正常的错误结果**。`verify_decisions.py` 的 `sem_*` 语义护栏与 `intake_job.py --apply` 的「Turn 2 归一化护栏」只能**事后告警**，不能代替真判定；**护栏告警必须如实向用户呈现并说明可能需要重做判定，禁止静默吞掉告警继续写库**。
-- **除 Turn 2 的语义判定外，禁止 agent 逐条敲 `dws` 命令。** 所有表格读写都发生在脚本内部（批量 ≤100 条/次、带重试、带写后回读）。老版逐条敲命令每回合边际墙钟成本约 5.4 秒（大模型推理 ~4s + 命令 ~1.3s），一份简历 20~40 回合——这是批量上传慢的根因，不许回退。
+- **除 Turn 2 的语义判定外，禁止 agent 逐条敲 `dws` 命令。** 所有表格读写都发生在脚本内部（批量 ≤100 条/次、带重试；stage 6b 补传附件带写后回读，stage 7 批量 upsert 不做回读——record_id 从 upsert 响应直接提取）。老版逐条敲命令每回合边际墙钟成本约 5.4 秒（大模型推理 ~4s + 命令 ~1.3s），一份简历 20~40 回合——这是批量上传慢的根因，不许回退。
 - 一次只调用一个脚本；同一批次 Turn 1 / Turn 3 使用同一个 `--out-dir`。
 - 批量写入实测参考：31 条记录批量写 1.38s/1 次调用（逐条 38.79s/31 次）；批量查重 1.33s/1 次（逐条 39.50s/31 次）；附件并发 5 上传 2.79s（串行 5.59s）。
 
@@ -59,7 +59,7 @@
 
 **告警**（不拦路，但必须业务话转述）：单条命中项越界判编造（该条 pass 无效、不建记录，`fabricated_skill_hit`/`fabricated_bonus_hit`）、命中项归一化映射成功（模型把切碎条目合回一句/缩写，`skill_hit_normalized`）、同集合重复命中已去重（`duplicate_hits`）、模型分数/推荐与脚本重算不一致（以脚本为准，D16，`score_mismatch`）、分母告警（岗位必备技能为空→技能得分记 0；加分项为空→加分得分记 100，`score_denominator`）、`gate_detail` 缺项、`batch_id` 与 digest 不一致、rejected 缺 `reason` 或 `job_keys` 为空、判定了跨组织/不在招组合（不会建记录）、没传 digest 的降级路径覆盖率未校验（`coverage_not_checked`）、上述全部 `sem_*` 语义护栏。
 
-**candidate_overrides 只认七个键**（契约 v3 §9#1）：`org` / `category` / `expected_location` / `skills_extra` / `certificates_extra` / `years_experience` / `org_reason`；其余键忽略并进 warnings。修正在 Turn 3 由脚本写回简历库（写后回读）。
+**candidate_overrides 只认七个键**（契约 v3 §9#1）：`org` / `category` / `expected_location` / `skills_extra` / `certificates_extra` / `years_experience` / `org_reason`；其余键忽略并进 warnings。修正在 Turn 3 由脚本写回简历库（emit/replay 模式下 stage 7 不做回读，record_id 从 upsert 响应提取）。
 
 ## 模型不输出分数（D16）
 
@@ -72,14 +72,14 @@
 - macOS / Linux：`python3 scripts/xxx.py ...`
 - Windows：`py -3 scripts\xxx.py ...`
 - **Windows 上 `python` 别名可能静默失败（退出码 49，无任何输出）**——不要用裸 `python`。脚本退出码异常且无输出时，先换 `py -3` 重试。
-- 脚本兼容 Python 3.9~3.14，零第三方 pip 依赖（olefile、pypdf 已 vendor 进 `shared/vendor/`）；但**机器上必须存在 python 运行时**，千问办公不自带。缺失时引导用户安装后重跑。
+- 脚本兼容 Python 3.9+，零第三方 pip 依赖（olefile、pypdf 已 vendor 进 `shared/vendor/`）；但**机器上必须存在 python 运行时**，千问办公不自带。缺失时引导用户安装后重跑。
 - `--config` / `--files` / `--out-dir` 一律传**绝对路径**；SKILL.md 里的 `scripts/xxx.py` 是相对本技能目录的路径，调用前先按平台注入的技能基目录展开。
 
 ## 幂等与续跑（D12，checkpoint 语义按契约 v3 §9#6 加强；P3 起增量落盘 + 墙钟预算）
 
 - 简历入库脚本落 `checkpoint.json`，**每个成功文件把「记录已写」（record_written）与「附件已传」（attachment_uploaded）分开记状态**（还含 md5/record_id/file_name/phone/org 等派生字段，跳过重跑时用于恢复 candidates.json 的完整性）。
-- **增量落盘（P3）**：两个状态各自一确立就原子写盘（tmp + os.replace）——附件按上传分片逐片落、记录在写后回读确认到 record_id 后逐条落。进程被杀/撞工具超时不再丢全部进度。文件带 `version: 2` 与 `progress` 段（尚未写库文件的中间状态，只作断点可见性）；旧格式 checkpoint 照常可读，整个文件读不懂时视为空并告警，不崩溃。
-- 重跑判定 = 记录已写 **且**（附件已传 **或** 本次带 `--no-attachment`）→ 整条跳过；记录已写但附件欠传且本次没带 `--no-attachment` → **只补传附件**（按 record_id 更新附件字段，绝不重复建记录），补传后回读附件非空才算完成。**补传路径每轮最多处理 100 份（P4a 主控裁决）**：超出部分 defer 到下一轮（entry 记「未完成」、进 `deferred_attachment_files`、stdout 说明），重跑同一命令续补——防大批量补传把墙钟拖爆。
+- **增量落盘（P3）**：两个状态各自一确立就原子写盘（tmp + os.replace）——附件按上传分片逐片落、记录在 upsert 响应返回 record_id 后逐条落。进程被杀/撞工具超时不再丢全部进度。文件带 `version: 2` 与 `progress` 段（尚未写库文件的中间状态，只作断点可见性）；旧格式 checkpoint 照常可读，整个文件读不懂时视为空并告警，不崩溃。
+- 重跑判定 = 记录已写 **且**（附件已传 **或** 本次带 `--no-attachment`）→ 整条跳过；记录已写但附件欠传且本次没带 `--no-attachment` → **只补传附件**（按 record_id 更新附件字段，绝不重复建记录），stage 6b 通过 `poll_fixup_attachments` 回读附件非空才算完成。**补传路径每轮最多处理 100 份（P4a 主控裁决）**：超出部分 defer 到下一轮（entry 记「未完成」、进 `deferred_attachment_files`、stdout 说明），重跑同一命令续补——防大批量补传把墙钟拖爆。
 - 这是老版历史 bug「曾因批量路径跳过附件导致『单个有、批量空』」的防线：`--no-attachment` 跑完后，再次运行**不带**该参数必须能把附件补上（实测 28 份：补传 28/28、新建记录 0、第三轮重跑全跳过 0 次 dws 调用）。
 - **墙钟预算 `--wall-budget <秒>`（P3，默认 100，必须小于 agent 工具 120s 超时）**：到点 graceful 停——落 checkpoint、打印已完成/未完成清单与一行 `RESUME:`（内容即原命令）、退出码 0、报告 `ok=true` 且 `partial=true`（带 `pending_files` 未完成名单与 `deferred_attachment_files` 附件欠传名单）。附件触顶停传后**记录仍照常批量 upsert**（欠附件的重跑走"只补附件"路径），保证每轮都有真实入库进度。**脚本内部不循环子批**；续跑 = 重跑同一条命令（checkpoint 幂等，不产生重复记录）。agent 纪律：**见 `RESUME:` 就重跑同命令，最多 3 次；仍 partial 才把已完成/未完成清单报给用户**。partial 时 `--auto-match` 自动跳过（candidates 不完整不进判定）。补传附件阶段（6b）不受预算门控（它是在完成上一轮已提交的记录），但受**每轮 100 份上限**约束（见上条）。
 - **`turns_saved_estimate` 口径（P4a 主控裁决）**：只按**已完成**文件计（老插件 25 回合/份 × 已完成份数 − 本脚本 1 回合）；「未完成」文件（预算耗尽/闸门/补传 defer）本轮没做完，**不计入**省下回合——报告与 stdout 的估算值不再虚报。
@@ -117,7 +117,7 @@
 
 ## 写后回读
 
-- 写记录/附件/选项后的回读验证**由脚本自动完成**（回读不到会按报告失败/警告呈现，写入落地到可读有约 1~2 秒传播延迟，脚本内部已轮询）。
+- 回读验证**仅在 stage 6b（补传附件）执行**——通过 `poll_fixup_attachments` 轮询附件非空才算完成。**stage 7（批量 upsert / 记录写入）在 emit/replay 模式下不做回读**，record_id 直接从 upsert 响应中提取，不发起单独的回读查询。
 - agent 不只凭退出码宣称成功：**只认产物报告 `ok==true` 与 `rows` 里的逐行结果**；报告说失败就是失败，如实转述。
 
 ## 覆盖与破坏性操作

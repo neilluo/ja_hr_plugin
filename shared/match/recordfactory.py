@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 """匹配记录工厂（MatchRecordFactory）：写库 payload 的字段渲染（纯函数面）。
 
-原 apply_decisions.py 的 `gate_text`(L139-157) / `cells_for`(L472-493) /
-`_years_text`(L997-1007) 与 apply() 内联的 rec 组装（L789-809）搬入。
 `make_record` 的键插入序与 None 剔除规则是 **PAYLOAD 层指纹的主要保护对象**
 （写库 payload 字段顺序与 cells 键冻结，逐字保留）；截断上限（[:500]/[:1000]/
 [:EVIDENCE_MAX_LEN]）是内联字面量口径，原样保留。
@@ -11,7 +9,7 @@
 from typing import Any, Dict, Optional
 
 from match.applyvalues import as_list, as_text, join_list, _today
-from match.constants import EVIDENCE_MAX_LEN, MATCH_SOURCE_SYSTEM
+from match.match_basics import EVIDENCE_MAX_LEN, MATCH_SOURCE_SYSTEM
 
 
 class MatchRecordFactory:
@@ -79,7 +77,7 @@ class MatchRecordFactory:
             "name": merged["name"],
             "phone": merged["phone"],
             "job_name": as_text(job.get("job_name")) or None,
-            "job_id": jid,                                     # D1：普通 text，脚本自己 join
+            "job_id": jid,                                     # 普通 text，脚本自己 join
             "org": merged["org"] or as_text(job.get("org")) or None,
             "source": MATCH_SOURCE_SYSTEM,
             "cand_skills": join_list(merged["skills"], "、")[:500] or None,

@@ -7,7 +7,7 @@ name_zh: 岗位入库
 description_en: Upload JD docs (single or batch). Script drafts, agent normalizes in one batched turn, script applies and verifies.
 description_zh: 上传岗位说明书（单个或批量）。脚本一次完成解析预填、按岗位+部门+组织查重、批量写入与并发附件，agent 只做一个回合的批量归一化（硬性门槛四项拆解/必备与加分技能切分/部门与组织归一），再由脚本一次应用并回读。
 user-invocable: true
-argument-hint: 上传 1 个或多个岗位说明书(JD)文件，或说明要新增的岗位
+argument-hint: Upload one or more JD files, or describe the role to add
 argument-hint-en: Upload one or more JD files, or describe the role to add
 argument-hint-zh: 上传 1 个或多个岗位说明书(JD)文件，或说明要新增的岗位
 ---
@@ -90,4 +90,4 @@ python3 scripts/intake_job.py --config <config.json绝对路径> \
 
 ## If Connectors Available
 
-数据表格（钉钉 AI 表格）已连（默认）→ 脚本直接批量落库。未连或 `dws` 未登录 → 只能输出岗位结构化草案（Markdown），提示先开启钉钉连接器；机器缺 python → 引导安装后重跑（自检：`python3 -V && dws aitable base list --limit 1`）。
+数据表格（钉钉 AI 表格）已连（默认）→ 脚本直接批量落库。未连或 `dws` 未登录 → 只能输出岗位结构化草案（Markdown），提示先开启钉钉连接器；机器缺 python → 引导安装后重跑（自检两条命令，**分开执行、不要用 `&&` 串**：PowerShell 5.1 不认 `&&`，Windows 用户粘进去直接报「标记"&&"不是此版本中的有效语句分隔符」；① `python3 -c "import sys;assert sys.version_info[:2]>=(3,9),sys.version;print(sys.version)"` 查版本界，要求 Python **3.9+**、低于 3.9 当场抛 AssertionError 而不会拖到 import 才炸；② `dws aitable base list --limit 1` 查登录态；Windows 把 `python3` 换成 `py -3`，**不要用裸 `python`**，可能是 Microsoft Store 别名、静默失败退出码 49）。

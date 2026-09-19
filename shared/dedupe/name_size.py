@@ -5,15 +5,15 @@
 本地侧用的是 `file_name` 与 `stat().st_size`。同名同大小即判重复，改一个字节内容也
 照样命中（误判）；反过来，同一份内容换个文件名就漏掉（漏判）。
 
-P4b 起内容级比对走 `dedupe/content_hash.py` 的 `ContentHashDeduper`（读库内
+内容级比对走 `dedupe/content_hash.py` 的 `ContentHashDeduper`（读库内
 「附件内容MD5」字段）。本类只剩两个用途：
   ① **老库回退**：config/schema 里没有「附件内容MD5」字段时，编排层直接用本类并告警
      （绝不自建字段——建字段是 replicate 部署时的事）；
   ② `ContentHashDeduper` 的父类：(文件名, 大小) 索引仍是「同名同大小但内容不同」
      与「老记录无哈希」两层判定的依据。
 
-扫描口径原值保留：`all_pages=True`、`max_pages=100`（≈10000 条上限；截断由
-`ScanResult.truncated` 报出去，见缺陷2）。
+扫描口径：`all_pages=True`、`max_pages=100`（≈10000 条上限；截断由
+`ScanResult.truncated` 报出去）。
 """
 
 from __future__ import annotations

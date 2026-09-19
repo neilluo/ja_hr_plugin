@@ -1,17 +1,16 @@
 # -*- coding: utf-8 -*-
-"""P5 身份字段安全阀的纯函数工具（intake_resume.py / build_match_input.py 共用）。
+"""身份字段安全阀的纯函数工具（intake_resume.py / build_match_input.py 共用）。
 
-背景（W6 召回审计）：name / email / expected_location 在 digest 里**既无 needs_review
-标记也无原文保留面**，正则/OCR 错抽即静默入库（实测盲区：OCR 垃圾姓名「本汉族」、
-OCR 邮箱 qq.com→q9.com、文件名覆盖正文姓名「林云/林之府」、双栏串栏期望地点）。
-本模块提供三件确定性能力，全部零第三方依赖、python 3.9/3.14 兼容（契约 D18）：
+背景：name / email / expected_location 在 digest 里**既无 needs_review
+标记也无原文保留面**，正则/OCR 错抽即静默入库。本模块提供三件确定性能力，
+全部零第三方依赖、python 3.9/3.14 兼容：
 
 1. `identity_evidence(text, ...)`：从简历全文里取「字段命中所在行原文」（≤60 字），
    进 digest 的 evidence.name_text / email_text / location_text——给 Turn 2 一个
-   可见的原文复核面（对齐 D4 对 education_text 的保留思路）。
+   可见的原文复核面。
 2. `email_ocr_noise(email)`：邮箱 OCR 噪声规则判据（域名无点 / TLD 含非字母 /
    域名主体字母+数字混排，如 q9.com ← qq.com、gmai1.com ← gmail.com、163.c0m ←
-   163.com）。命中 → needs_review 追加 "email"。规则清单同步列在 P5 报告。
+   163.com）。命中 → needs_review 追加 "email"。
 3. `name_review_reason(...)`：姓名来源判据——name_source ∈ {filename, vision, ocr}
    或提取 backend 是 OCR 梯队（vision_ocr / agent_vision / 任何含 ocr/vision 的
    backend）或 field_source=agent_vision → needs_review 追加 "name"。
@@ -91,7 +90,7 @@ def _head_line(text: Any, limit: int = IDENTITY_LINE_LIMIT) -> str:
 def identity_evidence(text: Any, name: Any = None, email: Any = None,
                       expected_location: Any = None,
                       limit: int = IDENTITY_LINE_LIMIT) -> Dict[str, str]:
-    """三个身份字段的「命中行原文」evidence（P5 安全阀的原文保留面）。
+    """三个身份字段的「命中行原文」evidence（安全阀的原文保留面）。
 
     * name_text：姓名命中行；姓名不在正文（如 name_source=filename 且正文写的是
       另一个名字）→ 兜底取简历首行（真名通常就在抬头），仍无 → ""。
@@ -134,7 +133,7 @@ _TLD_OK = re.compile(r"^[A-Za-z]{2,10}$")
 
 
 def email_ocr_noise(email: Any) -> Optional[str]:
-    """邮箱 OCR 噪声判据（P5 设计第 2 条，规则清单同步列在 P5 报告）。
+    """邮箱 OCR 噪声判据。
 
     命中任一规则返回判据说明（→ needs_review 追加 "email"）；干净返回 None。
       R1 域名无点（`abc@163com`）；
@@ -167,13 +166,13 @@ def email_ocr_noise(email: Any) -> Optional[str]:
 
 def name_review_reason(name_source: Any = None, parse_backend: Any = None,
                        field_sources: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    """姓名 needs_review 判据（P5 设计第 2 条：来源为 filename/vision/ocr 时标记）。
+    """姓名 needs_review 判据（来源为 filename/vision/ocr 时标记）。
 
     返回判据说明（→ needs_review 追加 "name"）；无需标记返回 None。
-      * field_sources["name"]=="agent_vision"（P4a 补丁草稿姓名）；
+      * field_sources["name"]=="agent_vision"（补丁草稿姓名）；
       * name_source ∈ NAME_FLAG_SOURCES（filename=文件名覆盖正文；vision/ocr 预留）；
       * parse_backend 属 OCR/视觉梯队（vision_ocr / agent_vision 等）——OCR 首行
-        垃圾 token 实测会产出「本汉族」这类姓名，正文行原文必须人工比对。
+        垃圾 token 会产出「本汉族」这类姓名，正文行原文必须人工比对。
     """
     fs = field_sources if isinstance(field_sources, dict) else {}
     if str(fs.get("name") or "") == "agent_vision":

@@ -7,7 +7,7 @@
 `schema.TableSchema._format_attachment`）。
 
 附件**没有批量接口**（3 步/文件），所以并发是唯一优化手段：
-`upload_attachments(paths, concurrency=5)`（API 限 20 QPS，5 是留足余量的默认值，契约 D5）。
+`upload_attachments(paths, concurrency=5)`（API 限 20 QPS，5 是留足余量的默认值）。
 并发上限夹在 1~20 也是原值，别调。
 """
 
@@ -27,7 +27,7 @@ from aitable.client import DwsClient, DwsError
 __all__ = ["AttachmentUploader", "DEFAULT_UPLOAD_CONCURRENCY",
            "MAX_ATTACHMENT_SIZE", "OSS_PUT_TIMEOUT"]
 
-#: 附件上传并发默认值（契约 D5：API 限 20 QPS，留余量）
+#: 附件上传并发默认值（API 限 20 QPS，留余量）
 DEFAULT_UPLOAD_CONCURRENCY = 5
 #: 附件单文件大小上限（沿用官方 skill 脚本 upload_attachment.py 的取值）
 MAX_ATTACHMENT_SIZE = 100 * 1024 * 1024
@@ -60,7 +60,7 @@ class AttachmentUploader(object):
     def upload_attachments(self, file_paths: Sequence[str],
                            concurrency: int = DEFAULT_UPLOAD_CONCURRENCY
                            ) -> List[Dict[str, Any]]:
-        """并发上传多个附件（契约 D5：默认并发 5，API 限 20 QPS 留余量）。
+        """并发上传多个附件（默认并发 5，API 限 20 QPS 留余量）。
 
         返回顺序与入参一致。每项含 `cell`，可直接塞进 rows 的 attachment 字段::
 
@@ -79,7 +79,7 @@ class AttachmentUploader(object):
                 i = fut2idx[fut]
                 try:
                     results[i] = fut.result()
-                except Exception as exc:      # 不让一个文件炸掉整批（D6 失败可见）
+                except Exception as exc:      # 不让一个文件炸掉整批（失败可见）
                     results[i] = {"ok": False, "path": str(paths[i]),
                                   "file_name": Path(str(paths[i])).name,
                                   "error": "%s: %s" % (type(exc).__name__, exc),
@@ -126,6 +126,12 @@ class AttachmentUploader(object):
                 return base
 
             # 步骤 2：PUT 到 OSS（Content-Type 必须是文件的具体 MIME type）
+            # emit 模式下 uploadUrl 是假的（emit-fake.example.com），跳过 OSS PUT
+            if "emit-fake" in (upload_url or ""):
+                # emit 模拟：跳过 OSS PUT，直接返回 token
+                base.update(ok=True, fileToken=token, cell=[{"fileToken": token}],
+                            elapsed_ms=int((time.monotonic() - t0) * 1000))
+                return base
             err = self._put_to_oss(upload_url, p, mime, data.get("headers") or {})
             if err:
                 base.update(error=err, category="network",

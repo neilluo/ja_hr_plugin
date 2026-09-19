@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """aitable 的值语义：写前净化 + 读回归一化 + 写读比对。
 
-读写两侧都必须过这里，别直接当字符串用（每条都是实测换来的）：
+读写两侧都必须过这里，别直接当字符串用：
   * `singleSelect` 读回是 dict（要取 `.name`）；`multipleSelect` 是 dict 数组且
     **读回不保序** → 所有比对按集合（`val_set` / `values_equal`），不能按列表；
   * `number` 读回是**字符串形式**的数字；`date` 读回是 RFC3339（写 `YYYY-MM-DD`）；
@@ -24,7 +24,7 @@ __all__ = ["val", "val_set", "values_equal", "sanitize_text"]
 def val(v: Any, default: Any = None) -> Any:
     """把 `record query` 读回的单元格值归一化成好用的 python 值。
 
-    实测坑（必须走这个函数，别直接当字符串用）：
+    注意（必须走这个函数，别直接当字符串用）：
       * `singleSelect` → dict `{"id","name"}`，取 `.name`；
       * `multipleSelect` → dict 数组，且**读回不保序**；
       * `number` / `currency` / `progress` → **字符串形式**的数字（如 `"0.7"`）；
@@ -123,7 +123,7 @@ def _is_numberish(x: Any) -> bool:
 # ---------------------------------------------------------------------------
 # 写前净化
 # ---------------------------------------------------------------------------
-#: 必须丢掉的码位区间（含端点）。实测依据见 sanitize_text 文档串。
+#: 必须丢掉的码位区间（含端点）。依据见 sanitize_text 文档串。
 _DROP_RANGES = (
     (0x00, 0x09), (0x0B, 0x1F),          # C0 控制字符（含 \t），只保留 \n = 0x0A
     (0x7F, 0x9F),                        # DEL + C1 控制字符
@@ -158,18 +158,16 @@ def _translate_table() -> Dict[int, Any]:
 def sanitize_text(s: Any) -> Any:
     """写入前净化文本；非字符串原样返回。
 
-    规则（契约要求 + 实测）：
+    规则：
       1. `\\r\\n` → `\\n`，剩下的孤立 `\\r` 丢掉；
       2. **U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR → `\\n`**。
-         实测：dws 会以 `[UNCLASSIFIED] <fieldId> contains dangerous Unicode characters`
-         **拒绝整批写入**（错误码 3、无 retryable 提示）。31 份真实简历里 3 份的
-         docx 提取文本含 U+2028 → 那 3 条记录写不进去。这类字符不是 C0/C1 控制符，
+         dws 会以 `[UNCLASSIFIED] <fieldId> contains dangerous Unicode characters`
+         **拒绝整批写入**（错误码 3、无 retryable 提示）。这类字符不是 C0/C1 控制符，
          `ord(c) < 32` 的老规则抓不到，必须显式处理。
       3. 丢掉 `ord(c) < 32`（**保留 `\\n`**）、DEL 与 C1（0x7F~0x9F）；
       4. 丢掉零宽/bidi 等不可见格式符（U+200B~U+200F、U+202A~U+202E、U+2060~U+2069、
          U+FEFF、U+00AD、U+061C、U+FFF9~U+FFFB、Tags 区块）。
-         注：实测这些字符当前服务端**是收的**（有简历含 17~38 个 U+200F 也写成功了），
-         但它们是 PDF/docx 提取噪声、不可见、且属于典型注入载体，统一清掉更稳。
+         这些字符是 PDF/docx 提取噪声、不可见、且属于典型注入载体，统一清掉更稳。
 
     ⚠️ 净化会改变字节内容 → 任何「写入 vs 读回」的逐字节比对都必须拿
     `sanitize_text(原文)` 当基准，不能拿原文（否则会误判成截断）。

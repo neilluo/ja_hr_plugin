@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""WallBudget：--wall-budget 墙钟预算的全部语义（P7 刀3）。
+"""WallBudget：--wall-budget 墙钟预算的全部语义。
 
 收拢 skills/resume-intake/scripts/intake_resume.py 里散落的预算状态：
   t_start / budget / deadline   计时三元组（构造时定格，t_start 供 Report 算 elapsed_ms）
   budget_stopped                预算触顶标志（阶段1 截断 / 写库前停 / 附件截断）
   deferred_files                记录已入库、附件因预算欠传的文件名清单
 
-「不进任何 dws 写阶段」的 `halted` 标志**不在本类**（P7 刀6 起归 IntakePipeline）：
+「不进任何 dws 写阶段」的 `halted` 标志**不在本类**：
 它是预算与 20% vision gate 共用的编排级闸门，两个写点分处两个阶段，收在 Pipeline
 才有唯一所有权；本类的 halt_before_write() 只翻 budget_stopped + 打印。
 

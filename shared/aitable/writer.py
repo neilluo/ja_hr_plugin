@@ -1,36 +1,7 @@
 # -*- coding: utf-8 -*-
 """写路径：批量 create/update/upsert/delete + 整片失败二分定位 + 行数上限护栏。
 
-设计纪律（都是实测换来的，改代码前先读）：
-
-1. **调用次数是第一优化目标。** 一次 dws 网络调用固定开销 ≈1.0~1.3s。所以本层所有
-   方法都是「一次调用干完一批」：批量写 ≤100 条/次（服务端硬限制，`MAX_RECORDS_PER_CALL`），
-   幂等查重一次 OR filter 查完 N 个键（≤100 个 OR 条件/次，`MAX_FILTER_OPERANDS`）。
-
-2. **整片失败必须二分定位坏行**：实测服务端校验是**整批原子**的 —— 一片 100 条里只要有
-   1 个非法值（例如 email 格式不合法 `invalid email format: a@b.c`），整片全部写不进去，
-   错误消息还不告诉你是第几条。二分定位一条坏行的额外成本只有 ~log2(N) 次调用
-   （100 条 ≈ 7 次），远好过逐条重放的 100 次，也好过整批丢弃（契约 D6：失败可见）。
-   权限类错误（401/403）**不二分不重试**：整片直接进 failed 并保留原始错误码。
-
-3. ⚠️ **对「刚批量创建出来的记录」做 update，写入可能要几分钟后才可读（本层实测最阴的坑）**：
-   `record update` 立刻返回 success + recordIds，但随后 34s / 47s / 156s 连续轮询读回**全是旧值**，
-   约 4 分钟后再读就是正确值了（也遇到过更久）。期间当场怎么重试都没用
-   （实测一轮 41 次调用 / 70 秒全废，含逐条重发）。
-   复现条件不唯一：job 表「一次 create 19 条 → 0/2/5/20s 后 update 12~19 条」多次复现
-   （number/text 字段都会）；同样写法也有一轮直接 1.3s 就可读；resume 表 19 条一次 update
-   从没出现过；拆 10+9 两片、或 19 次单条发，多数正常，可也有 10 条一片照样延迟的一轮。
-   → 工程结论：**① 能在 create 里一次写全的就别事后再 update（附件先上传拿 fileToken，
-   随 create 一起写入）；② 回填用 `batch_update_verified()`（≤10 条/片 + 回读 + 有界重试）；
-   ③ 回读不到时不要空转（按 D6 报进 failed/warnings、按 D7 在后续回合重跑该步复核），
-   因为值通常几分钟后就在了，当场重试只会白烧调用次数。**
-
-4. **幂等**（契约 D12）：`batch_upsert_by_key` 先**一次性**批量查出已存在键（不逐条查），
-   再拆 create/update，走 `record upsert` 一次提交。
-
-5. **行数上限护栏**（缺陷3）：免费版单表 20000 行，写前查一次行数（`record stats` COUNT，
-   结果按表缓存）；逼近上限（≥90%）时加 warning。调用方若已从别的查询里**免费**得知行数
-   （如 intake 的库内去重全表扫描），用 `set_row_count()` 喂进来即可省掉这次调用。
+批量写 ≤100 条/次（服务端硬限制），整片失败时二分定位坏行，幂等 upsert 先批量查再一次提交。
 """
 
 from __future__ import annotations
@@ -52,9 +23,8 @@ __all__ = ["RecordWriter", "SAFE_UPDATE_CHUNK", "MAX_FILTER_OPERANDS",
 #: 一次 filter 查询里最多塞多少个 OR 条件（超出自动分片查询）
 MAX_FILTER_OPERANDS = 100
 #: `batch_update_verified` 的单片条数上限。
-#: 实测：对**刚批量创建**出来的 job 表记录，一次 update 12~19 条时写入要几分钟后才可读
-#: （返回 success + recordIds，但当场轮询 156s 全是旧值）；≤10 条、或拆成多次、
-#: 或逐条发，大多数轮次都能 1~2s 内读到（不是 100%，所以还要配回读校验）。
+#: 对刚批量创建出来的记录，一次 update 12~19 条时写入可能要几分钟后才可读；
+#: ≤10 条、或拆成多次、或逐条发，大多数轮次都能 1~2s 内读到（不是 100%，所以还要配回读校验）。
 SAFE_UPDATE_CHUNK = 10
 #: 免费版单表行数上限（记忆库口径）
 ROW_LIMIT_FREE_TIER = 20000
@@ -73,7 +43,7 @@ class RecordWriter(object):
         self.warnings = warnings
         self._row_counts: Dict[str, Optional[int]] = {}
 
-    # -- 行数上限护栏（缺陷3）---------------------------------------------
+    # -- 行数上限护栏 ---------------------------------------------
     def set_row_count(self, table_key: str, count: int) -> None:
         """把已知的表行数喂进来（调用方已经从别的查询里免费拿到时用，省一次 stats 调用）。"""
         self._row_counts[table_key] = int(count)
@@ -121,7 +91,6 @@ class RecordWriter(object):
                      isolate: bool) -> Tuple[List[Any], List[Dict[str, Any]], int]:
         """提交一片记录（一次 dws 调用）；整片失败时**二分递归**定位坏行。
 
-        为什么必须二分：见模块文档第 2 条。
         返回 (成功 recordId 列表, failed 列表, 二分额外调用次数)。
         """
         args = ["aitable", "record", cmd, "--base-id", self.schema.base_id,
@@ -256,13 +225,13 @@ class RecordWriter(object):
                               fallback_single: bool = False) -> Dict[str, Any]:
         """`batch_update` + 写后回读 + **有界**重试。回填统计数字这类「必须写成功」的场景用它。
 
-        为什么需要它见模块文档第 3 条：那段时间里当场怎么重试都没用，所以本方法只做
-        **有界**重试（每片重发一次），然后把仍未生效的记录如实报进 `failed`
-        （契约 D6 失败可见 + D7 后续回合重跑该步），**绝不空转烧调用**。
+        对刚批量创建出来的记录做 update，写入可能要几分钟后才可读，期间当场重试无效。
+        所以本方法只做**有界**重试（每片重发一次），然后把仍未生效的记录如实报进 `failed`
+        （失败可见，后续回合重跑该步），**绝不空转烧调用**。
 
         流程（每片 ≤ chunk_size 条，默认 10）：update → readback_verify(expected=本次写入值)
         → 不一致就把该片重发一次 → 仍不一致 → 记 failed。
-        `fallback_single=True` 时再逐条重发一次（默认关闭：实测「一开始就逐条发」有效，
+        `fallback_single=True` 时再逐条重发一次（默认关闭：「一开始就逐条发」有效，
         但「批量发失败后再逐条补」在延迟期内同样无效）。
 
         返回::
@@ -310,7 +279,7 @@ class RecordWriter(object):
                     "batch_update_verified(%s) 第 %d 片第 %d 次写入后仍有 %d 条未生效"
                     % (table_key, start // size + 1, attempt, len(pending)))
             if pending and fallback_single:
-                # 逐条重发（仅在「一开始就逐条发」的场景实测有效；丢写生效期间同样无效）
+                # 逐条重发（仅在「一开始就逐条发」的场景有效；丢写生效期间同样无效）
                 for rid, cells in pending:
                     self.batch_update(table_key, [{"record_id": rid, "cells": cells}])
                 rb = self.verifier.readback_verify(
@@ -326,7 +295,7 @@ class RecordWriter(object):
             for rid, _ in pending:
                 failed.append({
                     "record_id": rid,
-                    "reason": "写入返回成功但当场回读不到新值（实测：新建记录的批量 update "
+                    "reason": "写入返回成功但当场回读不到新值（新建记录的批量 update "
                               "可能要几分钟后才可读，期间重试无效）。请在后续回合重跑本步回填复核；"
                               "详见 aitable.writer.batch_update_verified 文档串",
                     "category": "server_write_lag"})
@@ -360,7 +329,7 @@ class RecordWriter(object):
     # -- 幂等 upsert ------------------------------------------------------
     def batch_upsert_by_key(self, table_key: str, unique_field: str,
                             rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-        """按业务唯一键幂等写入（契约 D12）。
+        """按业务唯一键幂等写入。
 
         流程（**调用次数已压到最小**）：
           1. 一次 OR filter 查询把 N 个键全部查出来（N>100 才分片，每片仍是一次调用）；
@@ -552,7 +521,7 @@ class RecordWriter(object):
 def _dig_count(data: Any) -> Optional[int]:
     """从 `record stats` 的响应里挖出总行数。
 
-    实测形态（dws 1.0.60，2026-09-17 在基准库 CFFijGo 上只读探针，真值 28 条）::
+    响应形态::
 
         {"results": [{"calcVersion": 28, "dataVersion": 28, "deltaVersion": 28,
                       "results": [{"fieldId": "mUQYiBr", "statsType": "COUNT",

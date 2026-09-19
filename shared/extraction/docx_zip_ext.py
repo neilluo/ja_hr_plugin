@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
 """.docx 梯队：stdlib zipfile + 单趟正则解析 word/document.xml（backend=stdlib_zip）。
 
-**不要**用 macOS textutil 处理 docx：实测丢表格内容，10 份 docx 只提出
-21,141 字符，zipfile 路径 142,366 字符。
-容器非法/缺 document.xml 抛 ValueError，由门面通用 except 映射成 status=error
-（与旧实现一致，本梯队无下一级）。
+**不要**用 macOS textutil 处理 docx：会丢表格内容。
+容器非法/缺 document.xml 抛 ValueError，由门面通用 except 映射成 status=error。
 """
 
 from __future__ import annotations

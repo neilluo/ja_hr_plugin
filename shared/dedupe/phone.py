@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""手机号查重：一次 filter 查询判 new / overwrite / conflict（契约要求）。
+"""手机号查重：一次 filter 查询判 new / overwrite / conflict。
 
-扫描口径原值保留：
+扫描口径：
   * OR 条件 **≤100/片**（服务端硬限制），超出自己分片，每片仍是一次 dws 调用；
   * `fields=["phone","name"]`、`limit=100`、`all_pages=True`。
 
-判定纪律（老插件铁律「同号多条即停止并报告」，契约 D6：不自动选）：
+判定纪律（老插件铁律「同号多条即停止并报告」，不自动选）：
   * 本批内同一个手机号出现两次 → 失败/conflict，停下问用户；
   * 库内命中 0 条 → new；
   * 库内命中 >1 条 → 失败/conflict，**record_id 显式清空**，绝不自动挑一条覆盖；
@@ -53,7 +53,7 @@ class PhoneDeduper(Deduper):
 
         与 `Deduper.scan` 不同签名：这里必须**按待查键分片**（一次查完 N 个键），
         不是全表扫。截断状态由编排层直接看 `table.last_query_truncated`
-        （每片 all_pages=True、max_pages 用默认 50 ≈5000 条/片，实测远打不满）。
+        （每片 all_pages=True、max_pages 用默认 50 ≈5000 条/片，远打不满）。
         """
         phones = list(phones or [])
         records: List[Dict[str, Any]] = []

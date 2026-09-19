@@ -1,15 +1,11 @@
 # -*- coding: utf-8 -*-
 """表/文件侧读取边界（MatchSourceGateway）：build 侧唯一持 AITable 的 IO 类。
 
-原 build_match_input.py 的 `load_candidates_file`(L670) / `fetch_open_jobs`(L695) /
-`check_onboarded`(L722) / `fetch_candidates_from_table`(L787) 搬入。
-
 两条排序稳定性铁律（分片可复现性的根，方法内注释保留原文）：
   * fetch_open_jobs：jobs 按 job_id → job_name → key 稳定排序后**重编号**；
   * fetch_candidates_from_table：recs 按 姓名 → record_id 稳定排序。
 
-check_onboarded **就地**校正 candidates（表是唯一事实源）——入参是编排层自有的
-normalized 对象，就地语义被编排层封闭（同 candidates.py 头注）。
+check_onboarded **就地**校正 candidates（表是唯一事实源）。
 """
 
 import json
@@ -20,10 +16,9 @@ from aitable.client import DwsError
 from aitable.schema import AITableConfigError
 from aitable.table import AITable
 
-from match.constants import COMM_STATUS_ONBOARDED, JOB_STATUS_OPEN
-from match.jsonio import strip_md_fence
-# _LateBoundExtractor：入口注入的「调用时查名」代理（保持原模块级条件 import 的
-# 全局查找时机，见 match.jobparse 头注）；isinstance 判定与之配套。
+from match.match_basics import COMM_STATUS_ONBOARDED, JOB_STATUS_OPEN
+from match.match_basics import strip_md_fence
+# _LateBoundExtractor：入口注入的「调用时查名」代理（保持原模块级条件 import 的全局查找时机）；isinstance 判定与之配套。
 from match.jobparse import _LateBoundExtractor
 from match.tablevalues import WORK_TEXT_LIMIT, SKILL_TEXT_LIMIT, as_list, \
     as_number, as_text, clean_ws, clip, dedupe_keep_order, full
@@ -36,9 +31,9 @@ def _extractor_available(ex: Any) -> bool:
 
 
 class MatchSourceGateway:
-    """岗位/候选人取数（IO 边界）。job_parser 由编排层注入（含 W-A 降级语义）；
+    """岗位/候选人取数（IO 边界）。job_parser 由编排层注入（含降级语义）；
     resume_field_extractor = shared/extract_fields.extract_resume_fields，可为 None
-    （--from-table 切 evidence 用；缺失时降级，行为与原模块级条件 import 一致）。"""
+    （--from-table 切 evidence 用；缺失时降级）。"""
 
     def __init__(self, table: AITable, job_parser: Any,
                  resume_field_extractor: Any = None):
@@ -47,10 +42,10 @@ class MatchSourceGateway:
         self._extract_resume_fields = resume_field_extractor
 
     def load_candidates_file(self, path: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        """吃 C1 产出的 candidates.json（契约 §6 接缝）。也容忍直接给一个 candidates 数组。"""
+        """吃 C1 产出的 candidates.json。也容忍直接给一个 candidates 数组。"""
         if not path.exists():
             raise SystemExit("candidates.json 不存在：%s\n"
-                             "（它由 resume-intake 的 intake_resume.py 产出，契约 §6；"
+                             "（它由 resume-intake 的 intake_resume.py 产出；"
                              "请先跑简历入库，或用 --candidates 指向正确的绝对路径）" % path)
         with open(str(path), "r", encoding="utf-8") as fh:
             raw = fh.read()
@@ -65,11 +60,11 @@ class MatchSourceGateway:
             raise SystemExit("candidates.json 结构不认识（既不是 dict 也不是 list）")
         cands = data.get("candidates")
         if not isinstance(cands, list):
-            raise SystemExit("candidates.json 缺 candidates 数组（契约 §6）")
+            raise SystemExit("candidates.json 缺 candidates 数组")
         return cands, data
 
     def fetch_open_jobs(self, warnings: List[str]) -> List[Dict[str, Any]]:
-        """从**表里**查在招岗位（契约 §6 b：不依赖 jobs_draft.json）。"""
+        """从**表里**查在招岗位（不依赖 jobs_draft.json）。"""
         try:
             recs = self.table.query_records("job", filter={"status": JOB_STATUS_OPEN},
                                             all_pages=True)
@@ -123,9 +118,8 @@ class MatchSourceGateway:
                 if not c.get("org_guess"):
                     c["org_guess"] = tbl_org
                 elif tbl_org and tbl_org != clean_ws(c.get("org_guess")):
-                    # P5：表是唯一事实源——apply_decisions 写回组织改判（或用户人工改库）后，
-                    # 重跑同一命令必须按**表里的新组织**重切预筛与组合（HOTPATH 回合 2
-                    # 规则 5「组织判错 → 回填 override → 重跑同命令」依赖本语义）。改动显式报告。
+                    # 表是唯一事实源——apply_decisions 写回组织改判（或用户人工改库）后，
+                    # 重跑同一命令必须按**表里的新组织**重切预筛与组合。改动显式报告。
                     warnings.append("%s(%s)：简历库组织=%s 与 candidates.json 的 org_guess=%s "
                                     "不一致 → 以库内为准（表是唯一事实源），本轮组织预筛与组合"
                                     "按库内值重切"
@@ -135,7 +129,7 @@ class MatchSourceGateway:
                 if not c.get("category_guess"):
                     c["category_guess"] = clean_ws(as_text(cells.get("category"))) or None
                 if not c.get("email"):
-                    # P5：邮箱身份阀要在 C2 判 OCR 噪声；旧版 candidates.json 没带 email 时
+                    # 邮箱身份阀要在 C2 判 OCR 噪声；旧版 candidates.json 没带 email 时
                     # 从表里回补（同一次查询顺带取，零额外调用）
                     c["email"] = clean_ws(as_text(cells.get("email"))) or None
                 ft = as_text(cells.get("full_text"))
@@ -155,19 +149,18 @@ class MatchSourceGateway:
         return active, onboarded
 
     #: --from-table 导出的候选人字段集合：**与 C1 intake_resume.py 产出的 candidates.json
-    #: 元素完全同构**（契约 v3 §9#7 的验收断言就是「两种模式产出的键集合完全一致」）。
-    #: P5 起 email 也导出（身份阀判据），并补 name_source / parse_backend 两键
+    #: 元素完全同构**。email 也导出（身份阀判据），并补 name_source / parse_backend 两键
     #: （表里不存来源，置 None）保持键集合与模式 A 一致。
     def fetch_candidates_from_table(self, org: Optional[str] = None,
                                     exclude_onboarded: bool = False,
                                     warnings: Optional[List[str]] = None
                                     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        """契约 v3 §9#7：从简历库表批量导出**存量候选人**，映射成与 candidates.json
+        """从简历库表批量导出**存量候选人**，映射成与 candidates.json
         完全相同的 candidates 结构（key 用 c01/c02…，record_id 用表里的真实 id）。
 
         * 一次 filter 查询取全量（≤100/页由 aitable.query 自动翻页）；`--org` 时在服务端过滤。
-        * evidence 从「简历全文」text 列取，按 D4 保留教育/证书段：全文可用 → 用 W-A 的
-          同一套分段规则（extract_resume_fields）切；切不出来 → 整段截断进 work_text，
+        * evidence 从「简历全文」text 列取：全文可用 → 用同一套分段规则
+          （extract_resume_fields）切；切不出来 → 整段截断进 work_text，
           并在 meta 里标注 evidence_source="full_text_fallback"（后续 enrich_evidence
           还会按关键词开窗补教育/证书段，双保险）。
         * `--exclude-onboarded` 时在查询映射阶段就排除 沟通状态=已入职；不带该参数时
@@ -210,8 +203,8 @@ class MatchSourceGateway:
                 "file_name": fname or ("%s（在库简历）" % name if name else None),
                 "name": name,
                 "phone": clean_ws(as_text(cells.get("phone"))) or None,
-                # P5：邮箱导出（身份阀要在 C2 判 OCR 噪声 + 取原文行）；表里不存姓名来源
-                # 与解析 backend，两键置 None 只为与模式 A 键集合一致（契约 v3 §9#7）
+                # 邮箱导出（身份阀要在 C2 判 OCR 噪声 + 取原文行）；表里不存姓名来源
+                # 与解析 backend，两键置 None 只为与模式 A 键集合一致
                 "email": clean_ws(as_text(cells.get("email"))) or None,
                 "education": clean_ws(as_text(cells.get("education"))) or None,
                 "school": clean_ws(as_text(cells.get("school"))) or None,
@@ -233,7 +226,7 @@ class MatchSourceGateway:
                 "parse_backend": None,
                 "evidence": {"education_text": "", "cert_text": "", "work_text": "",
                              "skill_text": "",
-                             # P5 身份原文行：有「简历全文」时由 enrich_evidence 统一兜底补
+                             # 身份原文行：有「简历全文」时由 enrich_evidence 统一兜底补
                              "name_text": "", "email_text": "", "location_text": ""},
             }
             y = as_number(cells.get("years_experience"), None)
@@ -243,7 +236,7 @@ class MatchSourceGateway:
             if certs_text:
                 cand["certificates"] = dedupe_keep_order(
                     [clean_ws(x) for x in re.split(r"[、,，;；\n]+", certs_text) if clean_ws(x)])
-            # evidence（D4）：表内「简历全文」→ W-A 分段规则；切不出来整段截断 + 标注
+            # evidence：表内「简历全文」→ 分段规则；切不出来整段截断 + 标注
             ft = as_text(cells.get("full_text"))
             if ft:
                 secs: Optional[Dict[str, Any]] = None
@@ -263,7 +256,7 @@ class MatchSourceGateway:
                 else:
                     cand["evidence"]["work_text"] = clip(ft, WORK_TEXT_LIMIT)
                     ev_sources["full_text_fallback"] += 1
-                # enrich_evidence 兜底开窗仍可用全文（教育/证书段为空时按关键词补，D4 双保险）
+                # enrich_evidence 兜底开窗仍可用全文（教育/证书段为空时按关键词补，双保险）
                 cand["_full_text_from_table"] = ft
             else:
                 ev_sources["no_full_text"] += 1

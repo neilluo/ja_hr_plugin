@@ -1,12 +1,7 @@
 # -*- coding: utf-8 -*-
-"""门槛语义（build 侧）：EMPTY_GATE 词表 + P5 组织预筛「错杀」的机械复查。
+"""门槛语义（build 侧）：EMPTY_GATE 词表 + 组织预筛「错杀」的机械复查。
 
-原 build_match_input.py 的 `_EMPTY_GATE`(L301) / `EDU_ORDINAL`(L1044) /
-`_edu_rank` / `_years_req_of` / `mechanical_hard_gates` / `find_prefilter_suspicious`
-（L1051-1154）搬入。EMPTY_GATE 同时被 match.jobparse 消费（原 L420-426 的
-「无明确要求」归一）——这是 build 侧内部的单一词表源；apply 侧 gate_text 的
-「无明确要求」字面量（apply L144-146）与 verify 侧 gate_verdict 的
-_PASS_LIKE/_FAIL_LIKE（verify L56-57）是否同源合并由 P9 逐案裁定，本刀不动。
+EMPTY_GATE 同时被 match.jobparse 消费（「无明确要求」归一）——这是 build 侧内部的单一词表源。
 """
 
 import re
@@ -18,26 +13,26 @@ from match.tablevalues import as_list, as_number, clean_ws, clip, \
 EMPTY_GATE = ("无", "无明确要求", "不限", "无要求", "/", "-", "None", "null", "")
 
 # --------------------------------------------------------------------------- #
-# P5：组织预筛「错杀」的机械复查（零 token、零语义——只做 ordinal/数值/非空比较）
+# 组织预筛「错杀」的机械复查（零 token、零语义——只做 ordinal/数值/非空比较）
 #
-# 背景（W6 实测最严重盲区）：org_confidence=high 时 L3 预筛把跨组织岗位删出分片，
-# 且判定组合本来就只在同组织内发生——组织一旦判错（任旒：信息技术工程师被判
-# 「制造中心/high」，真值职能中心），正确组织的全部组合**静默错杀**，Turn 2 不可补救。
+# 背景：org_confidence=high 时 L3 预筛把跨组织岗位删出分片，
+# 且判定组合本来就只在同组织内发生——组织一旦判错，正确组织的全部组合**静默错杀**，
+# Turn 2 不可补救。
 #
-# P5 对策（设计第 1 条）：对每个候选人**跨组织**的在招岗位，用 digest 里现成的数据做
+# 对策：对每个候选人**跨组织**的在招岗位，用 digest 里现成的数据做
 # 机械硬门槛筛查：学历 ordinal 比较（博士>硕士>本科>大专>中专）/ 年限数值比较 /
 # 证书「无要求或持证者优先视为过，否则候选人证书非空视为过（粗筛）」；**专业跳过**
 # （语义项，机械判不了）。全部通过 → 该岗位「本来很有可能是该候选人的正确组织」→
 # 分片候选人加 prefilter_suspicious + needs_review 追加 "org" + 聚合 warning。
 #
-# 实现口径（在派工设计内的两点细化，报告有说明）：
+# 实现口径：
 #   * 跨组织岗位按**全量在招岗位**算，不只按「本片分片缺了什么」：分片预筛是并集口径
 #     （片里只要有一个人属于该组织，岗位就保留），但组合层只在同组织内配对——跨组织
 #     岗位对高置信候选人**永远不进组合**，错杀面与分片删光完全一致。
 #   * org_confidence=low 的候选人不标：其分片必然保留全部岗位，且 HOTPATH 规则 5
 #     已强制 agent 复核组织，再标属重复噪声。
-# **不把被删岗位的 JD 塞进分片**（O4 的 token 收益不动）；可见即可，复核走
-# candidate_overrides.org + 重跑同一命令（消费面规则见 HOTPATH.md 回合 2）。
+# **不把被删岗位的 JD 塞进分片**；可见即可，复核走
+# candidate_overrides.org + 重跑同一命令。
 # --------------------------------------------------------------------------- #
 
 #: 学历 ordinal（设计口径：博士>硕士>本科>大专>中专；常见同义词归到同档）。
@@ -53,8 +48,7 @@ class PrefilterAuditor:
     """机械硬门槛复查（纯计算，零 IO）。
 
     find_prefilter_suspicious **就地**给命中候选人追加 needs_review+="org"
-    （与原实现逐字一致；入参 candidates 是编排层自有的 normalized 对象，
-    不是调用方外部输入，就地语义被编排层封闭）。
+    （入参 candidates 是编排层自有的 normalized 对象，就地语义被编排层封闭）。
     """
 
     def edu_rank(self, s: Any, mode: str) -> Optional[int]:
@@ -68,7 +62,7 @@ class PrefilterAuditor:
         return min(hits) if mode == "req" else max(hits)
 
     def years_req_of(self, job: Dict[str, Any]) -> Optional[float]:
-        """岗位经验年限下限：优先 years_req_min（W-A 抽取），缺失时从 hard_gates.years
+        """岗位经验年限下限：优先 years_req_min，缺失时从 hard_gates.years
         文本里抓「N年」。抓不到/≤0 → None（= 无年限要求）。"""
         n = as_number(job.get("years_req_min"), None)
         if n is None:
@@ -127,7 +121,7 @@ class PrefilterAuditor:
     def find_prefilter_suspicious(self, candidates: Sequence[Dict[str, Any]],
                                   jobs: Sequence[Dict[str, Any]],
                                   org_prefilter: bool = True) -> Dict[str, List[Dict[str, Any]]]:
-        """P5：找出「组织预筛可能错杀」的 候选人×跨组织岗位 组合。
+        """找出「组织预筛可能错杀」的 候选人×跨组织岗位 组合。
 
         返回 {candidate_key: [entry,…]}，entry = {"job_key","job_name","dropped_org",
         "passed_mechanical_gates"}；命中的候选人**就地**把 needs_review 追加 "org"。

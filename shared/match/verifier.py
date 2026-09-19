@@ -1,34 +1,29 @@
 # -*- coding: utf-8 -*-
-"""主校验（DecisionVerifier）：原 verify_decisions.verify（L573-952，380 行上帝函数）
-的 OO 分解 + 结果组装原语（_result / _dist / _slim_for_stdout）。
+"""主校验（DecisionVerifier）：原 verify 的 OO 分解 + 结果组装原语。
 
 `verify(digest, decisions, check_coverage=True, sem_thresholds=None,
-semantic_guards=True) -> dict` 是**冻结签名**（旧 apply_decisions L626/L638/L646
-消费；sem_thresholds 的 5 个仅 API 键必须继续可传）。薄壳留在 verify_decisions.py
-入口，apply 侧经入口薄壳同进程复用同一个 verify()（SKILL.md 契约面）。
+semantic_guards=True) -> dict` 是**冻结签名**（sem_thresholds 的 5 个仅 API
+键必须继续可传）。薄壳留在 verify_decisions.py 入口，apply 侧经入口薄壳同进程复用
+同一个 verify()。
 
-原 err/warn 两个嵌套闭包（L591-595）→ 实例方法（errors/warnings 单一 sink 语义不变）；
-上帝函数按原注释分界线拆成 _index_inputs / _audit_passed / _audit_rejected /
-_conclude 四个阶段方法，跨阶段量提升为实例属性（沿 P7/P8 黑板手法）。
 返回 dict 的键插入序（ok/verified_at/errors/warnings/counts/coverage/summary/
 python + extras）与全部告警文案是 stdout/report 字节面，**逐字保留**。
 
 推荐档位判定（total ≥80 推荐 / 60~79 待定 / <60 不推荐）经 ScoreCalculator 构造
-注入：verify_decisions 入口的 `_recommend_of` 是裁判篡改自证 threshold 的定位锚点，
-必须留在入口且行为支配（模式同 build 入口的 REQUIREMENTS_LIMIT）。
+注入：verify_decisions 入口的 `_recommend_of` 必须留在入口且行为支配。
 """
 
 import datetime as _dt
 import json
-import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from match.constants import EVIDENCE_MAX_LEN, GATE_ITEMS, \
+from match.match_basics import EVIDENCE_MAX_LEN, GATE_ITEMS, \
     INVALID_PASSED_RATIO_LIMIT, RECOMMEND_VALUES
 from match.coverage import CoverageChecker
 from match.guardrails import SemanticGuardrails
 from match.hitmap import GateVerdictReader, HitMapper, as_str_list
 from match.scoring import ScoreCalculator
+from match.match_basics import json_dumps_zh, make_err, make_warn, python_version
 
 
 def dist(values) -> Dict[str, int]:
@@ -49,7 +44,7 @@ def build_result(ok: bool, errors: List[Dict[str, Any]], warnings: List[Dict[str
         "counts": counts,
         "coverage": coverage,
         "summary": summary,
-        "python": "%d.%d.%d" % sys.version_info[:3],
+        "python": python_version(),
     }
     out.update(extra)
     return out
@@ -78,12 +73,12 @@ class DecisionVerifier:
         self._coverage = CoverageChecker()
         self._guards = SemanticGuardrails()
 
-    # 原 verify() 里的 err/warn 闭包 → 实例方法（append 顺序 = 字节序，不变）
+    # err/warn → 实例方法（append 顺序 = 字节序，不变）
     def err(self, code: str, key: Any, detail: str) -> None:
-        self.errors.append({"code": code, "key": key, "detail": detail})
+        self.errors.append(make_err(code, key, detail))
 
     def warn(self, code: str, key: Any, detail: str) -> None:
-        self.warnings.append({"code": code, "key": key, "detail": detail})
+        self.warnings.append(make_warn(code, key, detail))
 
     def verify(self, digest: Any, decisions: Any, check_coverage: bool = True,
                sem_thresholds: Optional[Dict[str, float]] = None,
@@ -94,7 +89,7 @@ class DecisionVerifier:
         那时无法知道**真实**的期望组合集合（组织归属可能不全），所以只跳过覆盖率判定，
         引用/集合/算术/evidence/结构 五项照查，并记一条 `coverage_not_checked` warning。
 
-        `sem_thresholds` / `semantic_guards`（缺陷2 新增，缺省启用、阈值见
+        `sem_thresholds` / `semantic_guards`（缺省启用、阈值见
         SEM_GUARD_DEFAULTS）：语义合理性护栏开关与阈值覆盖；不传 = 默认阈值全开，
         既有调用方（apply_decisions）零改动兼容。
 
@@ -108,7 +103,7 @@ class DecisionVerifier:
             return build_result(False, self.errors, self.warnings, {}, {}, {})
         if not isinstance(decisions, dict):
             self.err("decisions_not_object", "decisions",
-                     "decisions 不是 JSON 对象（契约 §3.3 要求 {batch_id,passed,rejected,...}），实得 %s"
+                     "decisions 不是 JSON 对象（要求 {batch_id,passed,rejected,...}），实得 %s"
                      % type(decisions).__name__)
             return build_result(False, self.errors, self.warnings, {}, {}, {})
         self.digest = digest
@@ -224,9 +219,9 @@ class DecisionVerifier:
                 self.err("gate_detail_not_object", "%s|%s" % pair,
                          "gate_detail 必须是对象，实得 %s" % type(gd).__name__)
 
-            # 3. 集合校验（防模型编造命中项，契约 D16）
-            #    先做**可解释的归一化映射**（模型常把 W-A 切碎的条目合回一句引用），
-            #    映射不上的才算编造 → 该条无效 + warnings（D16 原文：越界即判该条无效并进 warnings）
+            # 3. 集合校验（防模型编造命中项）
+            #    先做**可解释的归一化映射**（模型常把切碎的条目合回一句引用），
+            #    映射不上的才算编造 → 该条无效 + warnings
             skill_hits_raw = as_str_list(p.get("skill_hits"))
             bonus_hits_raw = as_str_list(p.get("bonus_hits"))
             skill_eff, skill_map = self._hits.map_hits_to_items(skill_hits_raw, must)
@@ -239,20 +234,18 @@ class DecisionVerifier:
                 self.warn("fabricated_skill_hit", "%s|%s" % pair,
                           "skill_hits 有 %d 项无法映射到岗位 must_skills（判为编造，**该条 pass 无效**、"
                           "不会建匹配记录）：%s ｜岗位必备技能=%s"
-                          % (len(bad_skill), json.dumps([d["original"] for d in bad_skill][:6],
-                                                         ensure_ascii=False),
-                             json.dumps(list(must)[:8], ensure_ascii=False)))
+                          % (len(bad_skill), json_dumps_zh([d["original"] for d in bad_skill][:6]),
+                             json_dumps_zh(list(must)[:8])))
             if bad_bonus:
                 self.warn("fabricated_bonus_hit", "%s|%s" % pair,
                           "bonus_hits 有 %d 项无法映射到岗位 bonus_skills（判为编造，**该条 pass 无效**）：%s"
                           " ｜岗位加分项=%s"
-                          % (len(bad_bonus), json.dumps([d["original"] for d in bad_bonus][:6],
-                                                         ensure_ascii=False),
-                             json.dumps(list(bonus)[:8], ensure_ascii=False)))
+                          % (len(bad_bonus), json_dumps_zh([d["original"] for d in bad_bonus][:6]),
+                             json_dumps_zh(list(bonus)[:8])))
             if fixed_skill or fixed_bonus:
                 self.warn("skill_hit_normalized", "%s|%s" % pair,
                           "命中项已归一化映射回岗位原文条目（模型把被切碎的条目合回一句/做了缩写）："
-                          "%s" % json.dumps((fixed_skill + fixed_bonus)[:4], ensure_ascii=False)[:400])
+                          "%s" % json_dumps_zh((fixed_skill + fixed_bonus)[:4])[:400])
             # 同一集合内重复命中会虚增分子（map_hits_to_items 已按岗位条目去重）
             raw_skill = len([h for h in skill_hits_raw if self._hits.squash(h)]) - len(bad_skill)
             raw_bonus = len([h for h in bonus_hits_raw if self._hits.squash(h)]) - len(bad_bonus)
@@ -272,7 +265,7 @@ class DecisionVerifier:
                 self.err("evidence_empty", "%s|%s" % pair, "passed[%d] 的 evidence 为空（必须给原文引用）" % i)
             elif len(ev_s) > EVIDENCE_MAX_LEN:
                 self.err("evidence_too_long", "%s|%s" % pair,
-                         "evidence %d 字 > 上限 %d 字（契约 §3.3）：%s…"
+                         "evidence %d 字 > 上限 %d 字：%s…"
                          % (len(ev_s), EVIDENCE_MAX_LEN, ev_s[:40]))
 
             rec = p.get("recommend")
@@ -280,7 +273,7 @@ class DecisionVerifier:
                 self.err("recommend_invalid_value", "%s|%s" % pair,
                          "recommend=%r 非法，只能是 %s" % (rec, "/".join(RECOMMEND_VALUES)))
 
-            # 4. 算术复核（D16：脚本算，模型输出只作对照）
+            # 4. 算术复核（脚本算，模型输出只作对照）
             got = self._calc.compute(skill_u, bonus_u, must, bonus, job.get("weights"))
             audit: Dict[str, Any] = {
                 "candidate_key": ck, "job_key": jk,
@@ -323,7 +316,7 @@ class DecisionVerifier:
                                          % (m["recommend"], got["recommend"], got["total_score"]))
             if audit["mismatch"]:
                 self.warn("score_mismatch", "%s|%s" % pair,
-                          "%s × %s：%s ｜以脚本重算为准（契约 D16）"
+                          "%s × %s：%s ｜以脚本重算为准"
                           % (audit["candidate_name"], audit["job_name"], "; ".join(audit["mismatch"])))
             for n in got["notes"]:
                 self.warn("score_denominator", "%s|%s" % pair, "%s × %s：%s"
@@ -415,17 +408,17 @@ class DecisionVerifier:
                       "候选人 %s 在本 digest 里没有同组织的在招岗位 → 期望覆盖 0 个组合"
                       % cand_by_key.get(ck, {}).get("name"))
 
-        # 编造命中项本身按 D16 只作 warning + 该条无效；但**比例过高**说明模型整体在瞎写
-        # （前序实验：20 人批量会语义崩塌、放弃推理改写关键词脚本），这时必须拦住不让写库。
+        # 编造命中项本身只作 warning + 该条无效；但**比例过高**说明模型整体在瞎写，
+        # 这时必须拦住不让写库。
         n_invalid = len([a for a in self.passed_audit if not a["valid"]])
         if self.passed_audit and n_invalid * 1.0 / len(self.passed_audit) > INVALID_PASSED_RATIO_LIMIT:
             self.err("too_many_invalid_passed", "passed",
                      "有 %d/%d 条 pass 的命中项判为编造（>%.0f%%）→ 模型输出整体不可信，"
-                     "不写库；请缩小分片（契约 D3）或重跑本批判定"
+                     "不写库；请缩小分片或重跑本批判定"
                      % (n_invalid, len(self.passed_audit), INVALID_PASSED_RATIO_LIMIT * 100))
 
-        # ---------------- 6. 语义合理性护栏（缺陷2，2026-09-17） ----------------
-        # 形式校验全过 ≠ 语义判定认真做了（W-F run3：规则脚本代跑 → 0 推荐但 verify PASS）。
+        # ---------------- 6. 语义合理性护栏 ----------------
+        # 形式校验全过 ≠ 语义判定认真做了（规则脚本代跑 → 0 推荐但 verify PASS）。
         # 护栏告警**必须**如实转述给用户并说明可能需要重做 Turn 2，禁止静默吞掉继续写库。
         sem_metrics: Dict[str, Any] = {"evaluated": False}
         if semantic_guards:
@@ -467,7 +460,7 @@ class DecisionVerifier:
                                                                               "evidence_too_long")]),
             "recommend_distribution": dist(a["recomputed"]["recommend"] for a in self.valid_passed),
             "denominator_warnings": len([w for w in self.warnings if w["code"] == "score_denominator"]),
-            # 语义护栏（缺陷2；只增不删）：触发的护栏代码 + 实测指标，供 agent/报告直接引用
+            # 语义护栏（只增不删）：触发的护栏代码 + 指标，供 agent/报告直接引用
             "semantic_guards": {
                 "triggered_errors": sorted({e["code"] for e in self.errors if e["code"].startswith("sem_")}),
                 "triggered_warnings": sorted({w["code"] for w in self.warnings

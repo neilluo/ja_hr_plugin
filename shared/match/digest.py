@@ -1,47 +1,45 @@
 # -*- coding: utf-8 -*-
-"""digest 编排（DigestBuilder）：原 build_match_input.build_digest（L1195-1485，
-291 行上帝函数）的 OO 分解。跨阶段长寿命状态提升为实例属性（沿 P7 IntakePipeline
-同款手法），run() 只剩阶段调度；每个阶段方法与原代码块**逐字**对应。
+"""digest 编排（DigestBuilder）：build_digest 的 OO 分解。
 
-    _open_table()            config → AITable；失败走 D7 早退产物（ok:false digest）
+    _open_table()            config → AITable；失败走早退产物（ok:false digest）
     _load_raw_candidates()   模式 A（candidates.json）/ 模式 B（--from-table 表导出）
     _normalize()             逐人 normalize + key 去重改名
     _check_onboarded()       老插件铁律剔除（errors 时短路，不发查询）
-    _enrich()                D4 evidence 全文兜底开窗 + 聚合 warning
+    _enrich()                evidence 全文兜底开窗 + 聚合 warning
     _load_jobs()             在招岗位 + 「无可判定」两条 error 检查
     _resolve_batch_id()      --batch-id > candidates.json > 时间戳
     _count_combos()          同组织组合数 + unmatched warning
-    _audit_prefilter()       P5 机械复查 + 聚合 warning
+    _audit_prefilter()       机械复查 + 聚合 warning
     _assemble_meta()         meta 键插入序 = digest 字节（红线，逐字保留）
     _assemble_digest()       顶层键序 batch_id/generated_at/ok/errors/scoring_rules/
                              candidates/jobs/meta（逐字保留）
     _write_shards()          分片循环（含 L3/L4 裁剪遥测键）+ 落盘
     _write_digest()          digest.json 落盘
 
-已知缺陷豁免（§B.7#1，不许修）：config 失败早退路径的 meta 只有 3 个键，
+已知缺陷豁免（不许修）：config 失败早退路径的 meta 只有 3 个键，
 report_and_emit 消费时抛 KeyError —— 本类**保持**该早退 meta 的键集合不变。
 """
 
 import datetime as _dt
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from aitable.client import now_iso
+from aitable.client import DwsCallCounter, DwsClient, now_iso
 from aitable.table import AITable
 
 from match.candidates import CandidateNormalizer
 from match.chunking import SLIM_DROP_JOB_FIELDS, ShardPlanner
-from match.constants import DEFAULT_MAX_PER_BATCH
+from match.match_basics import DEFAULT_MAX_PER_BATCH
 from match.gates import PrefilterAuditor
 from match.jobparse import JobRecordParser
-from match.jsonio import dump_json_doc
+from match.match_basics import dump_json_doc
 from match.scoring import SCORING_RULES
 from match.source import MatchSourceGateway
 from match.tablevalues import CHARS_PER_TOKEN, SKILL_TEXT_LIMIT, WORK_TEXT_LIMIT, \
     est_tokens, full
+from match.match_basics import python_version
 
 
 def _now() -> str:
@@ -62,7 +60,8 @@ class DigestBuilder:
                  org_prefilter: bool = True, slim_jobs: bool = True,
                  requirements_limit: int = 600,
                  job_field_extractor: Any = None,
-                 resume_field_extractor: Any = None):
+                 resume_field_extractor: Any = None,
+                 replay_path: Optional[str] = None):
         self.config_path = config_path
         self.candidates_path = candidates_path
         self.out_dir = out_dir
@@ -76,6 +75,7 @@ class DigestBuilder:
         self.requirements_limit = requirements_limit
         self.job_field_extractor = job_field_extractor
         self.resume_field_extractor = resume_field_extractor
+        self.replay_path = replay_path
         self.normalizer = CandidateNormalizer()
         self.auditor = PrefilterAuditor()
         self.planner = ShardPlanner(org_prefilter, slim_jobs)
@@ -89,7 +89,7 @@ class DigestBuilder:
         outdir.mkdir(parents=True, exist_ok=True)
 
         self.warnings: List[str] = []
-        self.errors: List[str] = []      # 契约 v3 §9#2：不可判定的原因（digest.ok=false 时非空）
+        self.errors: List[str] = []      # 不可判定的原因（digest.ok=false 时非空）
 
         failed = self._open_table(self._cfg, outdir)
         if failed is not None:
@@ -126,17 +126,20 @@ class DigestBuilder:
 
     # --------------------------------------------------------------- stages
     def _open_table(self, cfg: Path, outdir: Path) -> Optional[Dict[str, Any]]:
-        """config → AITable；打不开 → 失败也要落产物（D7），返回早退 res（正常路径返回 None）。"""
+        """config → AITable；打不开 → 失败也要落产物，返回早退 res（正常路径返回 None）。"""
         try:
-            self.table = AITable(str(cfg))
-        except Exception as exc:                          # config 坏 → 失败也要落产物（D7）
+            counter = DwsCallCounter()
+            client = DwsClient(counter=counter,
+                               replay_path=self.replay_path)
+            self.table = AITable(str(cfg), client=client)
+        except Exception as exc:                          # config 坏 → 失败也要落产物
             errors = self.errors
             errors.append("打不开 config.json（%s: %s）→ 无法查岗位/候选人，本批不可判定"
                           % (type(exc).__name__, exc))
             digest = {"batch_id": self.batch_id or ("match-%s" % _dt.datetime.now().strftime("%Y%m%d-%H%M%S")),
                       "generated_at": _now(), "ok": False, "errors": errors,
                       "scoring_rules": SCORING_RULES, "candidates": [], "jobs": [],
-                      "meta": {"config_path": str(cfg), "python": "%d.%d.%d" % sys.version_info[:3],
+                      "meta": {"config_path": str(cfg), "python": python_version(),
                                "warnings": self.warnings}}
             dpath = outdir / "digest.json"
             dump_json_doc(digest, dpath)
@@ -151,7 +154,7 @@ class DigestBuilder:
     def _load_raw_candidates(self) -> None:
         self.ft_meta: Dict[str, Any] = {}
         if self.from_table:
-            # 契约 v3 §9#7：存量候选人反向匹配（指定岗位反向匹配 / 重建全部匹配的数据源）
+            # 存量候选人反向匹配（指定岗位反向匹配 / 重建全部匹配的数据源）
             try:
                 self.raw_cands, self.ft_meta = self.gateway.fetch_candidates_from_table(
                     org=self.org, exclude_onboarded=self.exclude_onboarded,
@@ -193,7 +196,7 @@ class DigestBuilder:
                 seen[k] = 0
 
     def _enrich(self) -> None:
-        # D4 兜底：上游分段为空的 evidence，用简历表里的「简历全文」按关键词开窗补上
+        # 兜底：上游分段为空的 evidence，用简历表里的「简历全文」按关键词开窗补上
         self.n_enriched = 0
         for c in self.active:
             ft = c.pop("_full_text_from_table", "") or full(c.get("full_text"))
@@ -205,7 +208,7 @@ class DigestBuilder:
                           if not (c.get("evidence", {}).get("education_text") or "").strip()]
         if self.empty_edu:
             self.warnings.append("有 %d 个候选人连兜底后 evidence.education_text 仍为空（%s）→ "
-                                 "学历门槛只能靠 education 字段判，agent 判 fail 前请特别小心（D4 误杀坑）"
+                                 "学历门槛只能靠 education 字段判，agent 判 fail 前请特别小心"
                                  % (len(self.empty_edu), ",".join(self.empty_edu[:8])))
 
     def _load_jobs(self) -> None:
@@ -241,7 +244,7 @@ class DigestBuilder:
                                  % (len(unmatched), "; ".join(unmatched[:8])))
 
     def _audit_prefilter(self) -> None:
-        # P5：组织预筛错杀的机械复查（零 token；口径与判据见 find_prefilter_suspicious）。
+        # 组织预筛错杀的机械复查（零 token；口径与判据见 find_prefilter_suspicious）。
         # 命中的候选人 needs_review 已就地追加 "org"；prefilter_suspicious 明细只进**分片**
         # 候选人（Turn 2 消费面），digest.json 候选人只带 needs_review 标记（apply 侧消费面）。
         self.suspicious = (self.auditor.find_prefilter_suspicious(
@@ -253,7 +256,7 @@ class DigestBuilder:
             sample = "、".join("%s(%s)×%d" % (by_key[k].get("name") or "?", k,
                                               len(self.suspicious[k]))
                                for k in sorted(self.suspicious)[:6])
-            self.warnings.append("P5 组织预筛疑似错杀：%d 个候选人共 %d 个跨组织岗位**全部通过机械"
+            self.warnings.append("组织预筛疑似错杀：%d 个候选人共 %d 个跨组织岗位**全部通过机械"
                                  "门槛**（学历/年限/证书；专业是语义项不参与）却被组织预筛删除——%s%s。"
                                  "预筛可能错杀，请复核组织归属：明细见分片候选人 prefilter_suspicious"
                                  "（needs_review 已追加 org）；Turn 2 复核确认有误 → 回填 "
@@ -285,7 +288,7 @@ class DigestBuilder:
                                % (WORK_TEXT_LIMIT, SKILL_TEXT_LIMIT),
             "requirements_text_limit": self.requirements_limit,
             "needs_review_years": sorted([c["key"] for c in self.active if "years" in c.get("needs_review", [])]),
-            # P5：组织预筛机械复查的汇总（逐人明细在分片候选人 prefilter_suspicious 里；
+            # 组织预筛机械复查的汇总（逐人明细在分片候选人 prefilter_suspicious 里；
             # digest 候选人只带 needs_review 追加的 "org" 标记，供 apply/verify 侧消费）
             "prefilter_suspicious": {"candidate_count": len(self.suspicious),
                                      "job_pair_count": self.susp_pairs,
@@ -294,14 +297,14 @@ class DigestBuilder:
             "evidence_empty_education": self.empty_edu,
             "dws_calls": self.table.dws_calls,
             "elapsed_ms": int((time.time() - self._t0) * 1000),
-            "python": "%d.%d.%d" % sys.version_info[:3],
+            "python": python_version(),
             "warnings": self.warnings,
             "errors": self.errors,
         }
         if self.from_table:
             self.meta["from_table"] = dict(self.ft_meta, org_filter=self.org,
                                            exclude_onboarded=bool(self.exclude_onboarded))
-            # 契约 v3 §9#7：evidence 来源标注（整段截断的计数在 from_table_evidence_sources 里）
+            # evidence 来源标注（整段截断的计数在 from_table_evidence_sources 里）
             if (self.ft_meta.get("from_table_evidence_sources") or {}).get("full_text_fallback"):
                 self.meta["evidence_source"] = "full_text_fallback"
 
@@ -310,7 +313,7 @@ class DigestBuilder:
         self.digest = {
             "batch_id": self.bid,
             "generated_at": _now(),
-            "ok": ok,                        # 契约 v3 §9#2：D7 产物凭证统一口径
+            "ok": ok,                        # 产物凭证统一口径
             "errors": self.errors,
             "scoring_rules": SCORING_RULES,
             "candidates": self.active,
@@ -319,17 +322,15 @@ class DigestBuilder:
         }
 
     def _write_shards(self, outdir: Path) -> None:
-        # 分片文件：candidates 只放本片；jobs 默认按 L3 组织预筛 + L4 字段裁剪（W-I 优化，W-J 移植），
+        # 分片文件：candidates 只放本片；jobs 默认按 L3 组织预筛 + L4 字段裁剪，
         # 把 agent 要读进上下文的字符数压到最小。
         #
         # ⚠️ **合并版 digest.json 的构造完全不动**：它的 meta.shards 仍按**全量 jobs** 计算、
-        # 不带任何裁剪遥测键，因此 digest.json 在开关开/关两种情况下**逐字节不变**、且与移植前
-        # 逐字节相同——下游 verify/apply 吃 digest.json，输入契约零变化、零回归（任务 3.1 md5 证明）。
+        # 不带任何裁剪遥测键，因此 digest.json 在开关开/关两种情况下**逐字节不变**。
         # 裁剪与遥测只作用于**分片文件**（agent 唯一读进上下文的东西）。
-        # 两个开关都关时，分片文件也逐字节回到移植前形态（optimize=False → 不写遥测键、jobs 全量）。
-        # （P5 注：本节「逐字节不变」指 W-I 裁剪开关的行为；P5 对 digest 的影响是**只增键**——
-        # 候选人 evidence 三个身份原文键、needs_review 的 org/name/email 标记、meta 汇总键，
-        # 下游 verify/apply 按只增不减契约兼容。）
+        # 两个开关都关时，分片文件也逐字节回到裁剪前形态。
+        # （注：对 digest 的影响是**只增键**——候选人 evidence 身份原文键、
+        # needs_review 的 org/name/email 标记、meta 汇总键，下游 verify/apply 按只增不减兼容。）
         ok = not self.errors
         optimize = bool(self.org_prefilter or self.slim_jobs)
         self.shard_paths: List[str] = []
@@ -342,7 +343,7 @@ class DigestBuilder:
             shard_jobs, pf_note = self.planner.select_shard_jobs(sh, self.jobs)
             if self.slim_jobs:
                 shard_jobs = [self.planner.slim_job(j) for j in shard_jobs]
-            # P5：prefilter_suspicious 明细只挂**分片**候选人（dict 浅拷贝，digest.json 的
+            # prefilter_suspicious 明细只挂**分片**候选人（dict 浅拷贝，digest.json 的
             # 候选人对象不被污染）；sm_shard 用挂载后的副本算，输入 chars 遥测才诚实。
             shard_cands = [(dict(c, prefilter_suspicious=self.suspicious[c["key"]])
                             if c["key"] in self.suspicious else c) for c in sh]

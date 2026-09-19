@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""TableGateway：intake_resume.py 的 dws IO 边界唯一入口（P7 刀4）。
+"""TableGateway：intake_resume.py 的 dws IO 边界唯一入口。
 
 收拢原散在 run() 里的 dws 装配与**写路径**调用站点：
   装配          counter/client/tbl 三件套 + config 失败 fatal（tbl=None 继续跑）
@@ -19,10 +19,10 @@
     拿 `tbl` 直调 deduper）、欠传 fixup 名单、批切分策略、异常归类（DwsError 的
     except 分支与 warning/fatal 文本）全部留在 run()。
   * `field_keys` 不发 dws（读 TableSchema 的 config 缓存），**不得**「优化」成实时查询。
-  * 回读校验（verify_by_filter / 阶段6b 附件轮询 query）是刀5 ReadBackVerifier 的
+  * 回读校验（verify_by_filter / 阶段6b 附件轮询 query）是 ReadBackVerifier 的
     范围，本类不收；本类也**不新增**任何 checkpoint 落盘时机。
 
-与 shared/aitable/ 的关系：aitable 包（P2 立的层）是 dws 的实现层，本类是
+与 shared/aitable/ 的关系：aitable 包是 dws 的实现层，本类是
 **入口编排与 aitable 包之间的适配层**——不塞进 aitable 包、不改 aitable 包。
 """
 
@@ -38,10 +38,12 @@ class TableGateway:
     """dws IO 边界。`tbl` 可为 None——语义是「config 失败但不致命」（fatal 已给出，
     run() 继续跑完流程产出完整报告），全流程 20+ 处 `if tbl is not None` 门控据此判定。"""
 
-    def __init__(self, config_path: str) -> None:
+    def __init__(self, config_path: str, *,
+                 replay_path: Optional[str] = None) -> None:
         self.fatal: Optional[str] = None
         self.counter = DwsCallCounter()
-        self.client = DwsClient(counter=self.counter, timeout=300, http_timeout=180)
+        self.client = DwsClient(counter=self.counter, http_timeout=180,
+                                replay_path=replay_path)
         try:
             self.tbl: Optional[AITable] = AITable(config_path, client=self.client)
         except Exception as exc:                  # config 缺失/格式错 → 立刻可见地失败

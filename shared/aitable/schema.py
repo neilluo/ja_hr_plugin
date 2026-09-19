@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""config.json → 真实 ID / 字段类型的唯一映射层（契约 D8：脚本内零硬编码 ID）。
+"""config.json → 真实 ID / 字段类型的唯一映射层（脚本内零硬编码 ID）。
 
 **不发任何 dws 调用**：本模块只做三件事
   ① 装载 config.json 并暴露 base/table/field 的 ID 与类型查询；
@@ -7,7 +7,7 @@
   ③ 把业务值按字段类型格式化成 cells 里的写入值（含 attachment 的 fileToken 纪律）。
 
 `types` / `formatters` / `options` 是 config.json 的可选段（缺失时按 text 兜底），
-由 replicate/bootstrap 生成。字段类型相关的 config.json 结构见契约 §3.4。
+由 replicate/bootstrap 生成。
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ SELECT_TYPES = {"singleSelect", "multipleSelect"}
 
 
 class AITableConfigError(Exception):
-    """config.json 缺 base_id / table / field 映射时抛出（契约 D8：唯一 ID 源）。"""
+    """config.json 缺 base_id / table / field 映射时抛出（唯一 ID 源）。"""
 
 
 class TableSchema(object):
@@ -185,7 +185,7 @@ class TableSchema(object):
                     keep_empty: bool = False) -> Tuple[bool, Any, Optional[str]]:
         """把业务值格式化成 cells 里该 fieldId 的写入值。
 
-        返回 (是否要写这个 cell, 值, 错误原因)。错误原因非空时上层应把该行记进 failed（D6）。
+        返回 (是否要写这个 cell, 值, 错误原因)。错误原因非空时上层应把该行记进 failed。
         """
         ftype = self.field_type(table_key, field_key)
         if ftype in READONLY_TYPES:

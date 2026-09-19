@@ -4,11 +4,11 @@
 设计意图：`extractors` 按优先级排列，前面的先抽；抽不到可用结果
 （`text_usable=False`，即扫描件/水印/空文本）才落到后面的。
 
-**P2 只实现单源路径**：`extractors` 里只有 `RegexFieldExtractor`，`merge()` 的
+单源路径：`extractors` 里只有 `RegexFieldExtractor`，`merge()` 的
 `drafts` 恒为空 —— 只把 field_source 全量打标。打标结果 `field_sources` 不进
 `to_dict()`（进了就会改动 FIELDS 层指纹）。
 
-**P4 起 merge_resume 实现真正的草稿合并**（agent 多模态兜底通道）：
+草稿合并（agent 多模态兜底通道）：
 `drafts` 是外部草稿 dict 列表（intake `--apply-vision-patch` 传入补丁的
 `fields_draft`），合并规则（主控裁决，逐字执行）：
   1. 先对文本跑 RegexFieldExtractor（`_run` 已做）；
@@ -46,7 +46,7 @@ class FieldMerger(object):
     SOURCE_REGEX = "regex"
     SOURCE_DRAFT = "draft"
     SOURCE_AGENT = "agent"
-    #: P4 agent 多模态兜底补丁的字段来源标记（主控裁决口径）
+    #: agent 多模态兜底补丁的字段来源标记（主控裁决口径）
     SOURCE_AGENT_VISION = "agent_vision"
 
     def __init__(self, extractors: Optional[Sequence[FieldExtractor]] = None):
@@ -65,7 +65,7 @@ class FieldMerger(object):
                                   drafts: Sequence[Any] = (),
                                   draft_source: str = SOURCE_AGENT_VISION
                                   ) -> CandidateFields:
-        """P4 agent 兜底入口：对 text 跑 regex，再用外部草稿补空 + 打标。"""
+        """agent 兜底入口：对 text 跑 regex，再用外部草稿补空 + 打标。"""
         primary = self._run("extract_resume", text, file_name)
         return self.merge_resume(primary, drafts,
                                  primary_source=self.SOURCE_REGEX,

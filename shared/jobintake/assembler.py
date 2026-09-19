@@ -1,22 +1,19 @@
 # -*- coding: utf-8 -*-
 """JobFieldAssembler：岗位表 payload / draft 文档的字段组装（纯函数，无 IO）。
 
-自 intake_job.py 逐字搬移（P9b）：
-  build_write_row   阶段 5 写入行（原 702–734）——岗位表 payload 的**字段顺序与
-                    cells 键**是红线：job_name/status/must_weight/bonus_weight/
-                    submit_time 五键先行，其后条件键按 job_id → department → org →
-                    work_location → responsibilities → requirements → submitter 的
-                    插入序；缺字段 pop 循环的顺序与告警文案逐字。
-  build_draft_job   阶段 9 jobs[] 元素（原 887–942）——24+ 键插入序即
-                    jobs_draft.json 字节（裁判 DRAFT 面双指纹含 ORDER）；
-                    parse_status != "ok" 时的「不硬造字段」置空分支（契约 D11）逐字。
-  build_apply_cells Turn 3 cells 组装（原 1027–1053）——hard_gates/must_skills/
-                    bonus_skills → 权重 → 直传五键 → work_location 的顺序即键序；
+  build_write_row   阶段 5 写入行——岗位表 payload 的字段顺序与 cells 键
+                    先行五键：job_name/status/must_weight/bonus_weight/submit_time，
+                    其后条件键按 job_id → department → org → work_location →
+                    responsibilities → requirements → submitter 的插入序；
+                    缺字段 pop 循环的顺序与告警文案逐字。
+  build_draft_job   阶段 9 jobs[] 元素——24+ 键插入序即 jobs_draft.json 字节；
+                    parse_status != "ok" 时的「不硬造字段」置空分支。
+  build_apply_cells Turn 3 cells 组装——hard_gates/must_skills/bonus_skills →
+                    权重 → 直传五键 → work_location 的顺序即键序；
                     返回 (cells, hg, ms, bs)，后三者供编排层的「全空」告警判定。
 
 刻意保留的既有行为（不许「顺手修好」）：
-  * resp/req 的写前处理是**裸切片** `[:RICHTEXT_MAX]`，不走 A 侧 sanitize_text
-    （P6 分析 §3.1：是否遗漏待业务确认，统一会改产物字节）。
+  * resp/req 的写前处理是**裸切片** `[:RICHTEXT_MAX]`，不走 A 侧 sanitize_text。
   * weights 恒为默认 0.7/0.3（float 字面量 json.dump 写 `0.7`，不得改 Decimal/round）。
 """
 
@@ -67,7 +64,7 @@ class JobFieldAssembler:
         if req:
             row["requirements"] = req[:RICHTEXT_MAX]
         if submitter_cell is not None:
-            row["submitter"] = submitter_cell          # v3 §9#5：配置了才回填
+            row["submitter"] = submitter_cell          # 配置了才回填
         for k in ("job_id", "department", "org", "work_location",
                   "responsibilities", "requirements"):
             if k not in have and k in row:
@@ -104,7 +101,7 @@ class JobFieldAssembler:
             "work_location": ent.get("locations") or [],
             "org_confidence": ent.get("org_confidence") or "low",
             "needs_llm_normalization": list(LLM_NORMALIZE_FIELDS),
-            "draft_source": "regex(Turn1) —— 命中率实测 26%~79%，必须 Turn 2 复核",
+            "draft_source": "regex(Turn1) —— 命中率不完全，必须 Turn 2 复核",
             "hard_gates_raw": clean(f.get("hard_gates_raw")),
             "must_skills_raw": clean(f.get("must_skills_raw")),
             "bonus_skills_raw": clean(f.get("bonus_skills_raw")),
@@ -121,7 +118,7 @@ class JobFieldAssembler:
             "warnings": list(ent.get("warnings") or []),
         }
         if ent["parse_status"] != "ok":
-            # 契约 D11：不硬造字段
+            # 不硬造字段
             for k in ("job_id", "job_name", "department", "org", "status",
                       "hard_gates_raw", "must_skills_raw", "bonus_skills_raw",
                       "years_req_min", "age_req"):

@@ -2,7 +2,10 @@
 name: resume-intake-hotpath
 version: 0.2.0
 description: Single-file hot path card for ingesting one or a few resumes and running targeted matching. Contains every command, the decisions.json structure, the scoring rubric and all business iron rules - read this ONE file and you can run the whole flow without opening any other doc.
+name_en: Resume Intake Hot Path
 name_zh: 简历入库+定向匹配 单文件热路径卡
+description_en: Single-file hot path card for ingesting one or a few resumes and running targeted matching. Contains every command, the decisions.json structure, the scoring rubric and all business iron rules - read this ONE file and you can run the whole flow without opening any other doc.
+description_zh: 单文件热路径卡：1 份或几份简历「解析入库并匹配」的全流程浓缩。含全部命令、decisions.json 结构、评分口径与业务铁律——读这一个文件就能跑完整条流程，无需翻别的文档。
 user-invocable: false
 ---
 
@@ -15,6 +18,11 @@ user-invocable: false
 （`replicate/SKILL.md`）、扫描件/加密件解析细节（`references/parsing-methods.md`）、
 查询与看板（`candidate-query` / `recruit-dashboard`）。
 
+> **⚠️ 架构铁律：dws 是宿主 shim，Python subprocess 调不了。** 入库分两阶段：
+> (1) emit：脚本解析简历 + 收集 dws 命令（纯本地，不写表格）；
+> (2) agent 通过 Bash 工具执行 dws 命令 + replay 写表格。
+> 详见插件根目录 `AGENTS.md`。代码是唯一事实来源。
+
 ## 0. 开工前 30 秒（不要多花回合）
 
 **本流程只有 5 个回合，多一个都是浪费。以下五件事一律禁止：**
@@ -25,26 +33,42 @@ user-invocable: false
   本卡已写全。读源码只会白烧回合与上下文（实测会引发"自我怀疑式"长思考，多花 60 秒以上）。
 - **禁止 Read `digest.json`**：它是给 verify/apply 吃的全量版，内容与分片文件重复且更大。
   你只需要 Read `SHARD:` 指向的**分片文件**。
-- **禁止逐条敲 `dws` 命令读写表格**：唯一例外是环境自检那**一条只读**命令，
-  且要与首个脚本调用**合并在同一个回合**里：
-  `python3 -V && dws aitable base list --limit 1`（Windows：`py -3 -V && ...`）。
-  自检失败（没有 python / dws 未登录）→ 停下用业务话告诉用户先装 Python 3 或在
+- **禁止逐条敲 `dws` 命令读写表格**：唯一例外是环境自检那**两条只读**命令，
+  且要与首个脚本调用**合并在同一个回合**里。**分开执行、不要用 `&&` 串**
+  （PowerShell 5.1 不认 `&&`，Windows 用户粘进去直接报「标记"&&"不是此版本中的有效语句分隔符」）：
+  ① `python3 -c "import sys;assert sys.version_info[:2]>=(3,9),sys.version;print(sys.version)"`
+  查版本界（要求 Python **3.9+**，低于 3.9 当场抛 AssertionError，不会拖到 import 才炸）；
+  ② `dws aitable base list --limit 1` 查登录态。Windows 把 `python3` 换成 `py -3`，
+  **不要用裸 `python`**（可能是 Microsoft Store 别名，静默失败、退出码 49）。
+  自检失败（没有 python / 版本越界 / dws 未登录）→ 停下用业务话告诉用户先装 Python 3 或在
   「设置 → 连接器」开启并授权钉钉，**不要**继续。
 
 路径一律传**绝对路径**（`--config` / `--files` / `--out-dir`）。
 Windows 用 `py -3 scripts\xxx.py`，**绝不用裸 `python`**（别名会静默失败、退出码 49）。
 下文 `<PLUGIN>` = 本插件根目录绝对路径；`<CFG>` = 该目录下 `config.json` 绝对路径。
 
-## 1. 回合 1 —— 入库 + 生成判定输入（一条命令做完）
+## 1. 回合 1 —— emit：解析简历 + 收集 dws 命令（纯本地，不写表格）
 
 ```bash
+# 方式 A（推荐）：用 --files-dir 传目录，避免文件名转写错误
 python3 <PLUGIN>/skills/resume-intake/scripts/intake_resume.py \
-        --config <CFG> --files <简历1> [简历2 ...] \
+        --config <CFG> --files-dir <简历目录> \
         --out-dir <工作区>/resume --auto-match
+# 方式 B：逐个列文件
+# python3 <PLUGIN>/skills/resume-intake/scripts/intake_resume.py \
+#         --config <CFG> --files <简历1> [简历2 ...] \
+#         --out-dir <工作区>/resume --auto-match
 ```
 
+- `--files-dir`：传目录路径，脚本自动扫描 `*.pdf|*.docx|*.doc|*.png|*.jpg|*.jpeg`，避免文件名转写错误。可与 `--files` 合并。
 - `--files` **一次全给**，不要分多次调用。
 - `--auto-match`：入库成功后同进程接着生成定向匹配判定输入（省一个编排回合）。
+
+> **⚠️ emit 模式产出的是 dws 命令清单，不是真写库。** 脚本 stdout 会打
+> `emit 模式：N 条 dws 命令已写入 <out-dir>/dws_commands.json`。
+> 这 N 条命令包含 record upsert（写记录）、attachment upload（上传附件）等，
+> **必须由 agent 通过 Bash 工具执行 dws 才能真正写进 AI 表格。**
+> 详见回合 1b。也可用 `scripts/run_pipeline.py --phase emit` 编排。
   digest 默认落在 `<out-dir>/../match`；要换位置加 `--match-out-dir <目录>`。
   本批 partial（见下）时 auto-match 会自动跳过，先续跑补齐再单独跑 build_match_input。
 - `--wall-budget <秒>`（默认 100，勿超过 agent 工具 120s 超时）：墙钟预算。到点脚本
@@ -67,25 +91,90 @@ python3 <PLUGIN>/skills/resume-intake/scripts/intake_resume.py \
     `text` 跑正则，**regex 有值的字段用 regex，regex 为空才取 fields_draft**；
     `confidence`（0~1）与 `notes` 可选，会原样记进该候选人的 warnings。
   - **agent 只产出结构化补丁，绝不写库、禁止逐条敲 dws 写表**；入库仍由脚本走正常
-    查重/护栏/回读流程。凡取自 `fields_draft` 的字段会被打 `field_source="agent_vision"`
+    查重/护栏流程（stage 6b 补传附件带 `poll_fixup_attachments` 回读；stage 7 批量 upsert 不做回读，record_id 从 upsert 响应提取）。凡取自 `fields_draft` 的字段会被打 `field_source="agent_vision"`
     并追加进该候选人 `needs_review`，回合 2 **必须**用 evidence 原文复核后照转。
-  - **20% 闸门（用户拍板）**：读不出的份数超过本批 20% 时脚本**不写任何记录**，stdout
-    提示「本批 X/Y 份读不出文字，超过 20% 阈值，疑似整批格式问题，请确认后重试或提供
-    文字版」并列出名单，退出码 0、报告 `ok=true`、`partial=true`、`reason="vision_gate"`。
-    此时**不要**走补丁协议——把这段业务话如实转给用户确认（疑似整批格式问题），
-    用户确认后再重跑 / 打补丁 / 换文字版。
+  - **20% 闸门（用户拍板）**：本批 ≥5 份且读不出的份数超过本批 20% 时脚本本轮**不写任何
+    记录**（不足 5 份不判比例——热路径是「1 份或几份」，非 macOS 无本机 OCR，单份扫描件
+    按比例算必然超 20%，拦下只会卡死），stdout 提示「本批 X/Y 份读不出文字，超过 20%
+    阈值 → 本轮不写任何记录」并列出名单，退出码 0、报告 `ok=true`、`partial=true`、
+    `reason="vision_gate"`。闸门只拦本轮写入、**不拦补救**：`VISION_NEEDED:` 行照打，
+    此时**仍要走补丁协议**——一轮读完清单全部文件、写补丁 json、重跑同一命令加
+    `--apply-vision-patch`，重跑时补丁件即可解析、照常入库；补丁之后仍读不出的才是真的
+    「疑似整批格式问题」，那时再把业务话转给用户、请其提供文字版。
   - `RECRUIT_NO_VISION=1` 是**仅测试用**环境变量（关掉本机 Vision OCR 演练本通道），
     生产流程绝不设置。
 - 用户明确说"先不传附件" → 加 `--no-attachment`；之后"补传附件" = **重跑同一条命令去掉该参数**
   （`checkpoint.json` 幂等，已入库的不重放；checkpoint 是**增量落盘**的——每份文件的
   「记录已写」「附件已传」状态一确立就写盘，中途被杀也不丢已完成进度）。
   用户说"从头重来"才加 `--reset`。
-- 脚本内部完成（**你一件都不用自己做**）：提取文本（**macOS 上扫描件/图片简历自动走系统
+- 脚本内部完成（**纯本地计算**）：提取文本（**macOS 上扫描件/图片简历自动走系统
   Vision OCR 救回**，零依赖、纯本地不出网，多份并行 ≤4；首次运行可能弹 macOS 授权弹窗，
   请用户点允许）→ 正则预抽字段 → 库内附件**内容级比对**（键 = 简历库「附件内容MD5」
   字段，P4b）→ 一次批量手机号查重 → 批量写简历库（≤100 条/次，命中即覆盖更新）→ 技能标签**只增不删**补选项 →
-  期望地点兜底「不限」→ 原始文件名并发上传附件（并发 5）→ 写后回读 →
+  期望地点兜底「不限」→ 原始文件名并发上传附件（并发 5）→ stage 6b 补传附件回读（`poll_fixup_attachments`）；stage 7 批量 upsert 不做回读，record_id 从 upsert 响应提取 →
   生成 digest.json + 分片，并打印 `SHARD:<分片文件绝对路径>`。
+  **注意：emit 模式下以上操作都用模拟数据，不真正写表格。** 需要走完回合 1b（agent 执行 dws + replay）才算真正入库。
+  附件上传也可走 `scripts/upload_attachments.py` 三阶段（prepare → upload → verify），详见 `AGENTS.md`。
+
+## 1b. 回合 1b —— agent 执行 dws 命令 + replay（写库 + 附件）
+
+> **这是唯一需要 agent 介入的环节。** dws 是宿主 shim，Python subprocess 调不了，
+> 只有 agent 通过 Bash 工具直接调 dws 才有效。详见 `AGENTS.md`。
+
+emit 模式产出 `dws_commands.json` 后，有两种路径完成写库：
+
+**路径 A（run_pipeline.py 编排，推荐）**：
+```bash
+python3 <PLUGIN>/scripts/run_pipeline.py --phase emit --intake-type resume \
+        --config <CFG> --files-dir <简历目录> --out-dir <工作区>/resume
+# stdout 打印结构化 JSON，含所有 step 和 dws 命令
+# agent 按 JSON 中的 steps 执行 dws 命令，每条结果写 dws_out_<seq>.json
+# 完成后 replay:
+python3 <PLUGIN>/scripts/run_pipeline.py --phase replay --intake-type resume \
+        --config <CFG> --out-dir <工作区>/resume \
+        --replay-path <工作区>/resume/dws_results.json
+```
+
+**路径 B（直接调脚本，6 步精确清单）**：
+
+> **这个清单写死的原因**：agent 每次 session 都要"理解"流程再执行，一理解就会偏。
+> 照着做，不要跳步、不要自创脚本、不要改变顺序。
+
+**Step 1**（已完成）：`intake_resume.py` emit 模式 → `dws_commands.json` 产出。
+
+**Step 2（agent 调 dws，先写记录拿 record_id）**：
+1. 从 `dws_commands.json` 提取 upsert 命令（最后一条，argv 含 `record upsert`）
+2. **先删掉附件字段里的 fake token**：upsert 命令的 records 里 `T84felR` 字段值是 `emit_fake_token_N` 占位符，dws 会拒 `INVALID_ATTACHMENT_FILE_TOKEN`。把 `T84felR` 从每条 record 的 cells 里删掉，写成 `upsert_records_noattach.json`
+3. 执行 upsert：
+   ```bash
+   dws aitable record upsert --base-id <base_id> --table-id <table_id> \
+       --records-file <out_dir>/upsert_records_noattach.json --format json --yes --timeout 180
+   ```
+4. 从响应 `createdRecordIds` 数组提取 record_id（顺序与 records 一致）
+
+**Step 3（脚本，纯本地）**：`python3 <PLUGIN>/scripts/upload_attachments.py --phase prepare --intake-type resume --config <CFG> --out-dir <out_dir>` → 产出 `attachment_manifest.json`，stdout 打印 N 条 `dws aitable attachment upload` 命令
+
+**Step 4（agent 调 dws，逐条附件上传）**：
+- 每条命令的结果（system-reminder 里的 content 字段 JSON）写入 **`<out_dir>/dws_out_<seq>.json`（out_dir 根目录！不是子目录！）**
+- 可并行：一次 Bash 调用里并行 10 条，3 批跑完
+- 每条返回 `{ "data": { "fileToken": "ft_...", "uploadUrl": "https://..." } }`
+
+**Step 5（脚本，纯本地）**：`python3 <PLUGIN>/scripts/upload_attachments.py --phase upload --intake-type resume --config <CFG> --out-dir <out_dir>` → 脚本读 `dws_out_<seq>.json`，并发 PUT 到 OSS，产出 `attachment_update_records.json`（含真实 fileToken，record_id 是占位符）
+- OSS PUT 403 = uploadUrl 过期 → 重跑 Step 4 对应 seq 拿新 URL，重写 dws_out_<seq>.json，重跑 Step 5
+
+**Step 6（agent 调 dws，写回附件）**：
+1. 把 `attachment_update_records.json` 里的 `RECORD_ID_FOR_*` 占位符替换成 Step 2 的真实 record_id
+2. 执行：
+   ```bash
+   dws aitable record update --base-id <base_id> --table-id <table_id> \
+       --records-file <out_dir>/attachment_update_records_real.json --format json --yes --timeout 180
+   ```
+3. 跑 `python3 <PLUGIN>/scripts/upload_attachments.py --phase verify --intake-type resume --config <CFG> --out-dir <out_dir>`
+
+**禁止事项**：
+- **禁止写新脚本**：`upload_attachments.py` 三阶段覆盖了所有需求
+- **禁止改变顺序**：必须 Step 2（upsert 拿 record_id）→ Step 3-6（附件）。先传附件再 upsert = record_id 不存在、update 无目标
+- **禁止把 dws_out 文件放子目录**：脚本在 `out_dir` 根目录找 `dws_out_<seq>.json`
 
 **凭证校验（必做，防静默早退）**：stdout 会有两行 `ARTIFACT:` —— 第一行是
 `intake_report.json`，第二行是 `digest.json`。规则：
@@ -93,9 +182,10 @@ python3 <PLUGIN>/skills/resume-intake/scripts/intake_resume.py \
 - stdout 有 `RESUME:` 行（= 报告 `partial=true`，墙钟预算耗尽或 20% 闸门触发）→
   预算耗尽：**重跑同一条命令续跑**（checkpoint 幂等，不产生重复记录），**最多 3 次**；
   仍 partial → 把已完成/未完成清单如实报给用户。闸门触发（报告 `reason="vision_gate"`）：
-  不重跑、不打补丁，先把「疑似整批格式问题」业务话报给用户确认。
+  不裸重跑——先按下面的 `VISION_NEEDED:` 协议打完补丁，再带 `--apply-vision-patch` 重跑
+  同一命令即可入库；补丁之后仍读不出的才把「疑似整批格式问题」业务话报给用户、请其提供文字版。
   partial 时不会有 `SHARD:` 行，属预期，别当故障。
-- stdout 有 `VISION_NEEDED:` 行（且没有闸门提示）→ 走上面的 **agent 多模态兜底协议**：
+- stdout 有 `VISION_NEEDED:` 行（闸门触发时同样会打）→ 走上面的 **agent 多模态兜底协议**：
   一轮读完全部列出文件 → Write 补丁 json → 重跑同命令加 `--apply-vision-patch`。
 - stdout 同时有「── 简历入库结果 ──」清单 + `digest:` / `分片:` 摘要 + `SHARD:` 行 →
   **两件事都成了**。入库清单直接在 stdout 里读，**不要**再去 Read `intake_report.json`
@@ -263,7 +353,7 @@ python3 <PLUGIN>/skills/match-verify/scripts/apply_decisions.py --config <CFG> \
   幂等清理该批候选人的旧「系统匹配」记录（**人工匹配不动**）→
   批量创建达标匹配记录（含岗位ID、匹配依据=evidence）→ **岗位统计重算**（对每个受影响岗位从表里查
   其**全部**匹配记录含人工匹配与历史，重算 候选人总数/推荐数/待定数/不推荐数再一次批量回填）→
-  候选人修正字段写回简历库 → 写后回读。
+  候选人修正字段写回简历库（emit/replay 模式下 stage 7 不做回读，record_id 从 upsert 响应提取）。
 - **凭证校验**：stdout 末行 `ARTIFACT:` 指向 `apply_report.json`，且报告 `ok == true`。
   stdout 已打出 `verify:` / `删旧…→ 新建匹配…` 摘要即视为成功；**不要**再花一个回合去 Read 它，
   除非 stdout 缺摘要或报异常（那时才 Read，或重跑，最多 2 次）。
@@ -320,7 +410,7 @@ python3 <PLUGIN>/skills/match-verify/scripts/apply_decisions.py --config <CFG> \
    里说明（照转）；整个库没有该列（客户现存库）→ 自动回退「文件名+字节大小」并告警
    说明"未启用内容级去重、如何启用"，**照转给用户**，建议按复刻部署补建该列。
 7. **除本卡回合 3 的语义判定外，禁止逐条敲 `dws` 命令**；所有表格读写都在脚本内部完成
-   （批量、带重试、带写后回读）。环境自检那一条只读命令是唯一例外。
+   （批量、带重试；stage 6b 补传附件带 `poll_fixup_attachments` 回读，stage 7 批量 upsert 不做回读——record_id 从 upsert 响应提取）。环境自检那两条只读命令是唯一例外。
 8. **附件一律原始文件名**，禁止改名/加序号前缀。技能标签**只增不删**（追加新选项时保留全部已有选项及其 id）。
 9. 必填口径：简历「所属组织」必填（判不了问用户，组织为空 = 匹配不到任何岗位）；
    「期望地点」必填，没有明确地点一律「不限」；简历库分类默认「技术类」；沟通状态新入库默认「待筛选」。

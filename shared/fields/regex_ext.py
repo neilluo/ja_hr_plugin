@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""正则/启发式字段抽取器（现状 extract_fields.py 的全部正则群迁到这里）。
+"""正则/启发式字段抽取器（extract_fields.py 的全部正则群迁到这里）。
 
 分两类，别混：
   * **模块级正则原语**：姓名/电话/邮箱/工作年限/教育条目/文件名派生/JD 分段。
@@ -10,11 +10,13 @@
     warnings、产出 `CandidateFields` / `JobFields`。
 
 全部阈值、正则、词表、文案均为原值搬迁；置信度词汇 high|low|none 与 warnings
-措辞逐字保留（FIELDS 层指纹锁死，一个字都不能动）。
+措辞逐字保留。
 """
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import unicodedata
 from pathlib import Path
@@ -31,6 +33,18 @@ from fields.textnorm import (JD_SECTION_HEADS, RESUME_SECTION_HEADS,
                              SENTENCE_SEP_RE, clean_item, normalize_text,
                              slice_sections, split_items)
 
+# ---------------------------------------------------------------------------
+# External data-table loader (inline word tables are now JSON files in ./data/)
+# ---------------------------------------------------------------------------
+_DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+
+
+def _load_data(name: str):
+    """Load a JSON data file from the ``data/`` sub-directory (UTF-8, cached)."""
+    path = os.path.join(_DATA_DIR, name + ".json")
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
 __all__ = [
     "RegexFieldExtractor",
     "name_from_filename", "name_from_text", "extract_phone", "extract_email",
@@ -46,27 +60,7 @@ __all__ = [
 # 4. 姓名
 # =========================================================================== #
 # 文件名里不可能是人名的词（岗位 / 行业 / 地名 / 模板词）
-_NAME_STOPWORDS: Set[str] = set("""
-个人简历 简历 求职简历 求职 意向 应聘 岗位 职位 基本信息 个人信息 基本资料
-自我评价 自我推荐 个人评价 教育经历 教育背景 工作经历 工作经验 项目经历 项目经验
-专业技能 技能特长 荣誉奖项 证书 联系方式 培训经历 核心优势 优势亮点 求职意向
-工程师 高级工程师 助理工程师 主管 经理 总监 专员 助理 会计 出纳 班长 组长
-技师 操作工 技术员 技术工 主任 厂长 部长 总裁 秘书 顾问 讲师 教师
-工艺 设备 暖通 财务 财经 电力 电气 单晶 电池 组件 硅片 切片 镀膜 拉晶
-生产 制造 质量 安全 环保 厂务 动力 数据 信息 系统 软件 硬件 网络 运维
-行政 人事 采购 物流 仓储 销售 市场 客服 法务 审计 成本 预算 项目
-曲靖 昆明 云南 江苏 贵州 湖北 四川 宁夏 甘肃 山东 河南 浙江 安徽 湖南 江西
-福建 广东 广西 陕西 山西 河北 辽宁 吉林 新疆 西藏 青海 海南 重庆 天津 上海
-北京 深圳 杭州 苏州 无锡 常州 镇江 绵阳 荆州 中卫 银川 西宁 大理 商丘 阜阳
-毕节 平凉 牟定 贵阳 遵义 徐州 兰州 西安 焦作 盐城 阜宁 哈尔滨 长春 沈阳
-济南 青岛 宁波 温州 福州 厦门 南昌 郑州 武汉 长沙 广州 东莞 佛山 中山 珠海
-惠州 南宁 海口 成都 太原 全国 制造基地 基地 高新区 开发区 工业园 附件
-毕业 年限 以上 以下 应届 社招 校招 内推 最新 修改 定稿 副本 模板 男 女
-姓名 名字 性别 民族 年龄 电话 手机 邮箱 学历 学校 专业 籍贯 户籍 住址 地址
-政治 面貌 婚姻 状况 身高 体重 出生 年月 工作 经验 技能 特长 证书 荣誉 奖项
-求职 意向 期望 薪资 城市 地点 岗位 职位 自我 评价 推荐 基本 信息 资料 个人
-简历 教育 经历 项目 培训 总结 教训 联系 方式 现居 目前 状态 离职 在职 沟通
-""".split())
+_NAME_STOPWORDS: Set[str] = set(_load_data("name_stopwords"))
 
 _SEP_SPLIT_RE = re.compile(r"[【】\[\]()（）\-－—–_＿·•、，,。.\s/\\|:：;；~～!！?？]+")
 _CJK_NAME_RE = re.compile(r"^[\u4e00-\u9fff]{2,4}$")
@@ -95,7 +89,7 @@ def _plausible_person_name(tok: str) -> bool:
 
 
 def name_from_filename(file_name: str) -> Optional[str]:
-    """从文件名抽姓名。客户简历文件名格式高度规律，实测 29/31 可解析。
+    """从文件名抽姓名。客户简历文件名格式高度规律。
 
     支持：`姓名-岗位.pdf` / `姓名_岗位.pdf` / `姓名 岗位.pdf` /
     `岗位-姓名.docx` / `个人简历-姓名-方向.docx` /
@@ -142,20 +136,12 @@ _NAME_TITLE_LINE_RE = re.compile(
 
 
 # 「姓名后面紧跟的标签词」——修剪掉它是**强信号**（说明粘连的确实是标签）
-_NAME_TAIL_LABEL_2: Set[str] = set("""
-性别 民族 出生 电话 联系 邮箱 电子 籍贯 学历 年龄 政治 身高 体重 住址 地址
-求职 意向 婚姻 状况 健康 毕业 专业 户籍 现居 目前 应聘 手机 微信 个人 基本
-任职 职级 岗位 邮编 家庭 最高 开始 照片 头像 编号
-""".split())
-# 实测碰到过、但不是标签的词（如双栏 PDF 串行导致的 `许金措施`）——修剪掉它是
+_NAME_TAIL_LABEL_2: Set[str] = set(_load_data("name_tail_label_2"))
+# 碰到过、但不是标签的词（如双栏 PDF 串行导致的 `许金措施`）——修剪掉它是
 # **弱信号**，需要文件名或别处佐证才敢给 high 置信度
-_NAME_TAIL_WORD_2: Set[str] = set("""
-措施 日期 学校 院校 籍贯
-""".split())
+_NAME_TAIL_WORD_2: Set[str] = set(_load_data("name_tail_word_2"))
 # 单字修剪：只在候选长度=4 时用（`徐志伟性` -> `徐志伟`），弱信号
-_NAME_TAIL_STOP_1: Set[str] = set(
-    "性 民 出 电 联 邮 籍 学 年 政 身 住 求 意 婚 毕 专 户 现 目 工 期 应 手 "
-    "微 基 个 简 职 编 日 措 照 头".split())
+_NAME_TAIL_STOP_1: Set[str] = set(_load_data("name_tail_stop_1"))
 
 
 def _trim_name_candidate(cand: str) -> Tuple[str, str]:
@@ -237,19 +223,15 @@ _EMAIL_MISSING_AT_RE = re.compile(
     r"\.\s*(com|cn|net|com\.cn)",
 )
 _KNOWN_DOMAIN_TAIL = ("com", "cn", "net", "org", "com.cn", "edu.cn")
-# 常见 PDF 字体伪影域名修复（实测 pdfplumber 出过 `46449614@qqV.ctom`）
-_DOMAIN_ARTIFACT = (
-    ("qqv.ctom", "qq.com"), ("qqv.com", "qq.com"), ("qq.ctom", "qq.com"),
-    ("qq.corn", "qq.com"), ("qq.con", "qq.com"), ("qqv.cn", "qq.cn"),
-    ("163.ctom", "163.com"), ("163.corn", "163.com"), ("126.ctom", "126.com"),
-    ("foxmail.ctom", "foxmail.com"), ("gmail.ctom", "gmail.com"),
-)
+# 常见 PDF 字体伪影域名修复（pdfplumber 出过 `46449614@qqV.ctom`）
+_DOMAIN_ARTIFACT: Tuple[Tuple[str, str], ...] = tuple(
+    tuple(pair) for pair in _load_data("domain_artifact"))
 
 
 def extract_phone(text: str) -> Tuple[Optional[str], str]:
     """返回 (手机号, 置信度 high|low|"")。
 
-    ① 严格正则（带数字边界断言）+ 分隔符归一：干净文本层下实测 28/28 全中。
+    ① 严格正则（带数字边界断言）+ 分隔符归一：干净文本层下全中。
     ② 关键词邻近优先：同一份文本里有多个候选时，选「前面 14 字内出现
        电话/手机/联系方式」的那个。
     ③ 去掉数字边界断言兜底：应对 PDF 把手机号与相邻数字粘连
@@ -308,7 +290,7 @@ def extract_email(text: str) -> Tuple[Optional[str], str]:
 # 7. 工作年限
 # =========================================================================== #
 CURRENT_YEAR = __import__("datetime").date.today().year
-# `开始工作时间：2018.4` / `参加工作时间：2012` -> 用当前年份减，实测 4/4 与文件名/正文一致
+# `开始工作时间：2018.4` / `参加工作时间：2012` -> 用当前年份减
 _START_WORK_RE = re.compile(
     r"(?:开始工作时间|参加工作时间|首次工作时间|入职时间|工作时间)\s*[:：|]?\s*"
     r"(?:[A-Za-z]{0,4})?\s*((?:19|20)\d{2})")
@@ -553,7 +535,7 @@ def parse_education_block(text: str, edu_section: str,
 
     **条目行必须含学校名或学历词**——不能只凭日期区间。否则工作经历行
     （`2025.3-2025.8 印度尼西亚 现场工艺高级工程师`）会被当成教育条目，
-    把「印度尼西亚」抽成专业（实测踩过）。
+    把「印度尼西亚」抽成专业。
     专业兜底：条目行前后 3 行内、长度 <=20、不含公司/岗位词的短行，
     当作该条目的专业（应对 docx 表格里 日期/专业/学校 各占一行的排版，
     以及 `辽宁石油化工大学 本科 2010/09-2014/06` + 次行 `电气工程及其自动化专业`）。
@@ -668,11 +650,7 @@ _FN_JOB_WORD_RE = re.compile(
     r"(?:工程师|主管|经理|总监|专员|助理|会计|出纳|班长|组长|技师|技术员|操作工|主任|"
     r"工艺|设备|暖通|电力|电气|财务|生产|质量|安全|运维|系统|软件|开发))")
 _FN_SALARY_RE = re.compile(r"(\d+(?:\.\d+)?\s*[-~—－]\s*\d+(?:\.\d+)?\s*[kKwW万千])")
-_CITY_LIST = ("曲靖 昆明 云南 贵阳 贵州 武汉 湖北 成都 四川 西安 陕西 兰州 甘肃 银川 宁夏 "
-              "西宁 青海 镇江 江苏 苏州 无锡 南京 常州 盐城 杭州 浙江 合肥 安徽 郑州 河南 "
-              "济南 山东 青岛 石家庄 河北 太原 山西 长沙 湖南 南昌 江西 福州 厦门 广州 深圳 "
-              "东莞 佛山 南宁 海口 重庆 天津 上海 北京 大连 沈阳 长春 哈尔滨 绵阳 荆州 "
-              "焦作 商丘 阜阳 毕节 平凉 牟定 大理 中卫 阜宁 徐州 全国").split()
+_CITY_LIST: Tuple[str, ...] = tuple(_load_data("cities"))
 
 
 def job_tokens_from_filename(file_name: str) -> Optional[str]:
@@ -805,8 +783,7 @@ _DEGREE_REQ_RE = re.compile(
     r"\s*(及以上|以上)?")
 _YEARS_REQ_RANGE_RE = re.compile(r"(\d{1,2})\s*[-~—－]\s*(\d{1,2})\s*年(?:及以上|以上)?")
 _YEARS_REQ_RE = re.compile(r"(\d{1,2})\s*年(?:及以上|以上|左右)?")
-_CN_NUM = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6,
-           "七": 7, "八": 8, "九": 9, "十": 10}
+_CN_NUM: Dict[str, int] = _load_data("cn_num")
 _CN_YEARS_RE = re.compile(r"([一二两三四五六七八九十])\s*年(?:及以上|以上)?")
 _FRESH_GRAD_RE = re.compile(r"(应届生|应届毕业生|无相关从业经验|可接受无相关|无工作经验要求)")
 # 「优先/加分」标记。注意不含「考虑」——`可优先考虑` 之外的「考虑」噪声太大。
@@ -886,7 +863,7 @@ def job_name_from_filename(file_name: str) -> Optional[str]:
 # 11. 抽取器本体
 # =========================================================================== #
 class RegexFieldExtractor(FieldExtractor):
-    """纯正则/启发式抽取器。**永不抛异常**（契约 D6/D11）。
+    """纯正则/启发式抽取器。**永不抛异常**。
 
     方法划分 = 字段划分：每个 `_xxx` 方法负责一个（或一族）字段的抽取与置信度，
     `extract_resume` / `extract_job` 只做编排 + warnings 组装。
@@ -1086,7 +1063,7 @@ class RegexFieldExtractor(FieldExtractor):
         """从简历纯文本 + 文件名抽字段。
 
         **永不抛异常**：text 为空/水印/乱码时只回填文件名里确凿的信息，其余一律
-        留空（契约 D11：不硬造字段）。
+        留空（不硬造字段）。
         """
         text = normalize_text(text or "")
         file_name = file_name or ""
@@ -1345,8 +1322,7 @@ class RegexFieldExtractor(FieldExtractor):
         """
         scope_parts = [p.strip() for p in (cert_line, exp_line) if p and p.strip()]
         # **必须用换行拼**：`…证书者优先` 后面若直接接上 从业经验 段，
-        # 「整句以裸优先结尾」的判据就会被下一段的分号破坏（实测把 3 份 JD 的
-        # 「持证者优先」误判成硬性证书门槛）
+        # 「整句以裸优先结尾」的判据就会被下一段的分号破坏
         scope = "\n".join(scope_parts) or (qual or "")
         if not scope.strip():
             return None, False, [], [], ""
@@ -1587,7 +1563,7 @@ class RegexFieldExtractor(FieldExtractor):
             if len(bonus_items) < 20:
                 bonus_items.append(s)
         # 「持××证书者优先」本质上就是加分项，并进 bonus，避免有证书加分的 JD
-        # bonus_skills 反而为空（EHS经理这类 6 个（优先）证书的 JD 实测会漏）
+        # bonus_skills 反而为空（EHS经理这类 6 个（优先）证书的 JD 会漏）
         for c in cert_preferred:
             if c not in bonus_items and len(bonus_items) < 20:
                 bonus_items.append(c + "（持证者优先）")

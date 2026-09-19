@@ -1,17 +1,15 @@
 # -*- coding: utf-8 -*-
-"""表值/时间小工具 —— **apply_decisions（Turn 3 写库）一侧的语义**（P9a 搬入）。
+"""表值/时间小工具 —— **apply_decisions（Turn 3 写库）一侧的语义**。
 
-⚠️ as_list/as_text 终裁（P8 报告 §4a 逐案裁定表）：与 match/tablevalues.py 的
-build 侧同名函数**不合并**——
+⚠️ as_list/as_text 与 match/tablevalues.py 的 build 侧同名函数**不合并**——
   * `as_text`：本侧 dict 兜底 `json.dumps(v, ensure_ascii=False)`（默认 separators
     带空格），build 侧兜底 `compact(v)`（无空格）→ 兜底字节不同；
   * `as_list`：本侧 dict 元素走本侧 as_text、只 strip，build 侧取 name/text/value
     且过 clean_ws → 归一化强度不同。
-统一即改行为（分析报告 §B.7#4 红线），两侧各自保留独立实现：本模块只服务
-apply/写库侧，build 侧一律走 tablevalues.py，互不 import。
+统一即改行为，两侧各自保留独立实现：本模块只服务 apply/写库侧，
+build 侧一律走 tablevalues.py，互不 import。
 
-`_now`（与 build 侧 digest.py `_now` 逐字重复）P9a 裁定**不统一**：两侧各自模块
-私有、各 4 行，跨包合并需先建 clock.py 并触碰 build 侧模块，字节收益为零。
+`_now` 与 build 侧 digest.py `_now` 逐字重复，不统一：两侧各自模块私有。
 """
 
 import datetime as _dt

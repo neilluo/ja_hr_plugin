@@ -2,15 +2,12 @@
 """评分口径：SCORING_RULES 文案（内嵌进 digest）+ ScoreCalculator 实现体。
 
 ⚠️ 文案与实现两处漂移是已知风险：SCORING_RULES 是**文案**，真正实现分数的
-ScoreCalculator（P9a 搬入，原 verify_decisions.round_half_up L95 / compute_scores
-L102-143）在本模块；apply 侧消费面走 verify 的 passed_audit[].recomputed，
-不再各持一份实现（verify L93 注释「三处必须一致」的漂移面已收敛为文案 vs 本类）。
-SCORING_RULES **逐字保留**（键序即 digest 字节，无 sort_keys），一个字节都不能动。
+ScoreCalculator 在本模块；apply 侧消费面走 verify 的 passed_audit[].recomputed，
+不再各持一份实现。SCORING_RULES **逐字保留**（键序即 digest 字节，无 sort_keys）。
 
 推荐档位判定（总分 ≥80 推荐 / 60~79 待定 / <60 不推荐）经构造注入 `recommend_of`：
-verify_decisions 入口的 `_recommend_of` 是裁判篡改自证 threshold 的定位锚点，
-必须留在入口且行为支配（模式同 build 入口的 REQUIREMENTS_LIMIT / jobparse 的
-requirements_limit）；缺省 `_default_recommend` 与锚点行同口径。
+verify_decisions 入口的 `_recommend_of` 必须留在入口且行为支配；缺省
+`_default_recommend` 与锚点行同口径。
 """
 
 import math
@@ -29,7 +26,7 @@ def _default_recommend(total: int) -> str:
 
 
 class ScoreCalculator:
-    """D16 重算口径的唯一实现体（分数一律脚本算，模型输出只作对照）。"""
+    """重算口径的唯一实现体（分数一律脚本算，模型输出只作对照）。"""
 
     def __init__(self, recommend_of: Any = None):
         self._recommend_of = recommend_of or _default_recommend
@@ -37,7 +34,7 @@ class ScoreCalculator:
     def compute(self, skill_hits: Sequence[str], bonus_hits: Sequence[str],
                 must_skills: Sequence[str], bonus_skills: Sequence[str],
                 weights: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """按老插件口径重算四个数字（契约 D16：分数一律脚本算）。
+        """按老插件口径重算四个数字（分数一律脚本算）。
 
         技能得分   = 命中必备技能数 / 岗位必备技能总数 × 100，四舍五入取整
         加分项得分 = 命中加分项数 / 岗位加分项总数 × 100，四舍五入取整；**岗位加分项为空记 100**
@@ -100,7 +97,7 @@ SCORING_RULES = {
         "major": "专业达标 = 候选人 major / evidence.education_text 里的专业与岗位 major_req 同大类或相关；"
                  "岗位 major_req 为空或「不限」时一律达标。",
         "years": "经验年限达标 = 候选人 years_experience ≥ 岗位 years_req_min（岗位写「X年以上」取 X）。"
-                 "**候选人 needs_review 含 \"years\" 时（该值是脚本估出来的，28 份实测有 9 份），"
+                 "**候选人 needs_review 含 \"years\" 时（该值是脚本估出来的，可能不准），"
                  "必须先用 evidence.work_text / education_text 原文复核，"
                  "复核后的值写进 candidate_overrides[].years_experience，再判门槛。**",
     },
@@ -120,7 +117,7 @@ SCORING_RULES = {
     "no_fabrication": "禁止编造：skill_hits / bonus_hits 里列出的每一项**必须是岗位 "
                       "must_skills / bonus_skills 列表里的原文条目**，且能在 evidence 里对应到"
                       "简历原文的原词或明显同义词。越界项会被 verify_decisions.py 判为无效。",
-    "scores_computed_by_script": "**分数不由模型输出**（契约 D16）：skill_score / bonus_score / "
+    "scores_computed_by_script": "**分数不由模型输出**：skill_score / bonus_score / "
                                  "total_score / 推荐状态一律由 apply_decisions.py 按上述口径从 "
                                  "skill_hits / bonus_hits / weights 重算。模型只需给 "
                                  "skill_hits / bonus_hits / recommend（recommend 作对照，"

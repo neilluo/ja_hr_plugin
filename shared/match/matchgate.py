@@ -1,23 +1,12 @@
 # -*- coding: utf-8 -*-
 """apply 侧表读写边界（MatchTableGateway）：**唯一持 AITable** 的 IO 类。
 
-原 apply_decisions.py 的 `fetch_comm_status`(L440-469) / `find_stale_match_records`
-(L496-531) / `writeback_overrides`(L357-434) / `_ensure_select_options`(L1010-1026)
-/ `recompute_job_stats`(L534-569) 与 apply() 内联的 batch_delete / batch_create
-分片+重试 / 双回读调用点搬入；dws 调用次数/顺序/分片粒度/filter 构造是 ARGV 层
-指纹面，逐字保留。
-
-红线（原样保留，不在本刀修）：
+红线（原样保留）：
   * `readback_match` 里 `zip(record_ids, row_meta)` 假设服务端按提交顺序返回
-    record id（分析报告 §B.7#2 的已知风险）；
+    record id（已知风险）；
   * settle_polls 轮询次数（match 回读 settle_tries=3 / job 与 override 回读
     settle_tries=2）与 shared/aitable/verifier 的等待间隔不动；
-  * CREATE_CHUNK 批切的**值**由 apply 入口注入（裁判篡改自证 apply_chunk 的
-    定位锚点在入口），本类只消费 create_chunk 参数。
-
-D15 的取数与累加（recompute_job_stats）未按分析草案 D.2 类 5 拆成独立
-JobStatsRecomputer：取数/累加交错在分页循环与失败降级（stats.pop）里，拆开需引入
-中间数据形状，字节风险大于收益（裁剪理由同 P8 报告 DigestAssembler/Emitter 合并）。
+  * CREATE_CHUNK 批切的**值**由 apply 入口注入，本类只消费 create_chunk 参数。
 """
 
 import json
@@ -29,7 +18,7 @@ from aitable.table import AITable
 from aitable.values import sanitize_text
 
 from match.applyvalues import as_list, as_text, chunks, join_list
-from match.constants import FILTER_VALUE_CHUNK, MATCH_SOURCE_SYSTEM, RECOMMEND_VALUES
+from match.match_basics import FILTER_VALUE_CHUNK, MATCH_SOURCE_SYSTEM, RECOMMEND_VALUES
 from match.overrides import OVERRIDE_WRITEBACK_MAP
 
 
@@ -46,7 +35,7 @@ class MatchTableGateway:
 
         只写有变化且 config 里有对应字段的项；没有 record_id 的候选人只进 warnings
         （修正在本批匹配记录里仍然生效）。选项类字段先 ensure_options（只增不删），
-        写后回读（D6）；失败如实进 warnings，不静默。
+        写后回读；失败如实进 warnings，不静默。
         """
         out: Dict[str, Any] = {"submitted": 0, "updated": 0, "failed": [],
                                "readback_ok": None, "dws_calls": 0, "elapsed_ms": 0,
@@ -81,16 +70,11 @@ class MatchTableGateway:
                 updates.append({"record_id": rid, "cells": cells})
         if not updates:
             return out
-        # ⚠️ 刻意**不依赖 ensure_options 建选项**（W-G 实测 2026-09-18，G base；
-        #    W-H 已根治，2026-09-17）：旧版 ensure_options 走 `field update` 整体覆盖写，
-        #    而 `field get` 的选项快照有最终一致性（W-H 实测能读到 7/94 的陈旧快照），
-        #    陈旧/中间态快照进 payload 就会触发服务端给选项**重新分配 id**（churn）→
-        #    存量记录里按旧 id 引用的多选/单选单元格悬空、值被**静默清空**（W-G 实测把
-        #    27 条记录的「技能标签」清掉大半）。现 shared 层的 ensure_options 已改为
-        #    「只读 + 延迟补建」（彻底移除 field update）：record create/update 写**选项名**
-        #    时服务端自动补建缺失选项且不动已有 id（W-B/W-G/W-H 均实测，W-H 受控实验
-        #    585 个存量多选值零丢失）。所以写回直接按名字写，靠 readback 校验兜底；
-        #    读回缺值 → warnings 提示重跑（幂等）。
+        # ⚠️ 刻意**不依赖 ensure_options 建选项**：旧版 ensure_options 走 `field update` 整体覆盖写，
+        #    而 `field get` 的选项快照有最终一致性，陈旧快照进 payload 会触发服务端给选项重新分配 id
+        #    → 存量记录里按旧 id 引用的单元格悬空、值被静默清空。现 shared 层的 ensure_options 已改为
+        #    「只读 + 延迟补建」（彻底移除 field update）：record create/update 写选项名时服务端自动
+        #    补建缺失选项且不动已有 id。所以写回直接按名字写，靠 readback 校验兜底；读回缺值 → warnings。
         out["submitted"] = len(updates)
         try:
             res = self.table.batch_update("resume", updates)
@@ -157,16 +141,8 @@ class MatchTableGateway:
 
         **一次批量查**（filter 里 name 传多值），不逐条查。人工匹配不动。
 
-        ⚠️ 实测坑（本 worker 发现，W-B 层无法改，只能在这里绕）：
-        dws 的 filters **不支持嵌套 or**。`aitable.schema.TableSchema.build_filter` 对
-        `{"source":"系统匹配","name":[n1,n2,...]}` 会生成
-        `and[ eq(source), or[eq(name,n1), eq(name,n2)...] ]`，服务端直接报
-        `INVALID_FILTER_OPERATOR: Invalid filter operator: 'or'. Supported operators:
-        [all_of, exist, not_after, any_of, contain, after, none_of, lt, gt, ne, before,
-        from_now, date_between, date_eq, exclusive, gte, un_exist, not_before, eq, lte]`
-        —— **or 根本不在支持列表里**，只有当它是 filters 的**最外层**时才被接受
-        （单字段多值那种情况 build_filter 会把 or 提到最外层，所以能跑通）。
-        → 这里只用**单字段多值**（name）当最外层 or 查，`source` 拿回本地再过滤。
+        ⚠️ dws 的 filters 不支持嵌套 or，只用**单字段多值**（name）当最外层 or 查，
+        `source` 拿回本地再过滤。
         """
         out: List[Dict[str, Any]] = []
         uniq = sorted({n for n in names if n})
@@ -193,13 +169,13 @@ class MatchTableGateway:
 
     def create_records(self, create_res: Dict[str, Any], rows_to_create: Sequence[Dict[str, Any]],
                        create_chunk: int, warnings: List[str]) -> int:
-        """分片 batch_create（契约 ≤100/片）+ 选项失败 ensure_options 后重试一次。
+        """分片 batch_create（≤100/片）+ 选项失败 ensure_options 后重试一次。
 
         就地累加 create_res（键序/聚合口径与原实现逐字一致）；返回重试次数
         （原实现现场 `report["retry_count"] += 1`，改由调用方加回，终值不变）。
         """
         retries = 0
-        # 契约要求 ≤100 条/片：这里显式分片（aitable.writer 内部也会兜底再切一次）
+        # ≤100 条/片：这里显式分片（aitable.writer 内部也会兜底再切一次）
         for piece in chunks(rows_to_create, create_chunk):
             r = self.table.batch_create("match", piece)
             create_res["created"] += r.get("created", 0)
@@ -239,9 +215,9 @@ class MatchTableGateway:
                               warnings: List[str]) -> None:
         """只在「因选项写失败」时才付这个成本（正常路径省 3 次 dws 调用）。
 
-        注意：shared 层 ensure_options 已是**只读**实现（缺陷1 根治后不再 field update），
-        这里调它只是刷新选项池现状 + 把缺失名记入 pending_options；真正把选项补进池子
-        的是紧接着的 batch_create 重试——写选项名时服务端自动补建（不动已有 id）。
+        注意：shared 层 ensure_options 已是**只读**实现，这里调它只是刷新选项池
+        现状 + 把缺失名记入 pending_options；真正把选项补进池子的是紧接着的
+        batch_create 重试——写选项名时服务端自动补建（不动已有 id）。
         """
         try:
             self.table.ensure_options("match", "source", [MATCH_SOURCE_SYSTEM])
@@ -255,7 +231,7 @@ class MatchTableGateway:
 
     def recompute_job_stats(self, job_ids: Sequence[str],
                             warnings: List[str]) -> Dict[str, Dict[str, int]]:
-        """D15：从表里查每个受影响岗位的**全部**匹配记录（含人工匹配、含历史批次），重算四个数字。
+        """从表里查每个受影响岗位的**全部**匹配记录（含人工匹配、含历史批次），重算四个数字。
 
         **禁止**用本批 decisions 直接累加（会漏历史与人工记录导致统计漂移）。
         """
@@ -268,7 +244,7 @@ class MatchTableGateway:
                                                 fields=["job_id", "recommend", "source"],
                                                 all_pages=True)
             except (DwsError, AITableConfigError) as exc:
-                warnings.append("D15 统计重算：查岗位 %s 的全部匹配记录失败（%s）→ "
+                warnings.append("统计重算：查岗位 %s 的全部匹配记录失败（%s）→ "
                                 "该批岗位统计**不回填**（宁可不写也不写错）"
                                 % (",".join(part[:3]), str(exc)[:160]))
                 for j in part:
@@ -292,9 +268,9 @@ class MatchTableGateway:
 
     # ------------------------------------------------------------------- job
     def update_job_stats(self, stat_updates: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-        return self.table.batch_update("job", stat_updates)   # **一次**回填（D15）
+        return self.table.batch_update("job", stat_updates)   # **一次**回填
 
-    # --------------------------------------------------------------- 回读 D6
+    # --------------------------------------------------------------- 回读
     def readback_match(self, record_ids: Sequence[str], row_meta: Sequence[Dict[str, Any]],
                        warnings: List[str]) -> Dict[str, Any]:
         want = ["name", "job_id", "job_name", "source", "skill_score", "bonus_score",
@@ -302,8 +278,7 @@ class MatchTableGateway:
         want = [w for w in want if w in (self.table.field_keys("match") or [])]
         expected = {}
         for rid, meta in zip(record_ids, row_meta):
-            # ⚠️ 实测坑（aitable.values.sanitize_text 文档串）：写入前会净化文本，
-            # 所以「写入 vs 读回」的比对基准必须拿 sanitize_text(原值)，否则会误判成不一致。
+            # ⚠️ 写入前会净化文本（sanitize_text），所以「写入 vs 读回」的比对基准必须拿 sanitize_text(原值)。
             expected[rid] = {k: (sanitize_text(v) if isinstance(v, str) else v)
                              for k, v in meta["record"].items() if k in want and v is not None}
         rb_match = self.table.readback_verify("match", record_ids, want,

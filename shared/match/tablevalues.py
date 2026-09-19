@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-"""表值/文本归一小工具 —— **build_match_input（C2）一侧的语义**（P8 第一刀搬入）。
+"""表值/文本归一小工具 —— **build_match_input（C2）一侧的语义**。
 
-⚠️ 同名不同义，禁止合并（分析报告 §B.7#4，红线）：
+⚠️ 同名不同义，禁止合并（红线）：
   * `as_list`：build 侧 dict 元素取 name/text/value 且过 `clean_ws`；
-    apply_decisions.as_list（原 L111）dict 元素走它自己的 as_text、只 strip。
+    apply_decisions.as_list dict 元素走它自己的 as_text、只 strip。
   * `as_text`：build 侧 dict 兜底 `compact(v)`；apply 侧兜底 `json.dumps(v)`。
   两侧兜底/归一化强度不同 → 「抽公共实现统一两侧」本身就是行为变更。
-  **P9a 终裁：不合并**——apply 侧独立实现在 match/applyvalues.py（逐案裁定表见
-  P8 报告 §4a）。本模块只服务 build 侧，apply/verify 不得 import 这里的 as_list/as_text。
+  **不合并**——apply 侧独立实现在 match/applyvalues.py。本模块只服务 build 侧，
+  apply/verify 不得 import 这里的 as_list/as_text。
 """
 
 import json
@@ -17,7 +17,7 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 CHARS_PER_TOKEN = 1.5                   # 中文粗估：1.5 字符 / token（与前序实验同口径）
 
-#: evidence 里**可截断**的两段的长度上限（字符）。education_text / cert_text 绝不截断（D4）。
+#: evidence 里**可截断**的两段的长度上限（字符）。education_text / cert_text 绝不截断。
 WORK_TEXT_LIMIT = 900
 SKILL_TEXT_LIMIT = 500
 
@@ -43,7 +43,7 @@ def clip(s: Any, limit: int, mark: str = "…[截断]") -> str:
 
 
 def full(s: Any) -> str:
-    """D4：教育/证书段**完整保留，不截断**。"""
+    """教育/证书段**完整保留，不截断**。"""
     return "" if s is None else str(s)
 
 
@@ -89,7 +89,7 @@ def as_text(v: Any) -> str:
 
 
 def as_number(v: Any, default: Optional[float] = None) -> Optional[float]:
-    """number 字段读回是**字符串**（实测 "0.7"），统一转 float。"""
+    """number 字段读回是**字符串**（如 "0.7"），统一转 float。"""
     if v is None or v == "":
         return default
     try:

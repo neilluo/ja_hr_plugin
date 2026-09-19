@@ -6,9 +6,9 @@
 
 ## 0. 数据底座与连接
 
-- 数据底座：钉钉 AI 表格（通过已连接的钉钉/DWS 连接器访问），命令前缀 `dws aitable`。**热路径上的全部 dws 调用都在脚本内部以 subprocess 批量完成**，agent 不逐条敲命令。
+- 数据底座：钉钉 AI 表格（通过已连接的钉钉/DWS 连接器访问），命令前缀 `dws aitable`。**热路径上的全部 dws 调用通过 emit/replay 两阶段模式完成**，agent 不逐条敲命令。
 - Base 名称：**招聘筛选**（客户生产环境默认值；复刻部署到其它组织时以该机器的 config.json 为准）。
-- 运行时前提：本机存在 Python 3（3.9~3.14，零第三方 pip 依赖）+ `dws` 已登录。千问办公不自带 python 运行时。
+- 运行时前提：本机存在 Python 3（3.9+，零第三方 pip 依赖）+ `dws` 已登录。千问办公不自带 python 运行时。
 - 无需 `.mcp.json` 引导配置；钉钉连接器在「设置 → 连接器」开启即可。
 
 ## 1. 四张表总览（config.json 里的 table_key）
@@ -132,8 +132,8 @@
 - 简历查重：**手机号**。命中 → 覆盖更新（业务话告知"用最新简历覆盖"）；同手机号多条记录 → 停止并报告，不自动选。**手机号相同但姓名不同 = 疑似重名/录入错误，停止让用户确认**（digest 中 `dedupe=="conflict"`）。姓名相同但手机号不同 = 不同人，正常新建。
 - JD 查重：**岗位名称 + 所属部门 + 组织分类** 三者全同才算重复（不同组织下的同名同部门岗视为不同岗位、各自新建）。命中 → 覆盖更新；不同 → 新建。
 - 附件查重（P4b 起 = **内容级**）：库内比对键是简历库「附件内容MD5」(`attach_md5`, text) 列里存的**附件内容真 MD5**（附件上传成功后由脚本写入）。三层判定：① 本地文件真 MD5 命中库内哈希 → 判重复上传，跳过并告知"库内已存在内容相同的简历附件（附件内容MD5 比对命中）"——**换了文件名也命中**（修掉老键的漏判）；② 未命中但 (文件名, 字节大小) 命中且库内那条有哈希 → 内容确实不同 → **不判重复**，按同一候选人的简历新版本走覆盖更新（new/overwrite 由手机号查重决定），清单里说明"同名同大小但内容不同"（修掉老键的误判：改一版重投不再被静默跳过）；③ 命中的库内记录没有哈希（P4b 之前写入的老记录）→ 无从比内容，按老键「文件名+字节大小」回退判重复并告警。**老库容忍**：config.json 的 `fields.resume.attach_md5` 缺失（客户现存库没建该列）→ 整库自动回退 `NameSizeDeduper` + 一条 warning（说明未启用内容级去重与启用方法），不崩溃、**不自建字段**（建字段属复刻部署）。**懒回填**：老记录被覆盖更新（手机号命中）、6b 补传附件、回读补附件时一并把哈希补上，库随之收敛到内容级去重。本批内部去重与 `checkpoint.json` 幂等续跑用的是同一套真 MD5。
-- 幂等续跑：intake 脚本落 `checkpoint.json`（已成功文件的**真 MD5** 列表），重跑跳过已成功项、不重放（D12）；`--reset` 显式清空断点重来。P3 起 checkpoint **增量落盘**（「记录已写」「附件已传」各自一确立就原子写盘，version=2 带 progress 段；读不懂视为空并告警不崩溃），并新增 `--wall-budget <秒>`（默认 100 < 工具 120s 超时）：到点 graceful 停、报告 `partial=true` 并打印一行 `RESUME:`，重跑同一命令续跑（见 execution-notes「幂等与续跑」）。
-- 扫描件/图片简历：macOS 上由提取层自动走系统 Vision OCR 入库（backend=vision_ocr，零依赖纯本地；首次可能弹 macOS 授权弹窗）。**P4a 起 OCR 不可用/不可信（非 macOS 等）不再判死**：转 agent 多模态兜底——脚本打印 `VISION_NEEDED:` 清单，agent 一轮读完写补丁 json，重跑加 `--apply-vision-patch`（backend=agent_vision，草稿字段 field_source=agent_vision 进 needs_review；agent 绝不写库）；读不出份数 >20% 触发闸门（不写任何记录，reason=vision_gate，请用户确认整批格式问题）。失败清单语义为「仅加密/损坏/补丁未覆盖才失败」。细节见 parsing-methods.md 与 resume-intake/HOTPATH.md。
+- 幂等续跑：intake 脚本落 `checkpoint.json`（已成功文件的**真 MD5** 列表），重跑跳过已成功项、不重放（D12）；`--reset` 显式清空断点重来。P3 起 checkpoint **增量落盘**（「记录已写」状态在 upsert 响应返回 record_id 后即落盘，「附件已传」状态在 stage 6b `poll_fixup_attachments` 回读确认后落盘——各自一确立就原子写盘，version=2 带 progress 段；stage 7 批量 upsert 不做单独回读查询；读不懂视为空并告警不崩溃），并新增 `--wall-budget <秒>`（默认 100 < 工具 120s 超时）：到点 graceful 停、报告 `partial=true` 并打印一行 `RESUME:`，重跑同一命令续跑（见 execution-notes「幂等与续跑」）。
+- 扫描件/图片简历：macOS 上由提取层自动走系统 Vision OCR 入库（backend=vision_ocr，零依赖纯本地；首次可能弹 macOS 授权弹窗）。**P4a 起 OCR 不可用/不可信（非 macOS 等）不再判死**：转 agent 多模态兜底——脚本打印 `VISION_NEEDED:` 清单，agent 一轮读完写补丁 json，重跑加 `--apply-vision-patch`（backend=agent_vision，草稿字段 field_source=agent_vision 进 needs_review；agent 绝不写库）；本批 ≥5 份且读不出份数 >20% 触发闸门（本轮不写任何记录，reason=vision_gate；`VISION_NEEDED:` 清单照常打印，agent 仍打补丁重跑同一命令即可入库，补丁之后仍读不出的才请用户提供文字版）。失败清单语义为「仅加密/损坏/补丁未覆盖才失败」。细节见 parsing-methods.md 与 resume-intake/HOTPATH.md。
 
 ## 9. 不依赖的表格能力（D1/D2，与老版的关键差异）
 
@@ -147,6 +147,12 @@
 - `options` 段是单选/多选选项的 id 缓存（写记录、只增不删补选项都用它）；过期或缺失时脚本会实查刷新。
 - **多公司/多组织隔离**：两家公司、或一部门一表的场景，各自机器上各自生成自己的 config.json，互不污染；换机器时复制 config.json 或重跑复刻部署的「接线」阶段。
 
-## 附录：生产环境参考 ID（2026-09 实查，仅供复刻/接线比对）
+## 附录：环境参考 ID（仅供复刻/接线比对，运行时以本机 config.json 为准）
 
-生产 Base「招聘筛选」ID `lyQod3RxJKlq1q5jclwY77Qd8kb4Mw9r`；表：岗位JD表 `IWZ0aT4`、简历库管理 `jM3TFBf`、智能匹配 `PhF2w2g`、权限配置 `rzh5VaJ`。字段级 ID 以老版 system-config 实查记录为准（如 简历.姓名 `uHtg1Xj`、简历.手机号 `sVBJzE2`、岗位.岗位ID `vMQJaQN`）。**极速版新增字段（简历.专业/证书/简历全文/附件内容MD5，匹配.岗位ID(text)/匹配依据）在生产表中原本不存在**，接入生产环境前需先在表里补建这些普通字段并重新反查回填 config.json。其中「附件内容MD5」(text, `attach_md5`) 补建前脚本照常跑，只是库内附件去重回退「文件名+字节大小」并告警（不崩溃、不自建字段，见 §8）；补建命令与接线方式见 [复刻部署](../../replicate/SKILL.md)。运行时一切以该机器上的 config.json 为准，本附录仅供人工比对。
+### 生产环境（2026-09 实查）
+
+Base「招聘筛选」ID `lyQod3RxJKlq1q5jclwY77Qd8kb4Mw9r`；表：岗位JD表 `IWZ0aT4`、简历库管理 `jM3TFBf`、智能匹配 `PhF2w2g`、权限配置 `rzh5VaJ`。字段级 ID 以老版 system-config 实查记录为准（如 简历.姓名 `uHtg1Xj`、简历.手机号 `sVBJzE2`、岗位.岗位ID `vMQJaQN`）。**极速版新增字段（简历.专业/证书/简历全文/附件内容MD5，匹配.岗位ID(text)/匹配依据）在生产表中原本不存在**，接入生产环境前需先在表里补建这些普通字段并重新反查回填 config.json。其中「附件内容MD5」(text, `attach_md5`) 补建前脚本照常跑，只是库内附件去重回退「文件名+字节大小」并告警（不崩溃、不自建字段，见 §8）；补建命令与接线方式见 [复刻部署](../../replicate/SKILL.md)。
+
+### 测试环境（2026-09-19 由 replicate 技能创建）
+
+Base「招聘筛选」ID `amweZ92PV6DbOdgzUqer9gAo8xEKBD6p`；表：岗位JD表 `FmGPFhh`、简历库管理 `YjwifHF`、智能匹配 `TnVAvzk`、权限配置 `28cZkSE`。四表全量字段已按极速版标准 schema 建齐（含附件内容MD5），字段级 ID 见本机 config.json。运行时一切以该机器上的 config.json 为准，本附录仅供人工比对。

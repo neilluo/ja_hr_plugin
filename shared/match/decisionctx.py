@@ -2,14 +2,10 @@
 """decisions 上下文构建（DecisionContextBuilder）：digest 优先，缺 digest 时
 从表里/decisions 里降级解析。
 
-原 apply_decisions.py 的 `rows_needed`(L163) / `synth_digest_from_table`(L168-222)
-/ `build_job_index`(L225-247) / `resolve_job`(L250-256) / `build_candidate_index`
-(L259-281) 搬入。JobRecordParser 由构造注入（入口用 match.jobparse 的
-_LateBoundExtractor 接线，替换原先两处函数内延迟 `from build_match_input import
-parse_job_record`——同一套解析口径，脚本间零 import）。
+JobRecordParser 由构造注入。
 
-已知现状（P8 报告 §4b：**不显式授权不要修**，本刀原样保留）：
-synth_digest_from_table 会**就地改写 decisions 的 job_key**（原 L196-212）。
+已知现状（**不显式授权不要修**，原样保留）：
+synth_digest_from_table 会**就地改写 decisions 的 job_key**。
 """
 
 from typing import Any, Dict, List, Optional
@@ -19,7 +15,7 @@ from aitable.schema import AITableConfigError
 from aitable.table import AITable
 
 from match.applyvalues import as_text
-from match.constants import JOB_STATUS_OPEN
+from match.match_basics import JOB_STATUS_OPEN
 
 
 def resolve_job(job_index: Dict[str, Dict[str, Any]], entry: Dict[str, Any],

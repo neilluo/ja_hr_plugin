@@ -4,12 +4,12 @@
 `to_dict()` 是**对外契约面**（`extract_fields.extract_resume_fields` 的返回值），
 键集与键序必须与重构前逐字一致——两个分支的键集本来就不同：
 `text_usable=False`（扫描件/水印/空文本）时**不含** `edu_entries`，因为那条路径
-根本没跑教育条目解析（契约 D11：不硬造字段）。
+根本没跑教育条目解析（不硬造字段）。
 
 来源有两层，别混：
-  * `field_sources[field]` = 值由哪个抽取器给出（regex / draft / agent）。P2 只有
-    regex 一路，由 `merger.FieldMerger` 统一打标；**不进 to_dict()**——进了就会
-    改动 FIELDS 层指纹，P4 若要透传给 candidates.json 属于 P4 的 EXPECTED DIFF。
+  * `field_sources[field]` = 值由哪个抽取器给出（regex / draft / agent）。
+    由 `merger.FieldMerger` 统一打标；**不进 to_dict()**——进了就会
+    改动 FIELDS 层指纹。
   * `name_source` / `years_experience_source` = 现状契约键，细粒度取值来源
     （text / filename / estimated / None）。
 """
@@ -62,7 +62,7 @@ class CandidateFields:
     # ---- 每字段来源 ----
     name_source: Optional[str] = None
     field_sources: Dict[str, str] = field(default_factory=dict)
-    # ---- P4：取自外部草稿（agent 多模态兜底 fields_draft）的字段名清单 ----
+    # ---- 取自外部草稿（agent 多模态兜底 fields_draft）的字段名清单 ----
     # 与 field_sources 一样**不进 to_dict()**（进了会改动 FIELDS 层指纹）；
     # intake 的 --apply-vision-patch 路径直接读对象属性并透传给 candidates.json。
     needs_review: List[str] = field(default_factory=list)
@@ -101,7 +101,7 @@ class CandidateFields:
             "education_raw": self.education_raw,
             "years_experience_est": self.years_experience_est,
             "years_experience_source": self.years_experience_source,
-            # 契约 D13 键名别名（与 years_experience_source 同值，只增不删）
+            # 键名别名（与 years_experience_source 同值，只增不删）
             "years_source": self.years_experience_source,
             "schools_all": self.schools_all,
         }

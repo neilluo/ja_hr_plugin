@@ -1,16 +1,5 @@
 # -*- coding: utf-8 -*-
-"""岗位侧解析（JobRecordParser）：岗位表一行 → 契约 §3.3 jobs 元素。
-
-原 build_match_input.py 的 `_split_skill_text` / `_looks_like_prose` /
-`_gate_from_labelled` / `parse_job_record`（L304-464）搬入本类；
-`parse_job_record(cells, file_name="")` 是**冻结签名**（apply_decisions.py
-L176/L234 函数内延迟 import 消费），薄壳留在入口脚本、委托到本类。
-
-W-A 降级语义保留：`extract_job_fields`（shared/extract_fields）由入口脚本
-条件 import 后**构造注入**（可为 None，缺失时跳过 W-A 兜底，不致命）。
-`requirements_limit` 同样由入口注入（入口的 REQUIREMENTS_LIMIT = 600 是
-裁判篡改自证 build_l114 的定位锚点，必须留在入口脚本且行为支配）。
-"""
+"""岗位侧解析（JobRecordParser）：岗位表一行 → jobs 元素。"""
 
 import json
 import re
@@ -41,13 +30,7 @@ _NUMBER_PREFIX = re.compile(r"^\s*\d{1,2}\s*[、.．)）,，:：]\s*")
 
 
 class _LateBoundExtractor:
-    """把「调用时才查入口脚本模块全局 extract_job_fields」的原语义封成可注入对象。
-
-    原实现里 parse_job_record 在**每次调用时**读模块全局（import 成功后才可能从
-    None 变成函数：同进程后续把 shared/ 挂上 sys.path 再 import extract_fields 的
-    场景）。入口薄壳若在 import 期把值绑死会悄悄改变该分叉，故用本代理保持
-    查名时机逐字不变（`is not None` 判定发生在 parse() 调用时）。
-    """
+    """把「调用时才查入口脚本模块全局 extract_job_fields」的原语义封成可注入对象。"""
 
     def __init__(self, module: Any, attr: str):
         self._module = module
@@ -61,12 +44,11 @@ class _LateBoundExtractor:
 
 
 class JobRecordParser:
-    """「带标签解析 → W-A extract_job_fields 兜底」两级策略的岗位行解析器。
+    """「带标签解析 → extract_job_fields 兜底」两级策略的岗位行解析器。
 
-    job_field_extractor：W-A 的 extract_job_fields（可为 None=降级跳过兜底；
+    job_field_extractor：extract_job_fields（可为 None=降级跳过兜底；
     也可传 _LateBoundExtractor 保持「调用时查名」的原全局语义）。
-    requirements_limit：任职要求原文进 digest 的截断上限（入口的
-    REQUIREMENTS_LIMIT = 600 注入；裁判篡改自证 build_l114 的定位锚点在入口）。
+    requirements_limit：任职要求原文进 digest 的截断上限。
     """
 
     def __init__(self, job_field_extractor: Any = None, requirements_limit: int = 600):
@@ -149,11 +131,11 @@ class JobRecordParser:
         return out
 
     def parse(self, cells: Dict[str, Any], file_name: str = "") -> Dict[str, Any]:
-        """把岗位表一行（业务字段名 → 值）解析成契约 §3.3 的 jobs 元素。
+        """把岗位表一行（业务字段名 → 值）解析成 jobs 元素。
 
         hard_gates / must_skills / bonus_skills 在表里都是 **text** 字段，格式不可控
         （可能是 job-intake 归一化后的紧凑串，也可能直接是 JD 散文），所以这里是
-        「带标签解析 → W-A extract_job_fields 兜底」两级策略，并把用到的来源写进
+        「带标签解析 → extract_job_fields 兜底」两级策略，并把用到的来源写进
         `skills_source` / `gates_source` 供排查。
         """
         hard_gates_text = as_text(cells.get("hard_gates"))
@@ -227,7 +209,7 @@ class JobRecordParser:
             "must_skills": must,
             "bonus_skills": bonus,
             "weights": {"must": wm, "bonus": wb},
-            # ---- 契约之外的只增字段（前序实验证明「任职要求原文」是判门槛的关键证据）----
+            # ---- 只增字段：「任职要求原文」是判门槛的关键证据 ----
             "requirements_text": clip(clean_ws(req_text), self.requirements_limit),
             "responsibilities_text": clip(clean_ws(resp_text), 200),
             "years_req_min": (jd or {}).get("years_req_min"),

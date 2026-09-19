@@ -1,11 +1,6 @@
 # -*- coding: utf-8 -*-
 """命中项归一与映射（HitMapper / GateVerdictReader）：verify 侧的比对基础设施。
 
-原 verify_decisions.py 的 `norm_item`(L149) / `gate_verdict`(L160) / `as_str_list`(L202)
-/ `squash`(L215) / `map_hits_to_items`(L227) / `dedupe_norm`(L955) 搬入。
-`norm_item` 是**冻结出口**（旧 apply_decisions L77 经 verify_decisions import；
-P9a 起 apply 侧改经本模块取用，verify 入口留同名薄壳）。
-
 ⚠️ 本模块的归一化（norm_item / squash）是**命中比对**口径，与 build 侧
 match/tablevalues.clean_ws（digest 组装口径）regex 与用途都不同，禁止混用。
 """
@@ -13,7 +8,7 @@ match/tablevalues.clean_ws（digest 组装口径）regex 与用途都不同，�
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-#: gate_verdict 的判定词表（原 verify_decisions._PASS_LIKE / _FAIL_LIKE，L56-57 冻结）
+#: gate_verdict 的判定词表
 PASS_LIKE = ("pass", "passed", "达标", "符合", "满足", "yes", "true", "y", "✓", "✅")
 FAIL_LIKE = ("fail", "failed", "不达标", "不符", "不满足", "no", "false", "n", "✗", "❌")
 
@@ -31,7 +26,7 @@ def as_str_list(v: Any) -> List[Any]:
 
 
 class HitMapper:
-    """技能命中项比对：归一化 + 「映射不上=编造」的三条映射规则（契约 D16）。"""
+    """技能命中项比对：归一化 + 「映射不上=编造」的三条映射规则。"""
 
     def norm_item(self, s: Any) -> str:
         """技能条目比对用归一化：去空白/全角空格/末尾标点、转小写。"""
@@ -46,11 +41,9 @@ class HitMapper:
     def squash(self, s: Any) -> str:
         """比对用最强归一化：去掉所有空白与中英文标点、转小写。
 
-        为什么需要它（实测坑）：W-A 的 `must_skills` 切分粒度比 JD 原文细——
-        「对应工序生产设备的结构、原理及运维规范」被按顿号切成 2 条，模型在 skill_hits 里
-        很自然的把它**合回一条**引用。严格逐字 ⊆ 会把这种「合并引用」误判成编造，
-        实测 8人×19岗 一批里 3/10 条 pass 因此被判无效（白白丢掉 3 条匹配记录）。
-        所以先做**可解释的归一化映射**，映射不上才算编造。
+        为什么需要它：must_skills 切分粒度比 JD 原文细——模型在 skill_hits 里
+        很自然的把被切碎的条目**合回一条**引用。严格逐字 ⊆ 会把这种「合并引用」
+        误判成编造，所以先做**可解释的归一化映射**，映射不上才算编造。
         """
         return _SQUASH_DROP.sub("", str(s or "")).lower()
 
@@ -73,7 +66,7 @@ class HitMapper:
           a) 归一化后与某一条目完全相等；
           b) 归一化后等于**连续若干条**目的拼接（模型把被切碎的条目合回一句）；
           c) 归一化后与某一条目互为子串且长度占比 ≥0.6（模型做了缩写/同义改写）。
-        映射不上 → 该项算编造（D16：越界即判该条无效并进 warnings）。
+        映射不上 → 该项算编造（越界即判该条无效并进 warnings）。
 
         返回 (映射后的原文条目列表, 归一化明细)。
         """

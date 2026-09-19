@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ExtractionRunner：并发提取池编排（P7 刀3）。
+"""ExtractionRunner：并发提取池编排。
 
 收拢 skills/resume-intake/scripts/intake_resume.py 阶段1 的线程池：
   建池（workers = max(1, min(concurrency, len(files)))）
@@ -7,10 +7,9 @@
   预算触顶 cancel（遍历 futs 取消未开始的，标记 budget.budget_stopped）
   提取摘要交给 Console（打印用 workers 表达式**刻意不与建池合并**）
 
-红线（刀2 遗留提示④，逐字保持）：
+红线（逐字保持）：
   * 两处 workers 表达式（建池 `max(1, min(C, n))` vs 打印 `min(C, max(1, n))`）
-    数学等价但**不得合并**——保持两个表达式原样，防「只改建池侧」的静默失真
-    （oracle 不校验「并发 %d」这个数字，合并后改一侧不会有任何断言报错）。
+    数学等价但**不得合并**——保持两个表达式原样，防「只改建池侧」的静默失真。
   * index-keyed 收集顺序一变则 seq 漂移污染下游 digest（candidates key
     "c%02d" % seq），收集逻辑逐字搬。
   * 提取失败/扫描件进入 Vision 梯队的判定与顺序不变；20% vision gate 的

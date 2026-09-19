@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""ReadBackVerifier：写后回读与核查读路径（P7 刀5）。
+"""ReadBackVerifier：写后回读与核查读路径。
 
-收拢刀4 刻意留在 intake_resume.py 的读路径：
+收拢留在 intake_resume.py 的读路径：
   verify_by_filter        阶段8 写后回读：按业务键 filter 查 + 有界轮询 +
                           values_equal 比对 + 附件非空检查（原模块级 def 逐字搬移）
   poll_fixup_attachments  阶段6b 补传附件 batch_update 后的回读轮询（附件非空才算
@@ -23,11 +23,6 @@
   * 6b 轮询的告警文案「补传附件回读查询失败（%s）：按未确认处理，请重跑复核」逐字。
   * 本层只搬 IO 与轮询骨架：重复判定、fixup 名单、FIXUP_ROUND_MAX 上限与 cap 文案、
     其余 DwsError 异常归类全部留在 run()。
-
-与 shared/aitable/verifier.ReadBackVerifier 的关系：aitable 版按 **record_ids** 查
-（B 侧 intake_job 1130 在用，归 P8/P9）；本类按**业务键 filter** 查（A 侧）——
-`batch_upsert_by_key` 返回的 record_ids 是「created ids + updated ids」拼接、无法
-可靠对回具体行，故两者不互相替换，本刀不动 aitable 包。
 """
 
 from __future__ import annotations
@@ -40,7 +35,7 @@ from aitable.values import values_equal             # noqa: E402
 
 __all__ = ["ReadBackVerifier", "SETTLE_WAITS"]
 
-#: 写后读回传播延迟（W-B 实测：create 后按条件查 ≈2.7s 才可命中）
+#: 写后读回传播延迟（create 后按条件查 ≈2.7s 才可命中）
 SETTLE_WAITS = (1.5, 3.0, 4.5)
 
 
@@ -101,15 +96,15 @@ class ReadBackVerifier:
                          expected: Dict[Any, Dict[str, Any]],
                          attach_field: Optional[str] = None,
                          settle_waits: Sequence[float] = SETTLE_WAITS) -> Dict[str, Any]:
-        """写后必回读（契约 D6），但**按业务键 filter 查**而不是按 record_id 查。
+        """写后必回读（按业务键 filter 查而不是按 record_id 查。
 
         为什么不用 `AITable.readback_verify`：`batch_upsert_by_key` 返回的 record_ids 是
         「本片 created ids + updated ids」拼接，**无法可靠对回具体行**；而本脚本必须知道
         每份简历落到哪个 record_id（要写进 candidates.json 给 C2 用）。按手机号 filter 查
         一次就同时拿到 record_id 映射 + 读回值，省一次调用。
 
-        传播延迟：W-B 实测 create 后按条件查 ≈2.7s 才可命中，所以这里自带**有界**轮询
-        （1.5/3.0/4.5s），绝不空转烧调用；轮询完仍不一致就如实报进 mismatch（D6）。
+        传播延迟：create 后按条件查 ≈2.7s 才可命中，所以这里自带**有界**轮询
+        （1.5/3.0/4.5s），绝不空转烧调用；轮询完仍不一致就如实报进 mismatch。
         """
         t0 = time.monotonic()
         calls0 = self.tbl.dws_calls

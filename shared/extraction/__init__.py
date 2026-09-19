@@ -6,11 +6,11 @@
     jxa_ext.JxaExt            Tier 1   macOS JXA/PDFKit（pdf，仅 darwin）
     vision_ext.VisionOcrExt   Tier 1.5 macOS Vision OCR（扫描件/图片，仅 darwin）
     docx_zip_ext.DocxZipExt   Tier 1   stdlib zipfile（docx）
-    doc_piece_ext.DocPieceExt Tier 1   OLE2 + piece table（doc）
+    doc_textutil_ext.DocTextutilExt Tier 1  macOS textutil（doc）
     image_ext.ImageExt        终态     图片无文本层，如实 no_text_layer
-    agent_patch_ext.AgentPatchExt  Tier 2  agent 多模态补丁（P4a 通道，P7 刀6 入链；
+    agent_patch_ext.AgentPatchExt  Tier 2  agent 多模态补丁；
                                       必须排链尾——can_handle 靠 doc.prior 判定本机
-                                      梯队全失败，补丁表为空时恒不受理）
+                                      梯队全失败，补丁表为空时恒不受理
 
 新增梯队 = 新增一个类 + 在门面注册一行。
 import 风格与调用方一致：shared/ 在 sys.path 上，包内模块用顶层绝对 import

@@ -14,10 +14,10 @@
 
 极速版的解析/批量落库/评分重算由自带 Python 脚本完成（零第三方 pip 依赖，olefile/pypdf 已 vendor）：
 
-- **机器上必须存在 Python 3（3.9~3.14）**。千问办公不自带 python 运行时，缺失时需先安装。
+- **机器上必须存在 Python 3（3.9+）**。千问办公不自带 python 运行时，缺失时需先安装。
 - macOS / Linux 用 `python3`；Windows 用 `py -3`（裸 `python` 别名可能静默失败，退出码 49）。
 - `dws` CLI 已登录（脚本内部通过它批量读写 AI 表格）。
-- 一条命令自检：`python3 -V && dws aitable base list --limit 1`（Windows：`py -3 -V && dws aitable base list --limit 1`）。
+- 两条命令自检，**分开执行、不要用 `&&` 串**（PowerShell 5.1 不认 `&&`，Windows 用户粘进去直接报「标记"&&"不是此版本中的有效语句分隔符」）：① `python3 -c "import sys;assert sys.version_info[:2]>=(3,9),sys.version;print(sys.version)"` 查版本界（要求 Python **3.9+**，低于 3.9 当场抛 AssertionError，不会拖到 import 才炸）；② `dws aitable base list --limit 1` 查登录态。Windows 把 `python3` 换成 `py -3`，**不要用裸 `python`**（可能是 Microsoft Store 别名，静默失败、退出码 49）。
 
 ## 组织口径提醒
 

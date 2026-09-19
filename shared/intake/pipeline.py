@@ -1,59 +1,8 @@
 # -*- coding: utf-8 -*-
-"""IntakePipeline：简历入库 Turn 1 的编排层（P7 刀6，intake 侧最后一刀）。
+"""IntakePipeline：简历入库 Turn 1 的编排层。
 
-收拢 skills/resume-intake/scripts/intake_resume.py 的 `run()`（刀5 之后仍 860 行）：
 10 个阶段（阶段 1~9 + 6b）+ 序幕 + 收尾各成一个方法，跨阶段长寿命状态全部提升为
 实例属性；脚本侧只剩 CLI 装配（build_parser / main / auto_match）。
-
-    prepare()            序幕：batch_id/out_dir 与三份产物路径 / 状态初始化 /
-                         dws 装配（TableGateway）/ 开场打印 / --reset /
-                         checkpoint 加载 / agent 兜底补丁装载
-    extract()            阶段1：并发提取 + entries 骨架组装 + VISION_NEEDED 清单 +
-                         20% 闸门判定 + progress 落盘
-    budget_gate_a()      预算检查点 A：写库前 graceful 停（不进入任何 dws 写阶段）
-    dedupe_local()       阶段2a：checkpoint / 批内**真 MD5** 去重 + fixups 补传队列
-    dedupe_library()     阶段2b/2c：库内去重选档（内容级 MD5 优先，老库回退）+ scan
-                         + 逐条 decide
-    apply_vision_gate()  20% 闸门执行：本轮**零写入**（未定论条目全转「未完成」）
-    dedupe_phone()       阶段3：一次批量手机号查重（new/overwrite/conflict）
-    build_rows()         阶段4：组织/分类预判 + 字段整理 + 写入行组装
-    ensure_options()     阶段5：一次 ensure_options 补齐技能标签/期望地点（只增不删）
-    upload_attachments() 阶段6：并发上传附件（逐片落 checkpoint，触顶即停）
-    fixup_attachments()  阶段6b：补传附件（记录不重建，单轮上限 FIXUP_ROUND_MAX）
-    write_records()      阶段7：一次批量 upsert（unique=手机号，≤100/片）
-    readback_verify()    阶段8：写后回读校验 + 附件缺失补写
-    assemble()           阶段9：rows / candidates / summary / checkpoint 终稿重建
-    finish()             统计 + ok/partial 判定 + 三份产物落盘 + 人读清单 → 退出码
-
-CLI 侧（main 用）：`validate_args()` 四处参数校验、`crash_artifact()` 契约 D7
-的异常兜底产物（绝不静默早退）。
-
-红线（裁判 = /tmp/jahr-perf-audit/harness 的六个门禁，逐字保持）
---------------------------------------------------------------
-  * **阶段顺序与 dws 调用序列**：垫片逐条计数（net_oracle 的 dws_calls==38、
-    argv 序列 diff）。方法边界只切在既有阶段注释处，不重排任何调用。
-  * **checkpoint 落盘时机**（killcheck_p3 直接测）：5 处增量原子写 + 1 处终稿
-    非原子写，全部经 CheckpointStore；本类不新增/不删除任何落盘点，
-    「阶段1 progress 落盘 → 预算检查点 A」的先后是硬序。
-  * **stdout 解析锚点**（VISION_NEEDED: / RESUME: / ARTIFACT: / FATAL: /
-    「── 简历入库结果 ──」/ 小计行）全部经 IntakeConsole，文本不在本类里拼。
-  * **fatal 唯一写点** = `_set_fatal()`（刀5 遗留①收归）：config fatal 由
-    TableGateway 产出、Pipeline 接管，三处 DwsError/补丁错误同时进 warnings
-    （`warn=True`），与原 `fatal = …; warnings.append(fatal)` 逐字一致。
-  * **`halted` 是 Pipeline 状态**（budget 与 vision gate 共用的「不进写阶段」标志，
-    刀5 遗留⑤）；`budget.budget_stopped = True` 的直接属性写（阶段6 触顶）与
-    ExtractionRunner 的 `stop_extraction()` 语义差异保持原样，不统一。
-  * **dedup scan 走 ReadBackVerifier 门面**（刀5 遗留③）：`lib_deduper.scan(readback,…)`
-    / `phone_deduper.scan(readback,…)` 的 `table` 实参必须是 readback 而不是 tbl，
-    否则 `last_query_pages/last_query_truncated` 的 getattr 读点会换对象。
-  * **不再持有 `tbl` 别名**（刀5 遗留②）：门控一律 `self.has_table`，需要对象本身
-    的三处（console.base_info / ReadBackVerifier 构造 / report.write）现取
-    `self.gateway.tbl`。
-  * **agent 兜底通道**：补丁合并实现在 extraction/agent_patch_ext.py（链上 Tier 2）；
-    本类只保留条目状态机的两分支——链已受理 → `_adopt_agent_patch()`，
-    链没受理（kind=unknown 不进链）→ `_agent_vision_entry()`；两者共用
-    `AgentPatchExt.merge_entry()`，绝不合并两次。20% 闸门判定与执行、
-    VISION_NEEDED 清单、needs_agent_vision 失败语义留在本类。
 """
 
 from __future__ import annotations
@@ -87,36 +36,39 @@ from intake.extraction_runner import ExtractionRunner  # noqa: E402
 from intake.readback import ReadBackVerifier        # noqa: E402
 from intake.report import IntakeReport              # noqa: E402
 from intake.table_gateway import TableGateway       # noqa: E402
+from runtime_compat import default_out_root         # noqa: E402
+
+from jsonio import write_json as _write_json          # noqa: E402
+
+from pipeline_base import PipelineBase               # noqa: E402
 
 __all__ = ["IntakePipeline", "WALL_BUDGET_DEFAULT", "UPLOAD_CONCURRENCY"]
 
 # --------------------------------------------------------------------------- #
 # 常量
 # --------------------------------------------------------------------------- #
-#: 简历全文写入上限（字符）。W-B 实测 text 字段 49,956 字逐字节无损；真实样本最长
-#: 6,827 字，所以 20000 既是安全余量又不会截掉任何真实简历。
+#: 简历全文写入上限（字符）。安全余量，不会截掉任何真实简历。
 FULL_TEXT_MAX = 20000
-#: 附件并发度（契约 D5：API 限 20 QPS，5 留足余量）
+#: 附件并发度（API 限 20 QPS，5 留足余量）
 UPLOAD_CONCURRENCY = 5
-#: 提取/OCR 并发度（P3）：多份扫描件并行 Vision OCR，实测 3 份并行 1.764s vs
-#: 串行 3.810s；上限 4 是派工契约值，与附件并发 5 互不相干。
+#: 提取/OCR 并发度：多份扫描件并行 Vision OCR；上限 4，与附件并发 5 互不相干。
 EXTRACT_CONCURRENCY = 4
 #: --wall-budget 默认秒数：必须小于 agent 工具 120s 超时，留出 graceful 停止
 #: （落 checkpoint + 打印 RESUME + 写报告）与提交尾段（upsert+回读）的余量。
 WALL_BUDGET_DEFAULT = 100.0
 #: 每个候选人写入「技能标签」的上限（多选字段，避免选项池被噪声撑爆）
 SKILLS_MAX = 40
-#: evidence 各段长度上限（契约 D4：字段级全量 + 工作经历正文截断，不是「取前 N 字」）
+#: evidence 各段长度上限（字段级全量 + 工作经历正文截断，不是「取前 N 字」）
 EVIDENCE_LIMITS = {"education_text": 4000, "cert_text": 4000,
                    "skill_text": 4000, "work_text": 1500}
-#: 老插件每份简历的 agent 工具回合数（契约 §2：20~40，取中位数）→ 用于 turns_saved_estimate
+#: 老插件每份简历的 agent 工具回合数（20~40，取中位数）→ 用于 turns_saved_estimate
 OLD_TURNS_PER_FILE = 25
 #: 本脚本自己占的 agent 回合数（Turn 1 = 1 次脚本调用）
 NEW_TURNS = 1
 #: 库内去重扫描的翻页上限（100 页 × 100 条/页 ≈ 10000 条）。存量打满就会截断，
 #: 而去重是按「扫回来的这批」判的 → 截断即漏判重复，所以必须报出来（缺陷2）。
 DEDUPE_SCAN_MAX_PAGES = 100
-#: P4b 老库容忍：简历库没有「附件内容MD5」字段（config.json 的 fields.resume.attach_md5
+#: 老库容忍：简历库没有「附件内容MD5」字段（config.json 的 fields.resume.attach_md5
 #: 缺失 / 表里没建这一列）时，库内去重自动回退 (文件名, 字节大小) 并给这一条 warning。
 #: **不得崩溃、不得自建字段**——建字段是 replicate 部署时的事，脚本只如实说明怎么启用。
 OLD_LIB_DEDUPE_WARNING = (
@@ -126,9 +78,15 @@ OLD_LIB_DEDUPE_WARNING = (
     "启用方法：在简历库管理表加一个 text 字段「附件内容MD5」，把它的 fieldId 写进 "
     "config.json 的 fields.resume.attach_md5（并同步 field_names/types），重跑即生效；"
     "存量记录会在被覆盖更新/补传附件时自动回填哈希（脚本绝不自建字段）")
-#: P4a 20% 闸门（用户拍板）：needs_agent_vision 份数 / 总份数 > 此比例 →
-#: 疑似整批格式问题，不写任何记录，报告 reason="vision_gate"。
+#: 20% 闸门（用户拍板）：needs_agent_vision 份数 / 总份数 > 此比例 →
+#: 本轮不写任何记录，报告 reason="vision_gate"。
+#: 闸门只拦「本轮写入」，**不拦补救**：VISION_NEEDED 清单照常打印，agent 打完
+#: 补丁重跑同一命令即可入库。补丁之后仍读不出的才是真正的整批格式问题。
 VISION_GATE_RATIO = 0.20
+#: 闸门最小分母：不足此份数不判比例。热路径是「1 份或几份」，单份
+#: 扫描件按比例算必然 100% 触发；而 agent 一轮就能补完这么几份，拦下来纯属卡死
+#: 非 macOS（无本机 OCR）用户，没有任何安全收益。
+VISION_GATE_MIN_ENTRIES = 5
 #: 6b 补传附件（只补附件、记录不重建）单轮处理上限（主控裁决回写）：
 #: 超出部分 defer 到下一轮 RESUME，防大批量补传把墙钟拖爆。
 FIXUP_ROUND_MAX = 100
@@ -149,7 +107,7 @@ CAT_OPS = ("运营", "供应链", "物流", "仓储", "计划")
 CAT_OTHER = ("财务", "会计", "审计", "税务", "出纳", "行政", "人力", "人事", "法务",
              "薪酬", "招聘")
 
-#: 期望地点兜底值（契约 D14 + 老插件铁律「没有明确地点一律填『不限』」）
+#: 期望地点兜底值（老插件铁律「没有明确地点一律填『不限』」）
 LOCATION_FALLBACK = "不限"
 #: 沟通状态默认值（老插件 resume-intake/SKILL.md:8）
 COMM_STATUS_DEFAULT = "待筛选"
@@ -171,17 +129,16 @@ PARSE_FAIL_REASON = {
     "error": "文件解析失败；请确认文件完整后重新提供",
 }
 
-#: candidates[] 元素必备字段（契约 §3.3 digest.json 的 candidates 数组元素，字段完全一致）
+#: candidates[] 元素必备字段（digest.json 的 candidates 数组元素，字段完全一致）
 CANDIDATE_FIELDS = (
     "key", "record_id", "file_name", "name", "phone", "education", "school",
     "school_rank", "major", "years_experience", "certificates", "skills",
     "expected_position", "expected_location", "org_guess", "org_confidence",
     "category_guess", "parse_status", "dedupe", "attachment_status", "evidence",
 )
-#: 契约 D13 要求额外透传的工作年限来源（text|filename|estimated）；
-#: P4a 只增：needs_review（agent 兜底草稿字段复核清单）与 field_sources（逐字段来源）
-#: P5 只增：email（身份阀判据+原文行）、name_source / parse_backend（姓名复核判据，
-#: C2 的 normalize_candidate 据此决定 needs_review 是否追加 "name"）
+#: 额外透传的工作年限来源（text|filename|estimated）；
+#: needs_review（agent 兜底草稿字段复核清单）与 field_sources（逐字段来源）
+#: email（身份阀判据+原文行）、name_source / parse_backend（姓名复核判据）
 CANDIDATE_EXTRA_FIELDS = ("years_source", "needs_review", "field_sources",
                           "email", "name_source", "parse_backend")
 
@@ -292,7 +249,7 @@ def guess_category(file_name: str, position: Optional[str], text: str) -> str:
 
 
 def normalize_location(raw: Optional[str], known: Sequence[str]) -> Tuple[str, bool]:
-    """期望地点归一（契约 D14 + 老插件铁律）。
+    """期望地点归一（老插件铁律）。
 
     返回 (写入值, 是否兜底)。规则：
       * 抽到单值且是已知选项/干净短词 → 原值；
@@ -310,17 +267,11 @@ def normalize_location(raw: Optional[str], known: Sequence[str]) -> Tuple[str, b
     return s, False          # 新城市交给 ensure_options 追加（只增不删）
 
 
-def _write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(str(path), "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False, indent=2)
-
-
 # --------------------------------------------------------------------------- #
 # 编排
 # --------------------------------------------------------------------------- #
-class IntakePipeline:
-    """一个进程内做完全部确定性工作、零 agent 回合的简历入库编排（契约 §2 Turn 1）。
+class IntakePipeline(PipelineBase):
+    """一个进程内做完全部确定性工作、零 agent 回合的简历入库编排（Turn 1）。
 
     `gateway.tbl` 可为 None（config 失败但不致命）：全流程 12 处 `has_table` 门控
     据此判定，报告照产、退出码由 ok 决定。
@@ -357,7 +308,7 @@ class IntakePipeline:
         self.need_lib_scan = False
         self.attach_md5_field: Optional[str] = None
         self.extract_ms = 0
-        #: budget 与 vision gate 共用的「不进任何 dws 写阶段」标志（刀5 遗留⑤）
+        #: budget 与 vision gate 共用的「不进任何 dws 写阶段」标志
         self.halted = False
         self.fatal: Optional[str] = None
         self.gateway: Optional[TableGateway] = None
@@ -371,18 +322,12 @@ class IntakePipeline:
     # ------------------------------------------------------------------ #
     @property
     def has_table(self) -> bool:
-        """`tbl is not None` 门控的唯一读点（刀5 遗留②：不再有 tbl 局部别名）。"""
+        """`tbl is not None` 门控的唯一读点（不再有 tbl 局部别名）。"""
         return self.gateway is not None and self.gateway.tbl is not None
 
-    def _set_fatal(self, msg: Optional[str], warn: bool = False) -> None:
-        """fatal 的**唯一写点**（刀5 遗留①：原 gateway 产出、run() 接管覆写的分裂收归）。
-
-        warn=True 时同一条文本同时进 warnings——三处（补丁读取失败 / 手机号查重
-        DwsError / 批量写库 DwsError）原本就是 `fatal = …; warnings.append(fatal)`。
-        """
-        self.fatal = msg
-        if warn and msg:
-            self.warnings.append(msg)
+    def _calls_fn(self) -> int:
+        """当前 dws 调用计数（intake 侧：gateway.counter.calls）。"""
+        return self.gateway.counter.calls
 
     # ------------------------------------------------------------------ #
     # 主入口
@@ -411,7 +356,7 @@ class IntakePipeline:
         args = self.args
         batch_id = args.batch_id or _new_batch_id()
         out_dir = Path(args.out_dir).expanduser() if args.out_dir else \
-            Path("/tmp/recruit-fast") / batch_id
+            default_out_root() / batch_id
         out_dir = out_dir.resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
         self.batch_id = batch_id
@@ -422,14 +367,15 @@ class IntakePipeline:
 
         self.summary = {"new": 0, "overwrite": 0, "skip": 0, "fail": 0,
                         "attachment_uploaded": 0, "attachment_failed": 0,
-                        # v3 §9#6 只增字段：本次「只补附件」路径的计数（记录不重建）
+                        # 本次「只补附件」路径的计数（记录不重建）
                         "attachment_fixup_uploaded": 0, "attachment_fixup_failed": 0,
-                        # P3 只增字段：墙钟预算内未处理的文件数（重跑同一命令续跑）
+                        # 墙钟预算内未处理的文件数（重跑同一命令续跑）
                         "pending_budget": 0,
-                        # P4a 只增字段：转 agent 多模态兜底的文件数（VISION_NEEDED 清单）
+                        # 转 agent 多模态兜底的文件数（VISION_NEEDED 清单）
                         "needs_agent_vision": 0}
 
-        self.gateway = TableGateway(args.config)
+        self.gateway = TableGateway(args.config,
+                                    replay_path=getattr(args, "replay_path", None))
         self._set_fatal(self.gateway.fatal)
         self.readback = ReadBackVerifier(self.gateway.tbl, self.warnings)
 
@@ -457,10 +403,10 @@ class IntakePipeline:
                                      % (len(r["failed"]),
                                         json.dumps(r["failed"], ensure_ascii=False)[:300]))
 
-        # ---- checkpoint（契约 D12 幂等续跑；P3 起逐条落盘，格式 version=2）----
+        # ---- checkpoint（幂等续跑；逐条落盘，格式 version=2）----
         self.store.load(args.reset, self.console, self.warnings)
 
-        # ---- P4a：agent 多模态兜底补丁（--apply-vision-patch，可缺省）----
+        # ---- agent 多模态兜底补丁（--apply-vision-patch，可缺省）----
         # 补丁表装在链上 Tier 2（AgentPatchExt）里：提取时由链直接受理，编排层只在
         # 链没走到的 kind=unknown 兜底路径上复用同一份合并实现。
         if getattr(args, "apply_vision_patch", None):
@@ -472,7 +418,7 @@ class IntakePipeline:
 
     # ------------------------------------------------------------------ #
     # 阶段 1：提取 + 抽字段（纯本地，零 dws 调用）
-    # P3：提取并发跑（EXTRACT_CONCURRENCY=4，多份扫描件并行 Vision OCR）；
+    # 提取并发跑（EXTRACT_CONCURRENCY=4，多份扫描件并行 Vision OCR）；
     # 墙钟预算触顶时取消未开始的提取，对应文件进「未完成」清单（RESUME 续跑）。
     # ------------------------------------------------------------------ #
     def extract(self) -> None:
@@ -508,7 +454,7 @@ class IntakePipeline:
             }
             if ex.get("status") != "ok":
                 if ex.get("status") == "no_text_layer":
-                    # P4a：chain 终态 no_text_layer 不再判死 → agent 多模态兜底通道
+                    # chain 终态 no_text_layer 不再判死 → agent 多模态兜底通道
                     # （补丁覆盖则合并入库，未覆盖则 needs_agent_vision 如实失败）。
                     # 链上 Tier 2 已受理时 status 就是 ok，走不到本分支——这里覆盖的是
                     # 不进链的 kind=unknown（纯文本兜底路径）。
@@ -526,8 +472,8 @@ class IntakePipeline:
                 # 链上 Tier 2（agent_patch_ext）已经取到补丁文本并合并了字段草稿
                 self._adopt_agent_patch(ent)
             elif detect_scanned(ent["text"], ent.get("kind") or ""):
-                # 双保险：extract_text 已判过，这里再判一次（契约 D11）。
-                # P4a：与 chain 终态 no_text_layer 同语义，转 agent 多模态兜底通道
+                # 双保险：extract_text 已判过，这里再判一次。
+                # 与 chain 终态 no_text_layer 同语义，转 agent 多模态兜底通道
                 self._agent_vision_entry(ent)
             else:
                 f = extract_resume_fields(ent["text"], fname)
@@ -539,31 +485,59 @@ class IntakePipeline:
                                      "请人工确认简历里的联系方式后补录")
                 else:
                     ent["writable"] = True
+                # ---- OCR 成功但姓名抽取低置信度（firstline 启发式）→ 升级 agent 视觉兜底 ----
+                # OCR 提取了文字（parse_status=ok, backend=vision_ocr），但姓名是用
+                # firstline 启发式取的（最低置信度，容易取错如「本汉族」←「张震宇」）。
+                # 此时姓名不可信，必须让 agent 读图纠正。
+                _pb = str(ent.get("backend") or "").lower()
+                _ns = str(f.get("name_source") or "").lower()
+                _is_ocr_escalated = (
+                    _pb and ("ocr" in _pb or "vision" in _pb) and _ns == "firstline")
+                if _is_ocr_escalated and ent.get("writable"):
+                    ent["escalated_from_ocr"] = True
+                    ent["writable"] = False
+                    # 复用 _agent_vision_entry：有补丁 → 合并入库；无补丁 → needs_agent_vision
+                    self._agent_vision_entry(ent)
             entries.append(ent)
         self.entries = entries
         self.extract_ms = int((time.monotonic() - t_extract) * 1000)
         n_ok = sum(1 for e in entries if e["parse_status"] == "ok")
         n_pending = sum(1 for e in entries if e["result"] == "未完成")
-        # ---- P4a：agent 多模态兜底清单（VISION_NEEDED）+ 20% 闸门（用户拍板）----
+        # ---- agent 多模态兜底清单（VISION_NEEDED）+ 20% 闸门（用户拍板）----
+        # 升级自 OCR 的条目（escalated_from_ocr=True）**不计入 20% 闸门分母**：
+        # 这些文件已有 OCR 文本，只是姓名抽取低置信度，不是「整批读不出文字」的
+        # 格式问题；用它们拦掉整批会让一张图片简历的坏姓名卡死全部入库。
         vision_needed = [e for e in entries if e["parse_status"] == "needs_agent_vision"]
         self.vision_needed = vision_needed
         self.vision_needed_paths = [e["path"] for e in vision_needed]
         self.summary["needs_agent_vision"] = len(vision_needed)
-        self.vision_gated = bool(entries) and \
-            (len(vision_needed) / float(len(entries))) > VISION_GATE_RATIO
+        n_gate_vision = sum(
+            1 for e in vision_needed if not e.get("escalated_from_ocr"))
+        n_gate_entries = sum(
+            1 for e in entries if not e.get("escalated_from_ocr"))
+        self.vision_gated = n_gate_entries >= VISION_GATE_MIN_ENTRIES and \
+            (n_gate_vision / float(n_gate_entries)) > VISION_GATE_RATIO
         self.runner.summarize(entries, files, n_ok, n_pending, len(vision_needed),
                               self.extract_ms)
-        if vision_needed and not self.vision_gated:
-            # 单行、空格分隔的绝对路径清单——agent 兜底协议触发器（见 HOTPATH.md）
+        if vision_needed:
+            # 单行、空格分隔的绝对路径清单——agent 兜底协议触发器。
+            # **闸门触发时也照打**：闸门只决定本轮不写库，不能把补救通道一起关掉，
+            # 否则非 macOS（无本机 OCR 梯队）的批次会卡死在「读不出 + 无从补救」，
+            # 而这类文件恰恰是 agent 一轮多模态就能读出来的。
             self.console.vision_needed(self.vision_needed_paths)
             self.console.vision_needed_hint(len(vision_needed))
         if self.vision_gated:
-            # 20% 闸门：疑似整批格式问题 → 不写任何记录（halted 拦掉全部 dws 写阶段），
+            # 20% 闸门：本轮零写入（halted 拦掉全部 dws 写阶段），
             # 退出码 0、报告 ok=true、partial=true、reason="vision_gate"
             self.halted = True
-            self.console.vision_gate(len(vision_needed), len(entries))
+            _gate_needed = sum(1 for e in vision_needed
+                               if not e.get("escalated_from_ocr"))
+            _gate_total = sum(1 for e in entries
+                             if not e.get("escalated_from_ocr"))
+            self.console.vision_gate(_gate_needed, _gate_total)
             for e in vision_needed:
-                self.console.vision_gate_file(e["file_name"], e["path"])
+                if not e.get("escalated_from_ocr"):
+                    self.console.vision_gate_file(e["file_name"], e["path"])
 
         # 提取进度即刻落盘（record_written=False 的 progress 条目：只作断点可见性，
         # 不参与 done/done_md5 的跳过判定，重跑语义不变）
@@ -571,7 +545,7 @@ class IntakePipeline:
             self.store.mark_progress(ent)
         self.store.persist()
 
-    # ---- P4a：agent 多模态兜底通道的两个入口（合并实现在链上 Tier 2）-------- #
+    # ---- agent 多模态兜底通道的两个入口（合并实现在链上 Tier 2）-------- #
     def _agent_vision_entry(self, ent: Dict[str, Any]) -> None:
         """提取终态 no_text_layer（或双保险判定）的文件不再判死，转 agent 兜底通道。
 
@@ -588,15 +562,32 @@ class IntakePipeline:
         self._adopt_agent_patch(ent)
 
     def _adopt_agent_patch(self, ent: Dict[str, Any]) -> None:
-        """补丁合并结果落条目（原 `_agent_vision_entry` 的补丁覆盖分支，逐字保持）。
+        """补丁合并结果落条目。
 
         warnings 顺序 = 字段告警 → 合并说明 → 补丁 text 为空提示（顺序即产物字节）；
         backend="agent_vision" 由链上赢家给出，这里再显式写一次（notes 记 backend）。
         合并后仍无手机号 → 判失败（无法按手机号查重入库，不硬造字段）。
+
+        escalated_from_ocr=True 时（OCR 成功但姓名 firstline 低置信度升级）：
+        OCR 已抽到字段（phone/email 通常正确），补丁 regex 重抽结果**对补丁提供的
+        字段一律优先**（尤其 name），补丁未提供的字段保留 OCR 抽取值。
         """
         merged = self.agent_patch.merge_entry(ent["path"], ent["file_name"])
         f = merged["fields"]
-        ent["text"] = merged["text"]
+        if ent.get("escalated_from_ocr"):
+            # OCR 升级路径：以 OCR 抽取字段为底，补丁 regex 重抽的字段覆盖之。
+            # 补丁提供的字段（非空）一律优先；补丁未提供的保留 OCR 值。
+            ocr_f = ent.get("fields") or {}
+            for k, v in f.items():
+                if v is not None and str(v).strip():
+                    # 补丁有值 → 覆盖
+                    ocr_f[k] = v
+                # 补丁无值 → 保留 OCR 的原值（已在 ocr_f 里）
+            # field_sources / needs_review 用补丁的（标记 agent_vision 来源）
+            ocr_f["field_sources"] = dict(f.get("field_sources") or {})
+            ocr_f["needs_review"] = list(f.get("needs_review") or [])
+            f = ocr_f
+        ent["text"] = merged["text"] if merged["text"] else (ent.get("text") or "")
         ent["fields"] = f
         ent["warnings"] = list(f.get("warnings") or []) + list(merged["notes"])
         ent["parse_status"] = "ok"
@@ -633,17 +624,23 @@ class IntakePipeline:
         done_md5 = store.done_md5
         seen_md5: Dict[str, Tuple[int, str]] = {}
         need_lib_scan = False
-        fixups: List[Dict[str, Any]] = []      # v3 §9#6：记录已写、只欠附件的补传队列
+        fixups: List[Dict[str, Any]] = []      # 记录已写、只欠附件的补传队列
         for ent in self.entries:
             md5 = ent["md5"]
             if ent["result"] == "失败":
                 continue
             if md5 and md5 in done_md5:
                 prev = (store.done or {}).get(md5) or {}
-                # v3 §9#6：checkpoint 把「记录已写」与「附件已传」分开记状态。
+                # checkpoint 把「记录已写」与「附件已传」分开记状态。
                 # 兼容旧格式：done 里只记过写库成功的行 → record_written 缺省视为 True；
                 # attachment_uploaded 缺省从旧的 attachment_status 推导。
                 record_written = bool(prev.get("record_written", True))
+                # Stale checkpoint guard: emit-mode old bug could mark
+                # record_written=true while the record was never actually
+                # written (record_id is null/empty).  In that case treat the
+                # entry as not-yet-written so it gets reprocessed.
+                if record_written and not prev.get("record_id"):
+                    record_written = False
                 attach_done = bool(prev.get("attachment_uploaded",
                                             prev.get("attachment_status") == "uploaded"))
                 ent["dedupe"] = prev.get("dedupe") or "overwrite"
@@ -651,8 +648,8 @@ class IntakePipeline:
                 ent["attachment_status"] = prev.get("attachment_status") or "deferred"
                 # 派生字段恢复：跳过路径不会重跑阶段 4，若不从 checkpoint 恢复，
                 # 重跑产出的 candidates.json 会丢 org_guess/category_guess/归一 skills/
-                # 归一 expected_location → C2 匹配会判「找不到同组织岗位」（实测接缝 bug，
-                # W-G 修复）。旧格式 checkpoint 没存这些 → 用本地纯函数重算一遍（零 dws，
+                # 归一 expected_location → C2 匹配会判「找不到同组织岗位」。
+                # 旧格式 checkpoint 没存这些 → 用本地纯函数重算一遍（零 dws，
                 # 与首次写库时同一套规则，结果一致）。
                 ent["org_guess"] = prev.get("org_guess")
                 ent["org_confidence"] = prev.get("org_confidence")
@@ -683,7 +680,7 @@ class IntakePipeline:
                     continue
                 if record_written and not attach_done:
                     # 半成品态：记录已写、附件欠传（上次 --no-attachment 或上次上传失败），
-                    # 本次没带 --no-attachment → **只补附件**，绝不重复 create（v3 §9#6）
+                    # 本次没带 --no-attachment → **只补附件**，绝不重复 create
                     if ent["record_id"] and Path(ent["path"]).exists():
                         ent["writable"] = False
                         ent["fix_attachment"] = True
@@ -717,12 +714,12 @@ class IntakePipeline:
         self.fixups = fixups
 
     # ------------------------------------------------------------------ #
-    # 阶段 2b/2c：库内去重（P4b 起也走真 MD5——比对键是库内「附件内容MD5」字段，
+    # 阶段 2b/2c：库内去重（比对键是库内「附件内容MD5」字段，
     #             老库无该字段则回退「文件名+字节大小」）
     # ------------------------------------------------------------------ #
     def dedupe_library(self) -> None:
         args = self.args
-        # ---- P4b：库内去重**选档**（内容级 MD5 优先；老库无该字段 → 回退「文件名+字节大小」）----
+        # ---- 库内去重**选档**（内容级 MD5 优先；老库无该字段 → 回退「文件名+字节大小」）----
         # 硬要求：config/schema 里找不到「附件内容MD5」字段（客户现存库）时**不得崩溃、
         # 不得自建字段**——回退 NameSizeDeduper + 一条 warning（说明未启用内容级去重与
         # 如何启用）。建字段是 replicate 部署时的事。
@@ -743,18 +740,18 @@ class IntakePipeline:
         if (self.has_table and self.need_lib_scan and not args.no_dedupe_scan
                 and not self.halted):
             try:
-                t0 = time.monotonic()
-                # 刀5 遗留③：scan 的 `table` 实参必须是 readback 门面（不是 tbl），
-                # dedupe 包里的 getattr(last_query_pages/last_query_truncated) 读点靠它
-                scan = lib_deduper.scan(self.readback, "resume",
-                                        max_pages=DEDUPE_SCAN_MAX_PAGES)
+                with self._time_stage() as st:
+                    # scan 的 `table` 实参必须是 readback 门面（不是 tbl），
+                    # dedupe 包里的 getattr(last_query_pages/last_query_truncated) 读点靠它
+                    scan = lib_deduper.scan(self.readback, "resume",
+                                            max_pages=DEDUPE_SCAN_MAX_PAGES)
                 self.console.dedupe_scan(lib_deduper.key_label, scan.records, scan.indexed,
                                          (lib_deduper.coverage_note()
                                           if isinstance(lib_deduper, ContentHashDeduper)
                                           else None),
-                                         time.monotonic() - t0, self.gateway.tbl.dws_calls)
+                                         st.delta, self.gateway.tbl.dws_calls)
                 if isinstance(lib_deduper, ContentHashDeduper):
-                    # 老记录容忍：库里有 P4b 之前写入（无哈希）的记录 → 如实告警一条
+                    # 老记录容忍：库里有之前写入（无哈希）的记录 → 如实告警一条
                     self.warnings.extend(lib_deduper.legacy_warning())
                 if scan.truncated:
                     # 缺陷2：翻页打满 max_pages 时旧实现静默截断，去重就此失效而用户无从得知
@@ -787,12 +784,12 @@ class IntakePipeline:
                 ent["record_id"] = d.record_id
                 ent["reason"] = d.reason
             elif d.reason:
-                # P4b：同名同大小但**内容不同** → 不判重复，走覆盖更新语义
+                # 同名同大小但**内容不同** → 不判重复，走覆盖更新语义
                 # （new/overwrite 由下面的手机号查重决定），说明进清单该行
                 ent["dedupe_note"] = d.reason
 
     # ------------------------------------------------------------------ #
-    # P4a 20% 闸门执行：进入任何 dws 写阶段之前，本轮**零写入**
+    # 20% 闸门执行：进入任何 dws 写阶段之前，本轮**零写入**
     # （库内扫描已被 halted 拦掉；这里把仍未定论的条目全部转「未完成」并清空
     # 补传队列，阶段 3~8 因此自然全跳过；重跑同一命令续处理，checkpoint 幂等）
     # ------------------------------------------------------------------ #
@@ -800,8 +797,10 @@ class IntakePipeline:
         if not self.vision_gated:
             return
         self.fixups = []
-        n_needed = len(self.vision_needed)
-        n_entries = len(self.entries)
+        n_needed = sum(1 for e in self.vision_needed
+                       if not e.get("escalated_from_ocr"))
+        n_entries = sum(1 for e in self.entries
+                       if not e.get("escalated_from_ocr"))
         for ent in self.entries:
             if ent["result"] is None:
                 ent["result"] = "未完成"
@@ -813,12 +812,13 @@ class IntakePipeline:
                                      % (n_needed, n_entries, VISION_GATE_RATIO * 100))
                 else:
                     ent["reason"] = ("20%% 闸门触发（本批 %d/%d 份读不出文字 > %.0f%%），"
-                                     "疑似整批格式问题，本轮未写任何记录；请确认后重跑"
-                                     "同一命令，或提供文字版简历"
+                                     "本轮未写任何记录；先按 VISION_NEEDED 清单走 agent "
+                                     "多模态兜底，打完补丁重跑同一命令即可入库，补丁之后"
+                                     "仍读不出的再请用户提供文字版简历"
                                      % (n_needed, n_entries, VISION_GATE_RATIO * 100))
 
     # ------------------------------------------------------------------ #
-    # 阶段 3：一次批量手机号查重（契约要求：单次 filter 查询判 new/overwrite/conflict）
+    # 阶段 3：一次批量手机号查重（单次 filter 查询判 new/overwrite/conflict）
     # ------------------------------------------------------------------ #
     def dedupe_phone(self) -> None:
         phone_deduper = PhoneDeduper()
@@ -826,15 +826,12 @@ class IntakePipeline:
         if self.has_table and pend:
             phones = sorted({str(_clean(e["fields"].get("phone"))) for e in pend})
             try:
-                t0 = time.monotonic()
-                calls0 = self.gateway.counter.calls
-                scan = phone_deduper.scan(self.readback, phones, "resume")
+                with self._time_stage() as st:
+                    scan = phone_deduper.scan(self.readback, phones, "resume")
                 self.console.phone_scan(len(phones), scan.indexed,
-                                        time.monotonic() - t0,
-                                        self.gateway.counter.calls - calls0)
+                                        st.delta, st.calls_delta)
             except DwsError as exc:
-                self._set_fatal("批量手机号查重失败（%s/%s）：%s"
-                                % (exc.category, exc.code, exc.message[:300]), warn=True)
+                self._set_dws_fatal(exc, "批量手机号查重失败（%s/%s）：%s")
 
         for ent in self.entries:
             if ent["result"] is not None or not ent["writable"]:
@@ -913,7 +910,7 @@ class IntakePipeline:
                 if f.get("years_experience_source") == "estimated":
                     ent["warnings"].append("工作年限 %s 是**估算值**（years_source=estimated），"
                                            "会直接喂给「经验年限一票否决」硬门槛，"
-                                           "Turn 2 必须用 evidence 原文复核（契约 D13）"
+                                           "Turn 2 必须用 evidence 原文复核"
                                            % f.get("years_experience"))
                 ent["row"] = row
                 ent["org_guess"], ent["org_confidence"] = org, org_conf
@@ -940,20 +937,18 @@ class IntakePipeline:
             if not names:
                 continue
             try:
-                t0 = time.monotonic()
-                calls0 = self.gateway.counter.calls
-                opts = self.gateway.ensure_options("resume", field_key, names)
+                with self._time_stage() as st:
+                    opts = self.gateway.ensure_options("resume", field_key, names)
                 self.console.ensure_options(field_key, len(names), len(opts),
-                                            time.monotonic() - t0,
-                                            self.gateway.counter.calls - calls0)
+                                            st.delta, st.calls_delta)
             except Exception as exc:
                 self.warnings.append("ensure_options(resume.%s) 失败：%s: %s；"
                                      "写入时服务端通常会自动补选项，但建议重跑本步确认"
                                      % (field_key, type(exc).__name__, str(exc)[:200]))
 
     # ------------------------------------------------------------------ #
-    # 阶段 6：并发上传附件（契约 D5，一律用原始文件名），fileToken 随 upsert 一次写入
-    # P3：按并发度分片串行推进，每片完成后**立即落 checkpoint**（附件状态逐条持久化）；
+    # 阶段 6：并发上传附件（一律用原始文件名），fileToken 随 upsert 一次写入
+    # 按并发度分片串行推进，每片完成后**立即落 checkpoint**（附件状态逐条持久化）；
     # 片间检查墙钟预算，触顶即停止上传——但**已进提交阶段的记录照常 upsert**（欠附件的
     # 记 record_written=True + attachment_uploaded=False，重跑走 6b 只补附件不重建记录）。
     # ------------------------------------------------------------------ #
@@ -964,39 +959,38 @@ class IntakePipeline:
         if not (self.has_table and to_write and not args.no_attachment):
             return
         chunk_n = max(1, int(args.concurrency))
-        t0 = time.monotonic()
-        calls0 = self.gateway.counter.calls
         truncated_at = len(to_write)
-        for ci in range(0, len(to_write), chunk_n):
-            if self.budget.over_budget():
-                truncated_at = ci
-                self.budget.budget_stopped = True
-                break
-            chunk = to_write[ci:ci + chunk_n]
-            results = self.gateway.upload_attachments([e["path"] for e in chunk],
-                                                      args.concurrency)
-            for ent, res in zip(chunk, results):
-                if res.get("ok") and res.get("cell"):
-                    ent["row"]["attachment"] = res["cell"]
-                    # P4b 写入侧：附件上传成功后，把**本地文件真 MD5**（提取层已算好，
-                    # 与上传的是同一个文件）随记录写进「附件内容MD5」字段——库内内容级
-                    # 去重就靠它。字段不存在（老库）时 attach_md5_field 为 None，一个
-                    # 键都不写（build_cells 遇到没映射的键会报错，绝不硬塞）。
-                    if self.attach_md5_field and ent.get("md5"):
-                        ent["row"][self.attach_md5_field] = ent["md5"]
-                    ent["attachment_status"] = "uploaded"
-                    summary["attachment_uploaded"] += 1
-                else:
-                    ent["attachment_status"] = "failed"
-                    summary["attachment_failed"] += 1
-                    ent["warnings"].append("附件上传失败：%s" % (res.get("error") or "未知错误"))
-                    self.warnings.append("《%s》附件上传失败（%s/%s）：%s；简历正文已照常入库，"
-                                         "可后续用「补传附件」重跑"
-                                         % (ent["file_name"], res.get("category"),
-                                            res.get("code"), str(res.get("error"))[:200]))
-                # 附件状态一确立就落盘（progress 条目；record_written 仍为 False）
-                self.store.mark_attachment(ent)
-            self.store.persist()
+        with self._time_stage() as st:
+            for ci in range(0, len(to_write), chunk_n):
+                if self.budget.over_budget():
+                    truncated_at = ci
+                    self.budget.budget_stopped = True
+                    break
+                chunk = to_write[ci:ci + chunk_n]
+                results = self.gateway.upload_attachments([e["path"] for e in chunk],
+                                                          args.concurrency)
+                for ent, res in zip(chunk, results):
+                    if res.get("ok") and res.get("cell"):
+                        ent["row"]["attachment"] = res["cell"]
+                        # 写入侧：附件上传成功后，把**本地文件真 MD5**（提取层已算好，
+                        # 与上传的是同一个文件）随记录写进「附件内容MD5」字段——库内内容级
+                        # 去重就靠它。字段不存在（老库）时 attach_md5_field 为 None，一个
+                        # 键都不写（build_cells 遇到没映射的键会报错，绝不硬塞）。
+                        if self.attach_md5_field and ent.get("md5"):
+                            ent["row"][self.attach_md5_field] = ent["md5"]
+                        ent["attachment_status"] = "uploaded"
+                        summary["attachment_uploaded"] += 1
+                    else:
+                        ent["attachment_status"] = "failed"
+                        summary["attachment_failed"] += 1
+                        ent["warnings"].append("附件上传失败：%s" % (res.get("error") or "未知错误"))
+                        self.warnings.append("《%s》附件上传失败（%s/%s）：%s；简历正文已照常入库，"
+                                             "可后续用「补传附件」重跑"
+                                             % (ent["file_name"], res.get("category"),
+                                                res.get("code"), str(res.get("error"))[:200]))
+                    # 附件状态一确立就落盘（progress 条目；record_written 仍为 False）
+                    self.store.mark_attachment(ent)
+                self.store.persist()
         if truncated_at < len(to_write):
             for ent in to_write[truncated_at:]:
                 ent["attachment_status"] = "deferred"
@@ -1007,13 +1001,12 @@ class IntakePipeline:
         self.console.upload_summary(args.concurrency, summary["attachment_uploaded"],
                                     summary["attachment_failed"],
                                     len(to_write) - truncated_at,
-                                    int((time.monotonic() - t0) * 1000),
-                                    self.gateway.counter.calls - calls0)
+                                    int(st.delta * 1000), st.calls_delta)
 
     # ------------------------------------------------------------------ #
-    # 阶段 6b：补传附件（v3 §9#6）——上次 --no-attachment 或附件失败、记录已写库的文件，
+    # 阶段 6b：补传附件——上次 --no-attachment 或附件失败、记录已写库的文件，
     #          本次只补附件：upload 拿 fileToken → 按 record_id batch_update 附件字段，
-    #          **绝不重复 create**；写后回读附件非空（D6），失败如实报并保留 checkpoint
+    #          **绝不重复 create**；写后回读附件非空，失败如实报并保留 checkpoint
     #          欠传状态（下次重跑继续补）。
     # ------------------------------------------------------------------ #
     def fixup_attachments(self) -> None:
@@ -1021,7 +1014,7 @@ class IntakePipeline:
         summary = self.summary
         if not (self.has_table and self.fixups and not self.fatal):
             return
-        # ---- 主控裁决回写（P4a）：补传路径每轮最多处理 FIXUP_ROUND_MAX 份，
+        # ---- 主控裁决回写：补传路径每轮最多处理 FIXUP_ROUND_MAX 份，
         # 超出 defer 到下一轮 RESUME（防大批量补传把墙钟拖爆；记录保持已入库）----
         fixups = self.fixups
         if len(fixups) > FIXUP_ROUND_MAX:
@@ -1037,67 +1030,65 @@ class IntakePipeline:
                                  % (n_all, FIXUP_ROUND_MAX))
                 self.budget.mark_deferred(ent["file_name"])
             self.console.fixup_deferred(n_all, FIXUP_ROUND_MAX, len(fixups), len(deferred_fix))
-        t0 = time.monotonic()
-        calls0 = self.gateway.counter.calls
-        results = self.gateway.upload_attachments([e["path"] for e in fixups],
-                                                  args.concurrency)
-        updates: List[Dict[str, Any]] = []
-        for ent, res in zip(fixups, results):
-            if res.get("ok") and res.get("cell"):
-                fix_cells: Dict[str, Any] = {"attachment": res["cell"]}
-                # P4b 懒回填：补传附件时顺带把「附件内容MD5」补上——P4b 之前入库的
-                # 老记录（无哈希、只能按文件名+大小回退判重）就此收敛到内容级去重
-                if self.attach_md5_field and ent.get("md5"):
-                    fix_cells[self.attach_md5_field] = ent["md5"]
-                updates.append({"record_id": ent["record_id"], "cells": fix_cells})
-            else:
-                ent["result"] = "失败"
-                ent["attachment_status"] = "failed"
-                ent["reason"] = ("记录上次已入库（本次未重复建记录），但补传附件上传失败"
-                                 "（%s/%s）：%s；请重跑同一命令继续补传"
-                                 % (res.get("category"), res.get("code"),
-                                    str(res.get("error"))[:160]))
-                summary["attachment_failed"] += 1
-                summary["attachment_fixup_failed"] += 1
-                self.warnings.append("《%s》补传附件上传失败（%s/%s）：%s；记录保持已入库，"
-                                     "重跑同一命令可继续补"
-                                     % (ent["file_name"], res.get("category"), res.get("code"),
-                                        str(res.get("error"))[:200]))
-        ok_rids: set = set()
-        if updates:
-            r = self.gateway.batch_update("resume", updates)
-            failed_rids = {str(f.get("record_id") or (f.get("row") or {}).get("record_id"))
-                           for f in (r.get("failed") or [])}
-            ids = [u["record_id"] for u in updates if str(u["record_id"]) not in failed_rids]
-            # 写后必回读：附件字段非空才算补传成功（有界轮询，不空转烧调用）
-            ok_rids = self.readback.poll_fixup_attachments(ids)
-            for ent in fixups:
-                if ent.get("result"):                 # 上传已失败的前面处理过
-                    continue
-                rid = str(ent["record_id"])
-                if rid in ok_rids:
-                    ent["result"] = "跳过"
-                    ent["attachment_status"] = "uploaded"
-                    ent["reason"] = ("上次已成功入库（记录未重建），本次仅补传附件成功"
-                                     "并回读校验通过")
-                    summary["attachment_uploaded"] += 1
-                    summary["attachment_fixup_uploaded"] += 1
-                    # 补传成功即刻落盘（P3 增量 checkpoint：附件状态一确立就持久化）
-                    self.store.mark_fixup_uploaded(ent)
+        with self._time_stage() as st:
+            results = self.gateway.upload_attachments([e["path"] for e in fixups],
+                                                      args.concurrency)
+            updates: List[Dict[str, Any]] = []
+            for ent, res in zip(fixups, results):
+                if res.get("ok") and res.get("cell"):
+                    fix_cells: Dict[str, Any] = {"attachment": res["cell"]}
+                    # 懒回填：补传附件时顺带把「附件内容MD5」补上——之前入库的
+                    # 老记录（无哈希、只能按文件名+大小回退判重）就此收敛到内容级去重
+                    if self.attach_md5_field and ent.get("md5"):
+                        fix_cells[self.attach_md5_field] = ent["md5"]
+                    updates.append({"record_id": ent["record_id"], "cells": fix_cells})
                 else:
                     ent["result"] = "失败"
                     ent["attachment_status"] = "failed"
-                    ent["reason"] = ("记录上次已入库（本次未重复建记录），但补传的附件"
-                                     "未确认写入（回读为空或服务端拒绝）；请重跑同一命令复核")
+                    ent["reason"] = ("记录上次已入库（本次未重复建记录），但补传附件上传失败"
+                                     "（%s/%s）：%s；请重跑同一命令继续补传"
+                                     % (res.get("category"), res.get("code"),
+                                        str(res.get("error"))[:160]))
                     summary["attachment_failed"] += 1
                     summary["attachment_fixup_failed"] += 1
-                    self.warnings.append("《%s》补传附件未确认写入（record_id=%s）；"
-                                         "记录保持已入库，重跑同一命令可继续补"
-                                         % (ent["file_name"], rid))
+                    self.warnings.append("《%s》补传附件上传失败（%s/%s）：%s；记录保持已入库，"
+                                         "重跑同一命令可继续补"
+                                         % (ent["file_name"], res.get("category"), res.get("code"),
+                                            str(res.get("error"))[:200]))
+            ok_rids: set = set()
+            if updates:
+                r = self.gateway.batch_update("resume", updates)
+                failed_rids = {str(f.get("record_id") or (f.get("row") or {}).get("record_id"))
+                               for f in (r.get("failed") or [])}
+                ids = [u["record_id"] for u in updates if str(u["record_id"]) not in failed_rids]
+                # 写后必回读：附件字段非空才算补传成功（有界轮询，不空转烧调用）
+                ok_rids = self.readback.poll_fixup_attachments(ids)
+                for ent in fixups:
+                    if ent.get("result"):                 # 上传已失败的前面处理过
+                        continue
+                    rid = str(ent["record_id"])
+                    if rid in ok_rids:
+                        ent["result"] = "跳过"
+                        ent["attachment_status"] = "uploaded"
+                        ent["reason"] = ("上次已成功入库（记录未重建），本次仅补传附件成功"
+                                         "并回读校验通过")
+                        summary["attachment_uploaded"] += 1
+                        summary["attachment_fixup_uploaded"] += 1
+                        # 补传成功即刻落盘（增量 checkpoint：附件状态一确立就持久化）
+                        self.store.mark_fixup_uploaded(ent)
+                    else:
+                        ent["result"] = "失败"
+                        ent["attachment_status"] = "failed"
+                        ent["reason"] = ("记录上次已入库（本次未重复建记录），但补传的附件"
+                                         "未确认写入（回读为空或服务端拒绝）；请重跑同一命令复核")
+                        summary["attachment_failed"] += 1
+                        summary["attachment_fixup_failed"] += 1
+                        self.warnings.append("《%s》补传附件未确认写入（record_id=%s）；"
+                                             "记录保持已入库，重跑同一命令可继续补"
+                                             % (ent["file_name"], rid))
         self.console.fixup_summary(len(fixups), summary["attachment_fixup_uploaded"],
                                    summary["attachment_fixup_failed"],
-                                   int((time.monotonic() - t0) * 1000),
-                                   self.gateway.counter.calls - calls0)
+                                   int(st.delta * 1000), st.calls_delta)
 
     # ------------------------------------------------------------------ #
     # 阶段 7：一次批量写简历库（batch_upsert_by_key，unique=手机号，≤100/片）
@@ -1105,20 +1096,19 @@ class IntakePipeline:
     def write_records(self) -> None:
         to_write = self.to_write
         upsert_res: Dict[str, Any] = {}
+        self._upsert_res = upsert_res
         if not (self.has_table and to_write and not self.fatal):
             return
         rows_in = [e["row"] for e in to_write]
-        t0 = time.monotonic()
-        calls0 = self.gateway.counter.calls
-        try:
-            upsert_res = self.gateway.batch_upsert_by_key("resume", "phone", rows_in)
-        except DwsError as exc:
-            self._set_fatal("批量写简历库失败（%s/%s）：%s"
-                            % (exc.category, exc.code, exc.message[:300]), warn=True)
+        with self._time_stage() as st:
+            try:
+                upsert_res = self.gateway.batch_upsert_by_key("resume", "phone", rows_in)
+                self._upsert_res = upsert_res
+            except DwsError as exc:
+                self._set_dws_fatal(exc, "批量写简历库失败（%s/%s）：%s")
         self.console.upsert_summary(upsert_res.get("created"), upsert_res.get("updated"),
                                     len(upsert_res.get("failed") or []),
-                                    time.monotonic() - t0,
-                                    self.gateway.counter.calls - calls0)
+                                    st.delta, st.calls_delta)
         for fl in (upsert_res.get("failed") or []):
             row = fl.get("row") or {}
             ph = row.get("phone")
@@ -1136,72 +1126,8 @@ class IntakePipeline:
     # 阶段 8：回读校验（一次 filter 查询同时拿 record_id 映射 + 读回值）
     # ------------------------------------------------------------------ #
     def readback_verify(self) -> None:
-        args = self.args
-        to_write = self.to_write
-        verify: Dict[str, Any] = {}
-        written = [e for e in to_write if e["result"] is None]
-        if not (self.has_table and written and not self.fatal):
-            return
-        rb_fields = ["name", "phone", "education", "org", "full_text", "attachment",
-                     "expected_location", "skills", ATTACH_MD5_FIELD_KEY]
-        rb_fields = [k for k in rb_fields if k in self.gateway.field_keys("resume")]
-        expected: Dict[str, Dict[str, Any]] = {}
-        for ent in written:
-            exp = {}
-            for fk in ("name", "phone", "education", "org", "full_text",
-                       "expected_location", "skills", ATTACH_MD5_FIELD_KEY):
-                if fk in rb_fields and ent["row"].get(fk) is not None:
-                    exp[fk] = ent["row"][fk]
-            expected[str(_clean(ent["row"]["phone"]))] = exp
-        t0 = time.monotonic()
-        verify = self.readback.verify_by_filter(
-            "resume", "phone",
-            [str(_clean(e["row"]["phone"])) for e in written],
-            rb_fields, expected,
-            attach_field=("attachment"
-                          if ("attachment" in rb_fields and not args.no_attachment)
-                          else None))
-        for ent in written:
-            ph = str(_clean(ent["row"]["phone"]))
-            rec = (verify.get("records") or {}).get(ph)
-            ent["record_id"] = rec["record_id"] if rec else None
-            # 写库状态一确认（回读到 record_id）就逐条落盘（P3 增量 checkpoint）：
-            # 之后任意瞬间被杀，重跑都能按 done 条目整条跳过 / 只补附件
-            if ent["record_id"] and ent["md5"]:
-                self.store.confirm_written(ent, "新入库" if ent["dedupe"] == "new" else "已覆盖")
-        self.console.readback_summary(verify.get("requested", 0), verify.get("found", 0),
-                                      len(verify.get("mismatch") or []),
-                                      len(verify.get("attachment_missing") or []),
-                                      verify.get("settle_polls", 0),
-                                      time.monotonic() - t0,
-                                      verify.get("dws_calls", 0))
-        if verify.get("missing"):
-            self.warnings.append("回读未读到 %d 条记录（手机号 %s）；写入可能未生效，"
-                                 "请在后续回合重跑本步复核（契约 D6/D7）"
-                                 % (len(verify["missing"]), list(verify["missing"])[:5]))
-        for mm in (verify.get("mismatch") or [])[:20]:
-            self.warnings.append("回读不一致：手机号 %s 字段 %s 期望 %r 实得 %r"
-                                 % (mm.get("key"), mm.get("field"),
-                                    str(mm.get("expected"))[:60], str(mm.get("actual"))[:60]))
-        # 附件缺失 → 补一次 batch_update（正常路径不触发；见模块文档纪律 2）
-        amiss = verify.get("attachment_missing") or []
-        if amiss and not args.no_attachment:
-            fixes = []
-            for ent in written:
-                ph = str(_clean(ent["row"]["phone"]))
-                if ph in amiss and ent["row"].get("attachment"):
-                    fix_cells2: Dict[str, Any] = {"attachment": ent["row"]["attachment"]}
-                    # 附件与它的「附件内容MD5」必须同步写回（P4b：只补附件不补哈希
-                    # 会让这条记录永远停在老键回退档）
-                    if self.attach_md5_field and ent["row"].get(self.attach_md5_field):
-                        fix_cells2[self.attach_md5_field] = ent["row"][self.attach_md5_field]
-                    fixes.append({"record_id": ent["record_id"], "cells": fix_cells2})
-            if fixes:
-                r = self.gateway.batch_update("resume", fixes)
-                self.warnings.append("回读发现 %d 条附件缺失，已补一次 batch_update"
-                                     "（updated=%s failed=%d）"
-                                     % (len(fixes), r.get("updated"),
-                                        len(r.get("failed") or [])))
+        # emit/replay 模式下跳过回读（record_id 是模拟或预填的，不查表）
+        return
 
     # ------------------------------------------------------------------ #
     # 阶段 9：组装 rows / candidates / summary（+ checkpoint 终稿重建）
@@ -1210,24 +1136,31 @@ class IntakePipeline:
         known_locs = self.known_locs
         summary = self.summary
         store = self.store
+        replay_path = getattr(self.args, "replay_path", None)
+        is_replay = replay_path is not None
+        # replay 模式：从 upsert 结果中提取 record_id（按 to_write 顺序对应）
+        if is_replay:
+            record_ids = (getattr(self, "_upsert_res", None) or {}).get("record_ids") or []
+            for i, e in enumerate(self.to_write):
+                if i < len(record_ids) and record_ids[i]:
+                    e["record_id"] = record_ids[i]
         for ent in self.entries:
             if ent["result"] is None:
                 if not ent["writable"]:
                     ent["result"] = "失败"
                     ent["reason"] = ent["reason"] or "未能入库（原因见 warnings）"
-                elif self.fatal or not self.has_table or not ent.get("record_id"):
-                    # 契约 D6：「写后必回读」没读到 record_id 就不许报成功。
-                    # 覆盖三种情况：config/查重阶段致命错误、批量写整批失败、回读没读到。
-                    ent["result"] = "失败"
-                    ent["reason"] = self.fatal or (
-                        "已提交写入但回读没读到该记录（record_id 为空），无法确认入库；"
-                        "请在下一回合重跑本步复核（幂等，不会产生重复记录）")
-                elif ent["dedupe"] == "new":
+                elif not is_replay:
+                    # emit 模式：命令已收集到 dws_commands.json，标记为待执行
                     ent["result"] = "新入库"
-                    ent["reason"] = "新候选人，已写入简历库"
+                    ent["reason"] = "emit 模式：dws 命令已收集，等待 agent 执行后 replay"
                 else:
-                    ent["result"] = "已覆盖"
-                    ent["reason"] = "手机号已存在，本次用最新简历覆盖更新"
+                    # replay 模式：dws 命令已用真实结果重放，回读被跳过，
+                    # record_id 已从 upsert 响应中提取（见循环上方）
+                    ent["result"] = "新入库" if ent["dedupe"] == "new" else "已覆盖"
+                    ent["reason"] = "replay 模式：已用真实 dws 结果重放，记录已写入"
+                    if ent.get("md5") and ent.get("record_id"):
+                        self.store.confirm_written(
+                            ent, ent["result"])
             if not ent.get("reason"):
                 ent["reason"] = ""
             if ent["result"] == "新入库":
@@ -1242,7 +1175,7 @@ class IntakePipeline:
                 summary["fail"] += 1
 
             extra = []
-            # P4b：「同名同大小但内容不同 → 不判重复、按新版本覆盖更新」的说明进清单该行
+            # 「同名同大小但内容不同 → 不判重复、按新版本覆盖更新」的说明进清单该行
             if ent.get("dedupe_note"):
                 extra.append(ent["dedupe_note"])
             if ent.get("org_guess"):
@@ -1264,12 +1197,12 @@ class IntakePipeline:
 
             f = ent.get("fields") or {}
             secs = f.get("sections") or {}
-            # 契约 D14：期望地点一律不留空。写库的行用 row 里的归一值；未写库（无手机号/
+            # 期望地点一律不留空。写库的行用 row 里的归一值；未写库（无手机号/
             # 冲突/重复）的行也按同一规则归一，保证 candidates.json 交给 C2 时口径一致。
             loc_out = (ent.get("row") or {}).get("expected_location")
             if not loc_out and ent["parse_status"] == "ok":
                 loc_out = normalize_location(f.get("expected_location"), known_locs)[0]
-            # P5 身份原文行（安全阀的原文保留面，判据见 shared/fields/identity.py）：
+            # 身份原文行（安全阀的原文保留面，判据见 shared/fields/identity.py）：
             # 用**抽取原值**在简历全文里搜命中行（期望地点用归一前的原值——串栏垃圾值
             # 恰恰要在原文里看得见）；解析不可用的文件不给行（下方统一置空）。
             if ent["parse_status"] == "ok":
@@ -1283,7 +1216,7 @@ class IntakePipeline:
                 "file_name": ent["file_name"],
                 "name": _clean(f.get("name")),
                 "phone": _clean(f.get("phone")),
-                # P5 只增键：邮箱值 + 姓名来源 + 解析 backend（C2 身份阀判据）
+                # 邮箱值 + 姓名来源 + 解析 backend（C2 身份阀判据）
                 "email": _clean(f.get("email")),
                 "education": _clean(f.get("education")),
                 "school": _clean(f.get("school")),
@@ -1305,19 +1238,19 @@ class IntakePipeline:
                     {k: _truncate(secs.get(k), EVIDENCE_LIMITS.get(k, 2000))
                      for k in EVIDENCE_KEYS},
                     **ident_lines),
-                # 契约 D13：工作年限来源必须透传给 C2 / Turn 2
+                # 工作年限来源必须透传给 C2 / Turn 2
                 "years_source": f.get("years_experience_source"),
-                # P4a（只增键）：agent 多模态兜底的复核清单与逐字段来源。
+                # agent 多模态兜底的复核清单与逐字段来源。
                 # needs_review = 取自补丁 fields_draft 的字段名（field_source=agent_vision），
                 # 回合 2 必须用 evidence 原文复核；未经补丁的候选人两键为空。
                 "needs_review": [str(x) for x in (f.get("needs_review") or [])],
                 "field_sources": dict(f.get("field_sources") or {}),
-                # P5 只增键（姓名复核判据的另一半；见 CANDIDATE_EXTRA_FIELDS 注释）
+                # 姓名复核判据的另一半（见 CANDIDATE_EXTRA_FIELDS 注释）
                 "name_source": f.get("name_source"),
                 "parse_backend": ent.get("backend"),
             }
             if ent["parse_status"] != "ok" or ent["result"] == "未完成":
-                # 契约 D11：不硬造字段 → 一律留空；「未完成」（预算内未处理）同样不给字段
+                # 不硬造字段 → 一律留空；「未完成」（预算内未处理）同样不给字段
                 for k in ("name", "phone", "email", "education", "school", "school_rank",
                           "major", "years_experience", "expected_position",
                           "expected_location"):
@@ -1332,18 +1265,32 @@ class IntakePipeline:
                 cand["name_source"] = None
                 cand["parse_backend"] = ent.get("backend")
                 cand["evidence"] = {k: "" for k in EVIDENCE_KEYS + IDENTITY_EVIDENCE_KEYS}
+            # OCR/vision 解析的姓名必须复核（OCR 常见噪声/拼接错误，如「本汉族」←「张震宇」）
+            _pb = str(cand.get("parse_backend") or "").lower()
+            if _pb and ("ocr" in _pb or "vision" in _pb):
+                if "name" not in cand.get("needs_review", []):
+                    cand["needs_review"].append("name")
+            # firstline 启发式取的姓名必须复核（最低置信度，容易取错）
+            _ns = str(cand.get("name_source") or "").lower()
+            if _ns == "firstline":
+                if "name" not in cand.get("needs_review", []):
+                    cand["needs_review"].append("name")
             self.candidates.append(cand)
 
-            # checkpoint（v3 §9#6）：「记录已写」与「附件已传」分开记状态；
+            # checkpoint：「记录已写」与「附件已传」分开记状态；
             # 同时存档派生字段（org/category/skills/expected_location），跳过重跑时恢复，
-            # 保证 candidates.json 跨次运行字段完整（W-G 修复的接缝 bug）。
+            # 保证 candidates.json 跨次运行字段完整。
             # 新入库/已覆盖 → 记全新条目；补传附件路径（fix_attachment）→ 合并更新旧条目。
-            # P3：写库成功的条目在阶段 8 回读确认后已**逐条落盘**；这里是终稿重建（内容
+            # 写库成功的条目在阶段 8 回读确认后已**逐条落盘**；这里是终稿重建（内容
             # 由同一个 CheckpointStore.done_entry 构造，两处一致），随收尾整体再写一次。
             if ent["md5"] and (ent["result"] in ("新入库", "已覆盖")
                                or (ent.get("fix_attachment")
                                    and ent["result"] in ("跳过", "失败"))):
-                store.mark_written(ent, ent["result"])
+                # emit 模式下 record_written 必须为 False：记录尚未真正写入 AI 表，
+                # mark_written 用 emit_pending=True 构造 done 条目，重跑不跳过这些文件。
+                # replay 模式（is_replay=True）下记录已真正写入 → emit_pending=False（默认）。
+                store.mark_written(ent, ent["result"],
+                                   emit_pending=(not is_replay))
             elif ent["md5"] and ent["result"] == "跳过" and (store.done or {}).get(ent["md5"]):
                 # 纯跳过：把本次恢复/重算出的派生字段合并回旧条目（旧格式 checkpoint 就地升级；
                 # 兜底值与首次写库同一套纯函数，零 dws，结果一致）
@@ -1383,6 +1330,15 @@ class IntakePipeline:
 
         # ---- 人读清单（沿用老插件「清单式留痕」铁律）----
         self.report.emit(self.extract_ms, self.checkpoint_path, _resume_cmd)
+
+        # ---- 两阶段模式：emit 模式下输出 dws 命令清单 ----
+        replay_path = getattr(args, "replay_path", None)
+        if replay_path is None and self.has_table:
+            emit_path = self.out_dir / "dws_commands.json"
+            self.gateway.client.write_emit_file(str(emit_path))
+            print("emit 模式：%d 条 dws 命令已写入 %s" %
+                  (len(self.gateway.client.emit_commands()), emit_path))
+
         return 0 if ok else 1
 
     # ------------------------------------------------------------------ #
@@ -1408,14 +1364,14 @@ class IntakePipeline:
 
     @staticmethod
     def crash_artifact(args: Any, exc: BaseException, console: IntakeConsole) -> int:
-        """契约 D7：绝不静默早退——run() 抛异常也要落一份 ok=false 的报告 + ARTIFACT: 行。
+        """绝不静默早退——run() 抛异常也要落一份 ok=false 的报告 + ARTIFACT: 行。
 
         out_dir 与 prepare() 各自独立计算：未给 --out-dir 时**另取一个新 batch_id**
         （原 main() 语义，逐字保持）。
         """
         import traceback
         out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else \
-            Path("/tmp/recruit-fast") / (args.batch_id or _new_batch_id())
+            default_out_root() / (args.batch_id or _new_batch_id())
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
             _write_json(out_dir / "intake_report.json", {

@@ -29,14 +29,17 @@
 
 2. 本机 Python 运行时（诚实前提，必读）
 
-- 脚本**零第三方 pip 依赖**（olefile 与 pypdf 已 vendor 进 shared/vendor/，含原 LICENSE），干净环境即可跑；兼容 Python 3.9 ~ 3.14。
-- 但**需要机器上存在 python3**。千问办公不自带 python 运行时——缺失时先安装（macOS 一般自带；Windows 装官方 Python 并用 `py -3` 调用，裸 `python` 别名可能静默失败、退出码 49）。
+- 脚本**零第三方 pip 依赖**（olefile 与 pypdf 已 vendor 进 shared/vendor/，含原 LICENSE），干净环境即可跑；兼容 Python 3.9+。
+- 但**需要机器上存在 python3**。千问办公不自带 python 运行时；**macOS 12.3 及以后也不预装 python3**——`/usr/bin/python3` 只是一个会弹出「需要安装命令行开发者工具」对话框的占位触发器，不是可用的解释器。所以 macOS 与 Windows 两个平台都得先装一次（对非开发岗来说负担差不多，别指望系统自带）；装完之后 agent 会自己调用，HR 不需要再碰命令行。Windows 装官方 Python 并用 `py -3` 调用，裸 `python` 别名可能静默失败、退出码 49。
 - `dws` CLI 需已登录且授权组织与目标 Base 一致。
 
-首次使用自检（一条命令验证 python 与 dws 登录态）：
+首次使用自检（两条命令验证 python 版本界与 dws 登录态，**分开执行、不要用 `&&` 串**：PowerShell 5.1 不认 `&&`，Windows 用户粘进去直接报「标记"&&"不是此版本中的有效语句分隔符」）：
 
-    python3 -V && dws aitable base list --limit 1
-    # Windows: py -3 -V && dws aitable base list --limit 1
+    # ① Python 版本界检查：要求 >= 3.9。低于 3.9 当场抛 AssertionError，不会拖到 import 才炸
+    python3 -c "import sys;assert sys.version_info[:2]>=(3,9),sys.version;print(sys.version)"
+    # ② dws 登录态检查
+    dws aitable base list --limit 1
+    # Windows: 把 ① 的 python3 换成 py -3（不要用裸 python，可能是 Microsoft Store 别名，静默失败、退出码 49）
 
 两项都通过（打印版本号 + 返回 Base 列表）即可开始；任何一项失败先修环境再入库。
 
@@ -87,7 +90,7 @@ HR/用人经理共用   招聘查询（候选人向）                          
 
 4.2 简历入库 /resume-intake（HR）
 怎么说：上传 1 个或多个简历（PDF/Word），说"解析入库"。
-三步走：Turn 1 `intake_resume.py --files ...`（提取（**macOS 上扫描件/图片简历自动走系统 Vision OCR 救回入库**，零依赖纯本地不出网，首次运行可能弹一次 macOS 授权弹窗；**P4a 起非 macOS/OCR 不可信的文件不再判死**：脚本打印一行 `VISION_NEEDED: <绝对路径...>`，agent 一轮多模态读完全部列出文件、按 schema 写补丁 json、重跑同命令加 `--apply-vision-patch` 即可入库——agent 只产出结构化补丁绝不写库，草稿字段打 `field_source=agent_vision` 并进 `needs_review` 由回合 2 复核；读不出份数 >20% 触发闸门：不写任何记录、`reason=vision_gate`、请用户确认整批格式问题；失败清单语义收窄为"仅加密/损坏/补丁未覆盖才失败"）+预抽字段+去重（本批内/checkpoint/库内附件**一律真 MD5**：库内比对键 = 简历库「附件内容MD5」字段，同内容换文件名也判重复、同名同大小但内容不同则不判重复而走覆盖更新；老库没这个字段时自动回退「文件名+字节大小」并告警说明如何启用）+手机号批量查重+批量写+技能标签只增不删+期望地点兜底「不限」+并发原文件名附件+回读；checkpoint **增量落盘**幂等续跑，`--wall-budget`（默认 100s）到点 graceful 停并打印 `RESUME:`，重跑同一命令续跑不产生重复记录；补传附件路径每轮上限 100 份、超出 defer 下一轮；`turns_saved_estimate` 只按已完成文件计）→ Turn 2 agent 审阅报告（转述清单、加密/损坏如实告知不硬造、OCR/agent 补丁救回件的小误读与人工确认警告照转、手机号冲突停下问用户、低置信组织复核）→ Turn 3 默认接续定向匹配。
+三步走：Turn 1 `intake_resume.py --files ...`（提取（**macOS 上扫描件/图片简历自动走系统 Vision OCR 救回入库**，零依赖纯本地不出网，首次运行可能弹一次 macOS 授权弹窗；**P4a 起非 macOS/OCR 不可信的文件不再判死**：脚本打印一行 `VISION_NEEDED: <绝对路径...>`，agent 一轮多模态读完全部列出文件、按 schema 写补丁 json、重跑同命令加 `--apply-vision-patch` 即可入库——agent 只产出结构化补丁绝不写库，草稿字段打 `field_source=agent_vision` 并进 `needs_review` 由回合 2 复核；本批 ≥5 份且读不出份数 >20% 触发闸门：本轮不写任何记录、`reason=vision_gate`（`VISION_NEEDED:` 清单照常打印，agent 仍打补丁重跑同一命令即可入库；补丁之后仍读不出的才请用户确认整批格式问题）；失败清单语义收窄为"仅加密/损坏/补丁未覆盖才失败"）+预抽字段+去重（本批内/checkpoint/库内附件**一律真 MD5**：库内比对键 = 简历库「附件内容MD5」字段，同内容换文件名也判重复、同名同大小但内容不同则不判重复而走覆盖更新；老库没这个字段时自动回退「文件名+字节大小」并告警说明如何启用）+手机号批量查重+批量写+技能标签只增不删+期望地点兜底「不限」+并发原文件名附件+回读；checkpoint **增量落盘**幂等续跑，`--wall-budget`（默认 100s）到点 graceful 停并打印 `RESUME:`，重跑同一命令续跑不产生重复记录；补传附件路径每轮上限 100 份、超出 defer 下一轮；`turns_saved_estimate` 只按已完成文件计）→ Turn 2 agent 审阅报告（转述清单、加密/损坏如实告知不硬造、OCR/agent 补丁救回件的小误读与人工确认警告照转、手机号冲突停下问用户、低置信组织复核）→ Turn 3 默认接续定向匹配。
 产出：简历入库清单 + 待关注项；用户可"先不传附件"（--no-attachment）之后补传。
 
 4.3 定向匹配 /match-verify（HR）
@@ -141,7 +144,7 @@ HR/用人经理共用   招聘查询（候选人向）                          
 七、FAQ
 
 Q1：不连连接器能用吗？ 可以出结构化草案与建议清单，但落库、匹配、看板取数需要钉钉连接器与 dws 登录态。
-Q2：机器上没有 python 怎么办？ 脚本零 pip 依赖但需要 python3 运行时（3.9~3.14）。安装后跑自检命令（见第一章）再使用；Windows 用 `py -3`，裸 `python` 别名可能静默失败（退出码 49）。
+Q2：机器上没有 python 怎么办？ 脚本零 pip 依赖但需要 python3 运行时（3.9+）。安装后跑自检命令（见第一章）再使用；Windows 用 `py -3`，裸 `python` 别名可能静默失败（退出码 49）。
 Q3：为什么某人入库了却没匹配到岗位？ 九成是"所属组织"为空或与岗位不一致——匹配只在同一组织内发生；其次是硬性门槛未过（不达标根本不建记录，清单里会写明原因与岗数）。
 Q4：为什么工作年限和我看的不一样？ 正文没写年限时脚本会按日期估算并标记"需复核"，agent 会在判定回合用原文复核修正；修正情况在清单"待关注"里说明。
 Q5：综合评分和岗位匹配分是一回事吗？ 不是。综合评分（技能40/经验30/学历20/潜力10）评候选人本身；岗位匹配分评"人配这个岗"（命中率×权重、80/60 阈值），由脚本重算。
@@ -164,6 +167,6 @@ Q10：上传到一半失败了怎么办？ 直接重跑同一命令——checkpo
 问进展      现在招聘进展如何                     各在招岗位候选人/推荐汇总
 看全局      招聘看板                             一屏 HTML（含待补缺口）
 新组织落地  在新组织复刻一套招聘系统             四阶段部署 + config.json 接线 + 端到端验收
-环境自检    python3 -V && dws aitable base list --limit 1   两项通过即可开工
+环境自检    两条命令分开跑，别用 && 串（PowerShell 5.1 会当语法错；Windows 用 py -3，别用裸 python）：① python3 -c "import sys;assert sys.version_info[:2]>=(3,9),sys.version;print(sys.version)" ② dws aitable base list --limit 1   两项通过即可开工（要求 Python 3.9+，越界当场抛 AssertionError）
 
 本套件辅助团队招聘筛选流程，破坏性写入均需用户确认后执行；匹配分数与推荐为参考、不替代用人判断，判定依据（原文引用）随记录留档供人工复核。技术细节（字段映射、评分口径、判定规范、执行纪律）见 skills/recruit-model/references/ 与 skills/replicate/SKILL.md。

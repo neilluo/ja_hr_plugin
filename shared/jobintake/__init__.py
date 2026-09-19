@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""jobintake 包：岗位入库入口（intake_job.py）的 OO 分解（P9b）。
+"""jobintake 包：岗位入库入口（intake_job.py）的 OO 分解。
 
     constants.py       B 侧全部常量（组织关键词 B 变体 / SETTLE_WAITS / 粒度护栏
                        阈值与黑名单 / PARSE_FAIL_REASON 5 键——唯一的模块级可变 dict）
@@ -25,6 +25,6 @@
 
 `skills/job-intake/scripts/intake_job.py` 只剩 CLI 装配（build_parser / main）。
 
-沿 P2/P7 纪律：**本包 `__init__` 不做任何 re-export**（不留 shim，调用方直接
-import 子模块）；shared/ 在 sys.path 上，包内模块用顶层绝对 import。
+本包 `__init__` 不做任何 re-export（调用方直接 import 子模块）；
+shared/ 在 sys.path 上，包内模块用顶层绝对 import。
 """

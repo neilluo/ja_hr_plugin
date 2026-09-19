@@ -1,20 +1,11 @@
 # -*- coding: utf-8 -*-
-"""JobReadBackVerifier：岗位侧写后回读（B 口径，P9b 自 intake_job.verify_jobs 逐字搬移）。
+"""JobReadBackVerifier：岗位侧写后回读（B 口径）。
 
-红线（任务书 P9b #3 / P6 分析 §3.2 D2）：
-  * 本类与 A 侧 shared/intake/readback.py 的 ReadBackVerifier **不合并**：
-    A 按业务键（phone）filter 一对一、`found.setdefault` 一键多条保留第一条；
-    B 按 job_name filter **一对多**，再用 job_id /（岗位名称,所属部门,组织分类）
-    三元组做五级 fallback 精确归属（job_id 精确 → 三元组唯一 → 三元组多条取第一
-    → 候选唯一取它 → None），**归属优先级顺序就是行为**。
-  * 与 shared/aitable/verifier.ReadBackVerifier（按 record_ids 查）也不互换；
-    run_apply 的迟到二次复核走 aitable 版（经 JobTableGateway.readback_verify），
-    同一文件里两套回读是既有形态，保留。
-  * SETTLE_WAITS = (1.5, 3.0, 4.5)：`time.sleep(settle_waits[polls])` 在
-    `polls += 1` 之前，顺序不得交换；轮询次数/间隔逐字。
-  * 本方法**就地修改** entries（ent["record_id"] / ent["job_id"] 回填），是原
-    verify_jobs 的既有副作用，编排层阶段 9 依赖它。
-  * 返回 dict 的键名键序被下游直接读（含 B 独有的 submitter_missing），不能动。
+  * 岗位名称不唯一，按 job_name filter 查回来的是「一名多条」，再用 job_id /
+    （岗位名称,所属部门,组织分类）三元组做五级 fallback 精确归属。
+  * SETTLE_WAITS = (1.5, 3.0, 4.5)：轮询次数/间隔逐字。
+  * 本方法就地修改 entries（ent["record_id"] / ent["job_id"] 回填）。
+  * 返回 dict 的键名键序被下游直接读（含 submitter_missing），不能动。
 """
 
 from __future__ import annotations
@@ -38,13 +29,12 @@ class JobReadBackVerifier:
 
     def verify_jobs(self, entries: Sequence[Dict[str, Any]],
                     fields: Sequence[str], check_attach: bool) -> Dict[str, Any]:
-        """岗位侧写后回读（契约 D6）。
+        """岗位侧写后回读。
 
-        与简历侧不同：**岗位名称不唯一**（19 份真实 JD 里「工程师/高级工程师」在
-        硅片制造部-工艺部 / 硅片制造部-设备部 / 组件制造部-工艺部 … 各出现一次），
-        所以按 job_name filter 查回来的是「一名多条」，必须再用 **job_id（全表唯一）**
-        或 **(岗位名称, 所属部门, 组织分类)** 三元组把 record_id 精确对回本批的每一行，
-        否则会串档（把 A 部门的 record_id 写到 B 部门那条上）。
+        与简历侧不同：**岗位名称不唯一**，所以按 job_name filter 查回来的是「一名多条」，
+        必须再用 **job_id（全表唯一）** 或 **(岗位名称, 所属部门, 组织分类)** 三元组
+        把 record_id 精确对回本批的每一行，否则会串档（把 A 部门的 record_id 写到
+        B 部门那条上）。
 
         传播延迟用**有界**轮询（1.5/3.0/4.5s），不空转烧调用。
         """

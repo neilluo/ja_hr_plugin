@@ -20,9 +20,9 @@ from extraction.base import TextExtractor, normalize_pdf_text
 __all__ = ["JxaExt"]
 
 _JXA_TIMEOUT_S = 120
-# P4（主控裁决回写）：脚本改为返回 JSON {pages, text}——pages 是 PDFKit 实际
-# 解析到的 doc.pageCount，让**非 ok 结果**（无文本层）也能带回真实页数，不再
-# 硬编码 npages=0；文本内容本身与旧版逐字一致（JSON 往返无损）。
+# 脚本返回 JSON {pages, text}——pages 是 PDFKit 实际解析到的 doc.pageCount，
+# 让**非 ok 结果**（无文本层）也能带回真实页数，不再硬编码 npages=0；
+# 文本内容本身与旧版逐字一致（JSON 往返无损）。
 _JXA_SCRIPT = (
     'ObjC.import("Quartz");'
     "function run(argv){"

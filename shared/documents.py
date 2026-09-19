@@ -5,8 +5,7 @@ recruit-match-suite-fast / shared / documents.py
 ================================================
 
 文档模型层：FileKind / ResumeDocument / ExtractionResult + kind 嗅探 + vendor
-目录注入。P1 责任链重构中从 extract_text.py 原样搬入（判定逻辑与常量零改动），
-供 shared/extraction/** 各梯队与 extract_text.py 门面共用。
+目录注入。供 shared/extraction/** 各梯队与 extract_text.py 门面共用。
 
 kind 判定按「魔数优先、扩展名兜底」；FileKind.value 即契约枚举串
 pdf|docx|doc|image|unknown，对外返回值始终是 str，不外泄枚举对象。

@@ -1,19 +1,17 @@
 # -*- coding: utf-8 -*-
-"""jobintake 纯文本小工具（自 intake_job.py 逐字搬移，P9b）。
+"""jobintake 纯文本小工具。
 
-与 shared/intake/（A 侧）的同源小工具**刻意不合并**：本模块只服务 B 侧岗位入库，
-A/B 两侧脚本历史上各自自包含；合并进同一个 textutil 会把两侧未来的口径演化
-绑在一起（P6 分析 §3.2 D7 记录了字节相同这一事实，但归并属行为无关的收敛，
-不在 P9b「行为逐字节不变」范围内做）。
+本模块只服务岗位入库，与 shared/intake/ 的同源小工具刻意不合并。
 """
 
 from __future__ import annotations
 
-import json
 import random
 import time
 from pathlib import Path
 from typing import Any, Optional, Sequence
+
+from jsonio import write_json    # noqa: E402
 
 __all__ = ["new_batch_id", "today", "clean", "count_hits", "truncate", "write_json"]
 
@@ -47,9 +45,3 @@ def truncate(text: Optional[str], limit: int) -> str:
         return ""
     t = str(text)
     return t[:limit] + "…" if (limit and len(t) > limit) else t
-
-
-def write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(str(path), "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False, indent=2)

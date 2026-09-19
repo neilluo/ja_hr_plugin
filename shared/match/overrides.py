@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
-"""candidate_overrides 合入（OverrideMerger）：契约 v3 §9#1 的七键修正。
+"""candidate_overrides 合入（OverrideMerger）：七键修正。
 
-原 apply_decisions.py 的 `apply_overrides`(L290-347) / `OVERRIDE_KEYS`(L286) /
-`OVERRIDE_WRITEBACK_MAP`(L351-354) 搬入。就地改 cand_index 的语义**原样保留**
-（`_override_changes` 是写回简历库与报告留痕的依据）。norm_item 经 match.hitmap
-取用（原实现从 verify_decisions import，同一函数）。写回简历库的 IO 部分
+就地改 cand_index 的语义**原样保留**（`_override_changes` 是写回简历库与报告留痕的
+依据）。norm_item 经 match.hitmap 取用。写回简历库的 IO 部分
 （writeback_overrides）在 match.matchgate.MatchTableGateway。
 """
 
@@ -13,7 +11,7 @@ from typing import Any, Dict, List
 from match.applyvalues import as_list
 from match.hitmap import HitMapper
 
-#: 契约 v3 §9#1 裁定：candidate_overrides 支持且仅支持这七个键（+定位用 candidate_key）。
+#: candidate_overrides 支持且仅支持这七个键（+定位用 candidate_key）。
 #: 文档（match-verify/SKILL.md、ai-analysis-spec.md）与本清单必须保持一致。
 OVERRIDE_KEYS = ("org", "category", "expected_location", "skills_extra",
                  "certificates_extra", "years_experience", "org_reason")
@@ -33,12 +31,12 @@ class OverrideMerger:
 
     def apply_overrides(self, cand_index: Dict[str, Dict[str, Any]],
                         decisions: Dict[str, Any], warnings: List[str]) -> int:
-        """把 agent 在批量判定回合补齐的稀疏字段（D13 years 复核 / D14 地点与证书 / 组织归一）
+        """把 agent 在批量判定回合补齐的稀疏字段（工作年限复核 / 地点与证书 / 组织归一）
         合回候选人。
 
-        支持的键（契约 v3 §9#1，七个）：`org`、`category`、`expected_location`、
+        支持的键（七个）：`org`、`category`、`expected_location`、
         `skills_extra`(数组，与已有技能合并去重)、`certificates_extra`(数组，与已有证书合并去重)、
-        `years_experience`(int，D13 复核后的修正值)、`org_reason`(组织判定理由，只进报告)。
+        `years_experience`(int，复核后的修正值)、`org_reason`(组织判定理由，只进报告)。
 
         每处**实际改变值**的修正会记进 `cand["_override_changes"]`（业务字段名→新值），
         供 `writeback_overrides` 写回简历库与报告留痕使用。

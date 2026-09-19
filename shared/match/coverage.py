@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """覆盖率枚举（CoverageChecker）：「同组织 + 在招」的必须覆盖组合集。
 
-原 verify_decisions.expected_pairs（L296-332）搬入；candidate_overrides[].org 会覆盖
-org_guess（组织归一是 agent 在判定回合补的），组织缺失退化为全部在招岗位——
-两条口径都是覆盖率判定的契约面，逐字保留。
+candidate_overrides[].org 会覆盖 org_guess（组织归一是 agent 在判定回合补的），
+组织缺失退化为全部在招岗位——两条口径都是覆盖率判定的契约面，逐字保留。
 """
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""JobConsole：intake_job.py stdout/stderr 的唯一出口（P9b）。
+"""JobConsole：intake_job.py stdout/stderr 的唯一出口。
 
 收拢原脚本全部 29 处 print；本类持有输出文本的格式契约，不含任何业务判定——
 只接受编排层已算好的值并打印。

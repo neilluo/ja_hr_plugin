@@ -7,7 +7,7 @@ name_zh: 招聘看板
 description_en: Render a single-file HTML snapshot of open roles and their candidate/recommendation counts (one batched read-only query).
 description_zh: 从岗位表生成一份精简的单文件 HTML 招聘看板：在招岗位、候选人总数、推荐数与分岗位卡片。只读、一次批量查询取数；统计数由匹配脚本重算回填，看板直接读取。
 user-invocable: true
-argument-hint: 说"招聘看板"或"看下招聘全局"
+argument-hint: Say "recruit dashboard" or "show recruiting overview"
 argument-hint-en: Say "recruit dashboard"
 argument-hint-zh: 说"招聘看板"或"看下招聘全局"
 ---

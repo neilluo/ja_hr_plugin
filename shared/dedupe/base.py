@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """去重器抽象基类 + 判定/扫描结果载体。
 
-契约（编排层按这个用）：
+接口：
     build_index(records)  把一批库内记录（`AITable.query_records` 的返回）吃进索引
     scan(table, ...)      自己发查询 + build_index，返回 ScanResult（含截断状态）
     decide(...)           对**一条**待入库项给判定，返回 DedupeDecision；不改调用方数据
 
 `key_label` 是这个去重器实际用的键的**业务话名称**，给用户看的理由串必须用它——
-缺陷1 的教训：文案写「MD5 去重命中」而实际键是 (文件名, 字节大小)，用户会以为做了
-内容级比对。P4b 起内容级比对真的有了（`content_hash.py`，键 = 库内「附件内容MD5」
-字段），于是两档文案必须各说各的键：内容级说「附件内容MD5 比对命中」，老库回退档
+文案写「MD5 去重命中」而实际键是 (文件名, 字节大小)，用户会以为做了内容级比对。
+内容级比对键 = 库内「附件内容MD5」字段，老库回退档键 = (文件名, 字节大小)，
+两档文案必须各说各的键：内容级说「附件内容MD5 比对命中」，老库回退档
 说「文件名+字节大小 比对命中」，不许互相借用。
 """
 
@@ -48,14 +48,14 @@ def clean_value(s: Any) -> Optional[Any]:
 
 @dataclass
 class DedupeDecision:
-    #: pass=照常入库 / skip=判重复跳过 / fail=停下等人确认（契约 D6：不自动选）
+    #: pass=照常入库 / skip=判重复跳过 / fail=停下等人确认（不自动选）
     action: str = "pass"
     #: new | overwrite | conflict；None = 不改调用方现值
     dedupe: Optional[str] = None
     #: UNSET = 不碰；None = 显式清空；str = 指向库内那条记录
     record_id: Any = UNSET
     #: action=skip/fail 时 = 给用户看的判定理由；action=pass 且非空时 = **不判重复
-    #: 但要在清单说明**的原因（P4b：「同名同大小但内容不同 → 走覆盖更新」用这一档）
+    #: 但要在清单说明**的原因（同名同大小但内容不同 → 走覆盖更新用这一档）
     reason: Optional[str] = None
     warnings: List[str] = field(default_factory=list)
 
@@ -68,7 +68,7 @@ class ScanResult:
     indexed: int = 0
     #: 实际翻页数
     pages: int = 0
-    #: 因 max_pages 截断（缺陷2：截断必须可见，据此做的去重不可信）
+    #: 因 max_pages 截断（截断必须可见，据此做的去重不可信）
     truncated: bool = False
     max_pages: int = 0
 

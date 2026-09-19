@@ -4,73 +4,25 @@
 recruit-match-suite-fast / shared / extract_text.py
 ===================================================
 
-多格式文本提取层的**薄门面**（P1 责任链重构后）。**零第三方 pip 依赖**：只用
+多格式文本提取层的**薄门面**。**零第三方 pip 依赖**：只用
 python 标准库 + `shared/vendor/` 里 vendor 进来的纯 python 库（olefile /
 pypdf / typing_extensions，见 `shared/vendor/VENDOR_MANIFEST.txt`）。
 
-对外契约（构建契约 §3.1，签名已冻结，不得改动）
+对外契约（签名已冻结，不得改动）
 ------------------------------------------------
     extract_text(path: str) -> dict
         {"path": str, "kind": "pdf|docx|doc|image|unknown",
          "text": str, "chars": int, "elapsed_ms": int,
          "status": "ok|no_text_layer|garbled|encrypted|unsupported|error",
-         "backend": "pypdf|pdfkit_jxa|vision_ocr|agent_vision|stdlib_zip|ole_stdlib|"
-                    "ole_vendored|none",
+         "backend": "pypdf|pdfkit_jxa|vision_ocr|agent_vision|stdlib_zip|"
+                    "macos_textutil|none",
          "md5": str, "size": int, "error": str | None}
     detect_scanned(text: str, kind: str) -> bool
 
-本实现额外附带的**只增不改**字段（W-C 可忽略，不影响签名兼容）
---------------------------------------------------------------
-    warning : str | None   —— 人类可读的风险提示（契约 §0/D11 要求「失败可见」）
-    checks  : dict         —— 护栏量化指标（字符数下限 / CJK 占比 / 重复度 / 数字数），
-                              上层要转人工时可直接引用
-    pages   : int | None   —— pdf 页数
-    doc     : dict | None  —— .doc 专用：fComplex、piece 数、Table 流名、走的是
-                              piece table 还是 fcMin/fcMac 直读
-
-架构（P1 责任链，契约 D9 后端梯队）
-----------------------------------
-本文件只保留：前置检查、责任链委托、阶段 2 质量判定（text_quality /
-detect_scanned 护栏）、结果组装与 CLI。文档模型（FileKind / ResumeDocument /
-ExtractionResult / kind 嗅探）在 `shared/documents.py`；具体提取实现在
-`shared/extraction/**`，每个梯队一个 TextExtractor 类：
-
-    .pdf   -> PypdfExt    vendor pypdf                     backend=pypdf
-           -> JxaExt      macOS JXA/PDFKit（仅 darwin）     backend=pdfkit_jxa
-              都失败 -> status=error；**禁止** pdfplumber（依赖链含二进制 wheel）
-    .docx  -> DocxZipExt  stdlib zipfile + 正则             backend=stdlib_zip
-    .doc   -> DocPieceExt OLE2/CFB + MS-DOC piece table     backend=ole_vendored/ole_stdlib
-    扫描件/图片 -> VisionOcrExt（Tier 1.5，P3，仅 darwin）   backend=vision_ocr
-              macOS 自带 Vision framework 走 osascript/JXA，零 pip 依赖。
-              图片直接受理；PDF 仅当 pypdf/JXA 都没拿到可用文本（含「提出文本但
-              被 detect_scanned 判成水印/扫描件」的 gate 降级）才受理。
-              OCR 文本必须再过 detect_scanned + 「数字字符数>0」护栏，不可信判
-              no_text_layer，绝不当假成功（B1：markitdown 的水印噪声曾骗过护栏）。
-              非 darwin 无此梯队 -> ImageExt/no_text_layer 如实告知。
-    跨平台兜底 -> AgentPatchExt（Tier 2，P4a 通道 / P7 刀6 入链） backend=agent_vision
-              agent 多模态读出的补丁（`--apply-vision-patch`）作为链上最后一环：
-              只接「补丁表里有本文件」且「链终态本来是 no_text_layer」的文档，
-              文本原样返回并合并 fields_draft（取自草稿的字段 field_source=
-              agent_vision + needs_review）。补丁表为空时恒不受理（链行为与 P4a
-              之前逐字一致）；本门面只经 `agent_patch_tier()` 注册唯一实例，
-              装补丁是编排层（intake Pipeline）的事，本文件不读任何补丁文件。
-    图片（OCR 不可用/不可信时的终态）-> ImageExt  status=no_text_layer, backend=none
-              （契约 D11：不硬造字段，进 ❌ 清单建议提供文字版）
-    unknown（纯文本兜底）-> 仍由本文件 _plain_text 处理，不进链
-              （因此 Tier 2 对它不适用；编排层用 AgentPatchExt.merge_entry 走同一份
-              合并实现兜底，见 intake/pipeline.py）
-
-ExtractorChain 按注册顺序问 can_handle，第一个 extract 返回 status=="ok" 的
-梯队赢；走过的每一级记录进 notes（backend 链路可追溯）。P3 起 run() 额外接受
-gate（本门面传 detect_scanned）：ok 结果若被 gate 判为水印/扫描件文本会降级
-落下一级；npages 在所有梯队里保留首个非零值（P1 评审裁决①：扫描件不再丢页数）。
-加梯队 = 加一个类 + _CHAIN 注册一行。各梯队的标定结论与护栏阈值依据在对应模块
-docstring。
-
-兼容性
-------
-D10：全程 pathlib，不硬编码路径分隔符；语法兼容 python 3.8+（不用 match、
-不用 `X | None` 运行时标注，只用 typing.Optional）。已在 3.9.6 与 3.14.0 实测。
+架构：前置检查、责任链委托、阶段 2 质量判定（text_quality /
+detect_scanned 护栏）、结果组装与 CLI。文档模型在 `shared/documents.py`；
+具体提取实现在 `shared/extraction/**`，每个梯队一个 TextExtractor 类。
+加梯队 = 加一个类 + _CHAIN 注册一行。
 """
 
 from __future__ import annotations  # noqa: F404  (仅影响注解求值，3.7+ 可用)
@@ -88,7 +40,7 @@ from documents import nws as _nws
 from documents import sniff_kind as _sniff_file_kind
 from extraction.agent_patch_ext import AgentPatchExt, agent_patch_tier
 from extraction.chain import ExtractorChain
-from extraction.doc_piece_ext import DocPieceExt
+from extraction.doc_textutil_ext import DocTextutilExt
 from extraction.docx_zip_ext import DocxZipExt
 from extraction.image_ext import ImageExt
 from extraction.jxa_ext import JxaExt
@@ -105,16 +57,15 @@ __all__ = [
 
 # --------------------------------------------------------------------------- #
 # 提取责任链（注册顺序 = 梯队顺序；加梯队 = 加一个类 + 这里加一行）
-# VisionOcrExt = Tier 1.5（P3）：仅 darwin，只接「图片」与「前序文本层梯队全部
+# VisionOcrExt = Tier 1.5：仅 darwin，只接「图片」与「前序文本层梯队全部
 # 没拿到可用文本的 PDF」；OCR 文本仍要过 detect_scanned + 数字字符数护栏。
-# AgentPatchExt = Tier 2（P4a 通道，P7 刀6 入链）：agent 多模态补丁，只接「补丁表
-# 里有本文件」且「链终态本来是 no_text_layer」的文档；**必须排链尾**——can_handle
+# AgentPatchExt = Tier 2：agent 多模态补丁，只接「补丁表里有本文件」且
+# 「链终态本来是 no_text_layer」的文档；**必须排链尾**——can_handle
 # 靠 doc.prior 判断本机梯队全失败，插在中间会漏掉 docx/doc/image 的失败
-# （见 extraction/agent_patch_ext.py 模块 docstring）。补丁表为空时恒不受理，
-# 链行为与 P4a 之前逐字一致。
+# （见 extraction/agent_patch_ext.py 模块 docstring）。补丁表为空时恒不受理。
 # --------------------------------------------------------------------------- #
 _CHAIN = ExtractorChain([PypdfExt(), JxaExt(), VisionOcrExt(),
-                         DocxZipExt(), DocPieceExt(), ImageExt(),
+                         DocxZipExt(), DocTextutilExt(), ImageExt(),
                          agent_patch_tier()])
 
 
@@ -125,20 +76,19 @@ _PLAIN_EXTS = {".txt", ".text", ".md", ".markdown", ".csv", ".tsv", ".log",
                ".json", ".html", ".htm", ".xml", ".yaml", ".yml"}
 _MARKUP_EXTS = {".html", ".htm", ".xml"}
 
-# 护栏阈值（实测标定，见模块 docstring）
+# 护栏阈值（见模块 docstring）
 DOC_MIN_CHARS = 100        # .doc 非空白字符下限；低于此判 garbled
 DOC_WARN_CHARS = 300       # 低于此但高于下限时只打 warning
 MIN_CJK_RATIO = 0.15       # CJK 占比下限（配合拉丁占比一起判，避免误杀英文简历）
 MIN_LATIN_RATIO = 0.50     # 非 CJK 文档要求的拉丁字母占比
 MAX_GARBAGE_RATIO = 0.10   # U+FFFD / 私用区 / 控制字符 占比上限
 
-# detect_scanned 阈值（实测标定：3 份扫描件 80~1175 字符、0 个数字、
-# 唯一字符占比 <=0.13；28 份有效简历最少 966 字符但数字 >=29 个）
+# detect_scanned 阈值：扫描件通常字符少、数字极少、唯一字符占比低
 SCAN_MAX_CHARS = 1500      # 非空白字符数超过此值一律不判扫描件
 SCAN_MIN_DIGITS = 12       # 数字字符少于此值才算「数字极少」
 # 主判据是 unique_ratio：水印是「同一串字重复 N 遍」，唯一字符占比会掉到 0.01~0.13。
 # top_line / top_char 只作宽松备份——阈值必须放得很松，否则正常短文本
-# （50 字纯文本简历里手机号含 5 个 0）会被误判成水印，实测踩过。
+# （50 字纯文本简历里手机号含 5 个 0）会被误判成水印。
 SCAN_MIN_UNIQUE_RATIO = 0.15    # 唯一字符占比低于此值 = 重复串（水印）
 SCAN_MAX_TOP_LINE_RATIO = 0.30  # 单行重复占比高于此值 = 重复串（需 >= 8 行才判）
 SCAN_MIN_LINES_FOR_TOP_LINE = 8
@@ -234,19 +184,18 @@ def text_quality(text: str, kind: str) -> Dict[str, Any]:
 def detect_scanned(text: str, kind: str) -> bool:
     """判断「拿到了文本但其实等于没拿到」——扫描件 / 纯图片 / 只剩水印。
 
-    判据是**三条同时成立**（契约要求，单条都容易误杀）：
+    判据是**三条同时成立**（单条都容易误杀）：
       ① 字符数低于阈值：非空白字符 < SCAN_MAX_CHARS(1500)
       ② 水印 / 重复串占比高：唯一字符占比极低，或单行/单字符高度重复，
          或命中已知水印词
       ③ 数字字符极少：< SCAN_MIN_DIGITS(12)
          —— 这条是防误杀的关键：真实简历/JD 必含手机号、年份、日期，
-            实测最短的有效简历（周彦淇 966 字符）数字也有 29 个，
-            而 3 份扫描件数字都是 0 个。
+            而扫描件数字通常是 0 个。
 
     kind == "image" 且文本为空时直接返回 True：图片没有文本层可提。
-    P3 起图片可能被 Vision OCR 救回（backend=vision_ocr）——**有文本的图片不再
+    图片可能被 Vision OCR 救回（backend=vision_ocr）——**有文本的图片不再
     一票判死**，改走与 pdf 相同的内容判据（字符数/数字字符数/重复度/水印词）：
-    OCR 文本若仍是水印/重复串/数字极少，照样判 True（防静默假成功，B1 教训）。
+    OCR 文本若仍是水印/重复串/数字极少，照样判 True（防静默假成功）。
     """
     if kind == "image" and not _nws(text):
         return True
@@ -264,7 +213,7 @@ def detect_scanned(text: str, kind: str) -> bool:
     # ② 重复度 / 水印
     unique_ratio = len(set(body)) / n
     # 重复度只统计「文字类」字符：`：` `|` 这类标点在正常短文本里也会出现 4~5 次，
-    # 若把它们算进去，50 字的纯文本简历会被误判成水印（实测踩过）
+    # 若把它们算进去，50 字的纯文本简历会被误判成水印
     letters = [c for c in body if c.isalnum()]
     ln_n = len(letters)
     top_char_ratio = 0.0
@@ -344,8 +293,8 @@ def _blank(path: str, kind: str, status: str, backend: str, size: int, md5: str,
 def extract_text(path: str) -> Dict[str, Any]:
     """把一份文件（pdf / docx / doc / 图片 / 纯文本）提取成纯文本 + 质量元信息。
 
-    契约 §3.1 冻结签名：extract_text(path: str) -> dict。
-    永不抛异常——所有失败都落到 status/error/warning 里（契约 D6：失败可见）。
+    签名已冻结：extract_text(path: str) -> dict。
+    永不抛异常——所有失败都落到 status/error/warning 里。
     """
     t0 = time.perf_counter()
     p = Path(path)
@@ -403,7 +352,7 @@ def extract_text(path: str) -> Dict[str, Any]:
                 error = ("不支持的扩展名 %r（魔数前 8 字节 %s）；契约 kind 枚举只覆盖 "
                          "pdf/docx/doc/image" % (ext or "(无)", doc.head[:8].hex()))
         else:
-            # gate=detect_scanned（P3）：梯队返回 ok 但文本层被判「扫描件只剩水印/
+            # gate=detect_scanned：梯队返回 ok 但文本层被判「扫描件只剩水印/
             # 重复串」时降级落下一级——没有这一层，pypdf 提出 671 字符水印就赢了，
             # Vision OCR 永远接不到手。护栏本身与门面阶段 2 用同一个函数，口径一致。
             _res = _CHAIN.run(doc, gate=detect_scanned)
@@ -413,15 +362,15 @@ def extract_text(path: str) -> Dict[str, Any]:
                 warning = "; ".join(_res.notes)
             if _res.status != "ok":
                 hard_status = _res.status
-                # chain 耗尽且全梯队 error 才会走到这里（P3 起 pdf 含 Vision OCR 梯队）
+                # chain 耗尽且全梯队 error 才会走到这里（pdf 含 Vision OCR 梯队）
                 if _res.status == "error" and kind == "pdf":
                     error = "PDF 全部梯队都失败: %s" % ("; ".join(_res.notes) or "无文本")
             elif _res.backend == AgentPatchExt.BACKEND:
                 # Tier 2（agent 多模态补丁）赢时**不过下面的本机质量护栏**：护栏
                 # （字符数/CJK 占比/乱码占比/detect_scanned）恰恰是因为本机读不出
                 # 文字才走到这一环，拿它去判 agent 读出来的补丁文本会把兜底通道自己
-                # 判死（补丁文本短/无数字很常见）。与 P4a 编排层原语义一致：补丁覆盖
-                # 本文件即 parse_status="ok"，文本原样入库，复核责任交回合 2。
+                # 判死（补丁文本短/无数字很常见）。补丁覆盖本文件即 parse_status="ok"，
+                # 文本原样入库，复核责任交回合 2。
                 hard_status = "ok"
     except PermissionError as e:
         hard_status = "encrypted"
@@ -487,7 +436,7 @@ def extract_text(path: str) -> Dict[str, Any]:
         "md5": md5,
         "size": size,
         "error": error,
-        # ---- 以下为契约之外的只增字段，W-C 可忽略 ----
+        # ---- 以下为契约之外的只增字段 ----
         "warning": warning,
         "checks": checks,
         "pages": pages,
@@ -498,7 +447,7 @@ def extract_text(path: str) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# CLI（自测用；SKILL.md 不直接调本文件，由 W-C 的 intake 脚本调用）
+# CLI（自测用；由 intake 脚本调用）
 # --------------------------------------------------------------------------- #
 def _main(argv: List[str]) -> int:
     import json

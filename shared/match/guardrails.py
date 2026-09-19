@@ -1,47 +1,40 @@
 # -*- coding: utf-8 -*-
-"""语义合理性护栏（SemanticGuardrails）：缺陷2 修复（2026-09-17）的统计形态退化检测。
+"""语义合理性护栏（SemanticGuardrails）：统计形态退化检测。
 
-原 verify_decisions.semantic_guardrails（L335-570，236 行）搬入，按 SEM-E/H/R/G/O/P
-六族拆成六个私有方法（分析报告 D.3 类 5）；阈值 SEM_GUARD_DEFAULTS 共 **9** 键，
+按 SEM-E/H/R/G/O/P 六族拆成六个私有方法；阈值 SEM_GUARD_DEFAULTS 共 **9** 键，
 只有 4 个有 CLI 开关（--sem-*），另 5 个只能经 `evaluate(thresholds=…)` 编程覆盖
 ——这是必须冻结的 API 面。
 
-护栏告警文案（每条带具体证据：实测值 vs 阈值 + 样本 key）是 verify stdout / apply
+护栏告警文案（每条带具体证据：告警值 vs 阈值 + 样本 key）是 verify stdout / apply
 report 的字节面，**逐字保留**；metrics 的键插入序同样是字节（无 sort_keys）。
 """
 
-import json
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from match.hitmap import as_str_list
+from match.match_basics import json_dumps_zh
 
 # ---------------------------------------------------------------------------
-# 语义合理性护栏（缺陷2 修复，2026-09-17）—— 阈值全部可配置（模块常量 + CLI 覆盖）
+# 语义合理性护栏 —— 阈值全部可配置（模块常量 + CLI 覆盖）
 # ---------------------------------------------------------------------------
-# 背景（W-F run3 实测事故）：agent 在 Turn 2 没做语义判定，而是自写规则脚本
-# （normalize_jobs.py + generate_decisions.py）代替大模型 → verify 全部形式校验 PASS、
-# apply ok=true，但业务结果崩塌：0 条推荐（run1/run2 = 22 条）、skill_hits 普遍 ≤3、
-# evidence 同人同模板跨岗位复用、3 个岗位被错归组织。形式校验防不了语义偷懒，
-# 下面这组护栏专门盯「统计形态退化」，每条告警必须带具体证据（实测值 vs 阈值 + 样本 key）。
+# 这组护栏专门盯「统计形态退化」，每条告警必须带具体证据（告警值 vs 阈值 + 样本 key）。
 SEM_GUARD_DEFAULTS: Dict[str, float] = {
     # evidence 去重率下限：unique(evidence)/passed 低于它 → 模板化复用告警。
-    # 标定：W-F run1=0.55、run2=0.67（正常），run3=0.33（退化）→ 取 0.40 分界。
     "evidence_unique_ratio_min": 0.40,
     # 同一段 evidence 被**不同候选人**引用 → 疑似编造（evidence 必须出自本人简历）。
-    # 占比超过该值升级为硬错误拒写库；低于该值只告警。run1/run2/run3 实测均为 0。
+    # 占比超过该值升级为硬错误拒写库；低于该值只告警。
     "evidence_cross_candidate_error_ratio": 0.20,
     # 「命中项过少」：skill_hits ≤ low_skill_hits_max 的条目占比 ≥ low_skill_hits_ratio，
     # 且岗位 must_skills 分母中位数 > low_skill_hits_min_denominator → 告警（规则脚本
-    # 只做浅层关键词匹配的典型形态）。run3=33/33=1.00，run1=25/67=0.37。
+    # 只做浅层关键词匹配的典型形态）。
     "low_skill_hits_max": 3,
     "low_skill_hits_ratio": 0.90,
     "low_skill_hits_min_denominator": 4,
     # 「命中项放水」：分母 ≥ full_hit_min_denominator 的条目里 100% 全命中占比
-    # ≥ full_hit_ratio → 告警（W-F 观察到普晓刚 15/15 全命中但原文只支撑 11~13 项）。
-    # run1 全命中 18/67=0.27 → 不误报；阈值取 0.60。
+    # ≥ full_hit_ratio → 告警。
     "full_hit_min_denominator": 5,
     "full_hit_ratio": 0.60,
-    # 推荐率异常高：推荐/通过条目 > recommend_ratio_high → 告警复核。run1=22/67=0.33。
+    # 推荐率异常高：推荐/通过条目 > recommend_ratio_high → 告警复核。
     "recommend_ratio_high": 0.60,
     # 护栏最小样本量：passed 条目少于它时分布类护栏不评估（小批次统计无意义、易误报）。
     "min_passed_for_guards": 5,
@@ -56,17 +49,17 @@ class SemanticGuardrails:
                  rejected_pairs_n: int,
                  thresholds: Optional[Dict[str, float]] = None,
                  ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
-        """语义合理性护栏（缺陷2）。返回 (errors, warnings, metrics)。
+        """语义合理性护栏。返回 (errors, warnings, metrics)。
 
         与形式校验的分工：形式校验查「JSON 对不对」，本护栏查「判定像不像认真做的」。
-        每条告警都带**具体证据**（哪个 candidate/job、实测值 vs 阈值），不许只说"异常"。
+        每条告警都带**具体证据**（哪个 candidate/job、告警值 vs 阈值），不许只说"异常"。
         阈值来自 SEM_GUARD_DEFAULTS，可被 `thresholds` 覆盖（CLI --sem-* 参数）。
 
         升级为 error（拒写库）的只有一类：**同一段 evidence 被不同候选人引用**且占比高
         ——evidence 必须是本人简历原文，跨人复用等于编造数据，写库会污染匹配记录的
         「匹配依据」列；其余分布类异常（0 推荐、命中全 ≤3、模板化 evidence…）在极端
         批次里**可能合法**（例如整批确实无人达标），一律 warning + 强制人工复核，
-        不拦写库（拦了就是误报，W-F run1 类正常批次会被天天卡住）。
+        不拦写库（拦了就是误报，正常批次会被天天卡住）。
         """
         self.digest = digest
         self.decisions = decisions
@@ -101,7 +94,7 @@ class SemanticGuardrails:
             self.warnings.append({"code": "sem_all_rejected", "key": "batch",
                                   "detail": "整批 0 条通过、%d 个组合全部被拒（门槛通过率=0%%）。"
                                             "可能确实无人达标，也可能是 Turn 2 没做语义判定"
-                                            "（W-F run3 事故形态之一）→ 必须人工抽查 rejected "
+                                            "→ 必须人工抽查 rejected "
                                             "的 reason 与 evidence 后复核" % self.rejected_pairs_n})
         self.metrics.update(n_passed=0, rejected_pairs=self.rejected_pairs_n)
         self.metrics["evaluated"] = False
@@ -145,8 +138,7 @@ class SemanticGuardrails:
                            for e, pairs in worst)
             self.warnings.append({"code": "sem_evidence_reuse", "key": "passed",
                                   "detail": "evidence 去重率 %.2f < 阈值 %.2f（%d 条 pass 只有 %d 段"
-                                            "不同 evidence）→ 模板化复用嫌疑（W-F run3 实测 0.33；"
-                                            "正常批 run1/run2 = 0.55/0.67）。最重复样本：%s"
+                                            "不同 evidence）→ 模板化复用嫌疑。最重复样本：%s"
                                             % (unique_ratio, th["evidence_unique_ratio_min"],
                                                n_passed, len(ev_map), ws)})
 
@@ -168,8 +160,7 @@ class SemanticGuardrails:
             self.warnings.append({"code": "sem_skill_hits_too_few", "key": "passed",
                                   "detail": "skill_hits ≤%d 的条目占 %d/%d=%.0f%%（阈值 %.0f%%），而岗位"
                                             " must_skills 分母中位数=%d（>%d）→ 命中数与分母规模严重"
-                                            "不匹配，疑似关键词浅匹配代替语义判定（W-F run3：33/33 全"
-                                            "≤3、分母 5~15）。样本：%s"
+                                            "不匹配，疑似关键词浅匹配代替语义判定。样本：%s"
                                             % (low_max, low_n, n_passed, low_n * 100.0 / n_passed,
                                                th["low_skill_hits_ratio"] * 100, median_denom,
                                                th["low_skill_hits_min_denominator"], "; ".join(examples))})
@@ -182,8 +173,7 @@ class SemanticGuardrails:
             examples = ["%s×%s=%d/%d" % (c, j, h, t) for c, j, h, t in fh_pool[:6]]
             self.warnings.append({"code": "sem_skill_hits_full_inflated", "key": "passed",
                                   "detail": "分母 ≥%d 的 %d 条里 %d 条（%.0f%%，阈值 %.0f%%）100%% 全命中"
-                                            " → 放水嫌疑（W-F 实测普晓刚 15/15 全命中但原文只支撑 11~13"
-                                            " 项）。样本：%s"
+                                            " → 放水嫌疑。样本：%s"
                                             % (fh_min, len(fh_pool), fh_n, fh_n * 100.0 / len(fh_pool),
                                                th["full_hit_ratio"] * 100, "; ".join(examples))})
 
@@ -201,22 +191,20 @@ class SemanticGuardrails:
         if n_passed >= min_n and n_recommend == 0:
             self.warnings.append({"code": "sem_zero_recommend", "key": "passed",
                                   "detail": "整批 %d 条 pass 里「推荐」=0 条（分布=%s）→ 异常"
-                                            "（W-F run3 事故：0 推荐，run1/run2=22 条）；请复核"
-                                            "门槛与命中判定是否过严/偷懒，确需 0 推荐要向用户说明理由"
-                                            % (n_passed, json.dumps(rec_dist, ensure_ascii=False))})
+                                            "；请复核门槛与命中判定是否过严/偷懒，确需 0 推荐要向用户说明理由"
+                                            % (n_passed, json_dumps_zh(rec_dist))})
         elif n_passed >= min_n and recommend_ratio > float(th["recommend_ratio_high"]):
             self.warnings.append({"code": "sem_recommend_ratio_high", "key": "passed",
                                   "detail": "推荐率 %.0f%%（%d/%d）> 阈值 %.0f%%（分布=%s）→ 异常偏高，"
                                             "疑似放水；请抽查高分条目的 evidence 是否支撑"
                                             % (recommend_ratio * 100, n_recommend, n_passed,
                                                th["recommend_ratio_high"] * 100,
-                                               json.dumps(rec_dist, ensure_ascii=False))})
+                                               json_dumps_zh(rec_dist))})
         if n_passed >= min_n and len([k for k in rec_dist if k != "?"]) == 1:
             only = [k for k in rec_dist if k != "?"][0]
             self.warnings.append({"code": "sem_recommend_collapsed", "key": "passed",
                                   "detail": "整批 %d 条 pass 的推荐状态**全部**是「%s」（分布塌缩到单一"
-                                            "取值）→ 语义判定退化嫌疑（正常批 run1/run2 三档齐有："
-                                            "推荐22/待定26/不推荐19）；请人工复核后再写库"
+                                            "取值）→ 语义判定退化嫌疑；请人工复核后再写库"
                                             % (n_passed, only)})
 
     # ---------------- SEM-G：门槛通过率异常（全拒 / 全过） ----------------
@@ -229,11 +217,11 @@ class SemanticGuardrails:
             if self.rejected_pairs_n == 0:
                 self.warnings.append({"code": "sem_all_passed", "key": "batch",
                                       "detail": "整批 %d 个组合**全部通过**硬性门槛（0 拒绝）→ 异常"
-                                                "（真实批次门槛通过率实测 ~12%%）；疑似门槛没判/"
+                                                "（真实批次门槛通过率很低）；疑似门槛没判/"
                                                 "全放行，请复核 gate_detail" % total_pairs})
             # 全拒（passed=0）已在 n_passed==0 分支处理
 
-    # ---------------- SEM-O：candidate_overrides 覆盖率异常（D13 复核没做） ----------------
+    # ---------------- SEM-O：candidate_overrides 覆盖率异常 ----------------
     def _sem_o(self) -> None:
         need_years = [str(c.get("key")) for c in (self.digest.get("candidates") or [])
                       if isinstance(c, dict) and "years" in (c.get("needs_review") or [])]
@@ -245,20 +233,18 @@ class SemanticGuardrails:
             self.warnings.append({"code": "sem_years_review_missing", "key": "candidate_overrides",
                                   "detail": "digest 标记 needs_review:[\"years\"] 的候选人有 %d 个（%s），"
                                             "但 candidate_overrides 里**一个** years_experience 复核值"
-                                            "都没有 → D13 复核没做（估算年限直接喂一票否决门槛，"
-                                            "W-F 实测 9/9 标记、agent 执行率不满：P0 8/9、run1 4/9）；"
+                                            "都没有 → 年限复核没做（估算年限直接喂一票否决门槛）；"
                                             "必须补做复核或向用户说明"
                                             % (len(need_years), ",".join(need_years[:10]))})
         self._ovr = ovr
 
-    # ---------------- SEM-P（P5）：身份/组织安全阀的复核没有落点 ----------------
+    # ---------------- SEM-P：身份/组织安全阀的复核没有落点 ----------------
     def _sem_p(self) -> None:
-        # digest 里 needs_review 含 org/name/email 的候选人（P5：组织预筛机械复查命中 /
+        # digest 里 needs_review 含 org/name/email 的候选人（组织预筛机械复查命中 /
         # 姓名来源文件名/OCR/agent 草稿 / 邮箱疑似 OCR 噪声），decisions 里必须有复核动作：
         #   org   = candidate_overrides 给了 org 或 org_reason（或条目 evidence 里有组织说明）；
-        #   name/email = 该人任一条目的 evidence/reason 文本里出现复核关键词——契约 v3 §9#1
-        #     的 candidate_overrides 没有 name/email 键，复核结论只能落在 evidence 里
-        #     （HOTPATH 回合 2 已写明该落点）。
+        #   name/email = 该人任一条目的 evidence/reason 文本里出现复核关键词
+        #     （candidate_overrides 没有 name/email 键，复核结论只能落在 evidence 里）。
         # 两者皆无 → warning 强制人工复核（尺度同 SEM-O / sem_years_review_missing，不拒写库）。
         identity_review = (("org", ("组织", "org")),
                            ("name", ("姓名", "name")),
@@ -295,7 +281,7 @@ class SemanticGuardrails:
             if missing:
                 if fld == "org":
                     act = ("candidate_overrides 里没有任何 org / org_reason 复核结论，条目 "
-                           "evidence 也无组织说明 → 组织归属复核没做（P5 预筛错杀阀形同虚设）；"
+                           "evidence 也无组织说明 → 组织归属复核没做（预筛错杀阀形同虚设）；"
                            "必须依 evidence 复核：确认无误写 org_reason，确认有误写 "
                            "candidate_overrides.org 并重跑 build_match_input")
                 elif fld == "name":

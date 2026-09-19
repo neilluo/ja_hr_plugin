@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """JD 语义字段转换 + 技能粒度护栏（纯函数/纯规则，无 IO）。
 
-自 intake_job.py 逐字搬移（P9b）。红线（P6 分析 §3.2 D3/D4）：
+红线：
   * split_skill_items（原 _as_skill_items）的分隔符集是「、,，;；\\n」6 个，
     **禁止**换成 shared/fields/textnorm.split_items（后者分隔符更多且会剥动词
     前缀/过滤/去重——粒度护栏要的是 Turn 2 给的**原样逐条**，换了会让「过长」
@@ -88,7 +88,7 @@ def norm_skill_item(s: Any) -> str:
 
 
 class SkillGranularityGuard:
-    """任务二（W-J，根因来自 W-I 实测）：JD 技能条目粒度护栏（只增 warning 不拦写）。"""
+    """JD 技能条目粒度护栏（只增 warning 不拦写）。"""
 
     def check(self, jobs_skills: Sequence[Tuple[str, Any, Any]],
               warnings: List[str],

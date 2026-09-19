@@ -7,7 +7,7 @@ name_zh: 招聘查询
 description_en: Look up candidates for a role, roles for a candidate, or overall pipeline progress; read-only batched queries, output as lists.
 description_zh: 查某岗位的推荐候选人、某候选人匹配的岗位、或整体招聘进展。只读、批量查询（不逐条敲命令），以业务化清单返回。
 user-invocable: true
-argument-hint: 如"暖通工程师有哪些候选人"/"胡裕匹配了哪些岗位"/"现在招聘进展如何"
+argument-hint: e.g. "candidates for HVAC engineer" / "what roles did Hu Yu match" / "recruiting progress"
 argument-hint-en: e.g. "candidates for HVAC engineer" / "what roles did Hu Yu match"
 argument-hint-zh: 如"暖通工程师有哪些候选人"/"胡裕匹配了哪些岗位"/"现在招聘进展如何"
 ---

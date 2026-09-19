@@ -1,29 +1,17 @@
 # -*- coding: utf-8 -*-
 """stdout 冻结契约（MatchReporter）：digest 摘要 + ARTIFACT:/SHARD: 协议行。
 
-原 build_match_input.py 的 `report_and_emit`(L1538) / `emit_shard_stdout`(L1168) /
-`EMIT_BUDGET_BYTES`(L1165) 搬入。`report_and_emit(res, emit_stdout=False,
-emit_always=False)` 是**冻结签名**（intake_resume.py --auto-match L246 同进程复用），
+`report_and_emit(res, emit_stdout=False, emit_always=False)` 是**冻结签名**，
 薄壳留在入口脚本、委托到本类 `report()`。
-
-已知缺陷豁免（分析报告 §B.7#1，裁判断言的就是当前行为，**不许修**）：
-config 缺失/不可解析的失败早退路径 meta 只有 3 个键，`report()` 第一行 print 直接
-下标访问 m["candidate_count_active"] → 抛 KeyError: 'candidate_count_active'，
-stdout 全空、无 ARTIFACT: 行。本类的下标访问方式与原实现逐字一致，KeyError
-的键名/抛出点语义不变（裁判 DEFECT_badconfig 面断言 stderr 末行异常文本）。
 """
 
 import json
 from typing import Any, Dict
 
-#: L4-c 的 stdout 预算（字节）。实测 qodercli 对 Bash tool_result 有**硬上限**：
-#: 30,002 字节（≈29.3 KB）处**静默切断、不留任何截断标记**（W-I 实测：一次
-#: intake+auto-match 的 stdout 被切在第 15 个岗位的 requirements_text 中间，
-#: 既没有 `== 判定输入结束 ==` 也没有 `SHARD:` 行，agent 只能自己去 Read 文件补救）。
+#: stdout 预算（字节）。qodercli 对 Bash tool_result 有硬上限（~30 KB 处静默切断），
 #: 所以默认**不**把判定输入打进 stdout；本函数与 --emit-stdout 开关**均不移植进 CLI**
-#: （W-I 实测 O4-c 负收益：agent 拿到半截 JSON 反而去 Read digest.json / Grep .py 源码自证，
-#: 多烧 3~4 回合与 2 万多 output token）。保留本函数仅为 report 的冻结签名
-#: `emit_stdout=False` 参数有定义可依，**任何入口都不会把它打开**。
+#: （agent 拿到半截 JSON 反而去 Read digest.json / Grep .py 源码，多烧回合与 output token）。
+#: 保留本函数仅为 report 的冻结签名 `emit_stdout=False` 参数有定义可依。
 EMIT_BUDGET_BYTES = 20000
 
 
@@ -31,11 +19,11 @@ class MatchReporter:
     """build 侧 agent 消费面（stdout 行协议）的唯一出口。无状态。"""
 
     def emit_shard_stdout(self, shard_doc: Dict[str, Any]) -> int:
-        """L4-c（**默认关闭、CLI 不可达**）：把单片判定输入打到 stdout。
+        """**默认关闭、CLI 不可达**：把单片判定输入打到 stdout。
 
         返回打出的字符数；**超出 EMIT_BUDGET_BYTES 就返回 -1 并且什么都不打**。
-        W-I 实测此路负收益，故 W-J 移植时**不接任何 CLI 开关**，仅保留函数体以满足
-        report 的冻结签名（emit_stdout 恒为 False，本函数永不被调用）。
+        此路负收益，故不接任何 CLI 开关，仅保留函数体以满足 report 的冻结签名
+        （emit_stdout 恒为 False，本函数永不被调用）。
         """
         payload = {
             "batch_id": shard_doc.get("batch_id"),
@@ -61,12 +49,12 @@ class MatchReporter:
         """打印 digest 摘要 + ARTIFACT 行 + SHARD: 行（agent 下一步唯一该 Read 的东西）。
 
         独立成函数是为了让 intake_resume.py --auto-match 能在同一进程里复用完全相同的输出口径
-        （O2/L2），两条入口的 stdout 一致，agent 学一次就够。
+        （两条入口的 stdout 一致，agent 学一次就够）。
 
         `emit_stdout` / `emit_always` 是冻结签名参数，但**恒为 False、无任何 CLI 开关能打开**：
-        W-I 实测 O4-c（把判定输入打进 stdout）负收益——qodercli 在 ~30 KB 处静默切断 Bash 输出，
-        半截 JSON 会让 agent 转而去 Read digest.json、甚至 Read/Grep .py 源码自证，多烧 3~4 回合
-        与 2 万多 output token。所以判定输入**不打 stdout**，一律按 SHARD: 路径 Read 分片文件。
+        把判定输入打进 stdout 负收益——qodercli 在 ~30 KB 处静默切断 Bash 输出，
+        半截 JSON 会让 agent 转而去 Read digest.json、甚至 Read/Grep .py 源码自证，多烧回合
+        与 output token。所以判定输入**不打 stdout**，一律按 SHARD: 路径 Read 分片文件。
         返回 0 = digest.ok；1 = 不可判定（errors 里有业务话原因）。
         """
         d = res["digest"]
@@ -101,7 +89,7 @@ class MatchReporter:
         if m["needs_review_years"]:
             print("D13 needs_review=[years]（工作年限是估算的，agent 必须复核）: %s"
                   % ",".join(m["needs_review_years"]))
-        # P5：组织预筛疑似错杀的逐人清单（明细在分片候选人 prefilter_suspicious 里；
+        # 组织预筛疑似错杀的逐人清单（明细在分片候选人 prefilter_suspicious 里；
         # 这里只打人名+被删岗位名，控制 stdout 体量——Bash 输出 ~30KB 处会被静默截断）
         susp_meta = m.get("prefilter_suspicious") or {}
         if susp_meta.get("candidate_count"):
@@ -143,7 +131,7 @@ class MatchReporter:
                   flush=True)
         for p in paths:
             print("SHARD:%s" % p, flush=True)
-        # emit_stdout 恒 False（无 CLI 开关能打开；O4-c 实测负收益，见 report docstring）
+        # emit_stdout 恒 False（无 CLI 开关能打开；打 stdout 负收益，见 report docstring）
         if emit_stdout and shard_docs and (len(shard_docs) == 1 or emit_always):
             total = 0
             for doc in shard_docs:

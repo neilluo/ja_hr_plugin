@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """ExtractorChain：按注册顺序问 can_handle，第一个 extract 成功的赢。
 
-语义与旧 _pdf_text 梯队 fallback 逐条对应（见 documents.ExtractionResult
-的 status 注释）：
+语义：
   - status=="ok"          -> 赢；已走过的每一级的 notes 前插进赢家 notes，
                              backend 链路可追溯；
   - status!="ok"          -> 本级 notes 累积，落下一级；
@@ -10,18 +9,18 @@
                              docx/doc 容器失败直达通用 except、pdf 加密直达
                              encrypted 的路径；pdf 梯队"异常转下一级"由
                              PypdfExt/JxaExt 内部自捕完成；
-  - 全部走完无人赢（耗尽） -> 复刻旧 _pdf_text 终态
+  - 全部走完无人赢（耗尽） -> 复刻旧终态
                              ("", "none", 0, notes, "no_text_layer" if ran_without_exc else "error")：
                              任一级"跑通但 0 字符"即 no_text_layer，否则 error。
 
-P3 增量语义（两条都是契约回写，见 W3 派工）：
+增量语义（两条）：
   1. **gate（文本层护栏前置）**：调用方可传 gate(text, kind)->bool（门面传
      detect_scanned）。梯队返回 ok 但 gate 判定文本不可用（扫描件只剩水印/
      重复串/数字极少）时，把该结果**降级为 no_text_layer** 并落下一级——
      这是 Vision OCR 能接手「pypdf 提出 671 字符水印」这类假 ok 的前提；
-     没有 gate 时行为与 P1 完全一致。
-  2. **npages 保留（P1 评审裁决①）**：终态与赢家结果的 npages 不再被后梯队
-     的硬编码 0 清掉——取所有已试梯队里首个非零 npages（如 pypdf 已解析出
+     没有 gate 时行为不变。
+  2. **npages 保留**：终态与赢家结果的 npages 不再被后梯队的
+     硬编码 0 清掉——取所有已试梯队里首个非零 npages（如 pypdf 已解析出
      页数但文本层是水印时，最终 pages 仍是真实页数）。
 
 doc.prior：每级 can_handle 之前，已走过的梯队结果（含被 gate 降级的）都在

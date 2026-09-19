@@ -42,10 +42,10 @@ Turn 3  跑一个 Python 脚本 —— 校验/批量建匹配记录/脚本重算
 
 ## 数据底座
 
-钉钉 AI 表格 Base「招聘筛选」（或 replicate 复刻出的同构 Base），四表：岗位JD表 / 简历库管理 / 智能匹配 / 权限配置。脚本通过 `dws` CLI 的 subprocess 调用访问表格，**业务名 → 真实 ID 的映射唯一来源是插件根目录的 `config.json`**（由 [复刻部署](../replicate/SKILL.md) 技能生成，格式见根目录 `config.example.json`）。脚本内零硬编码 ID；若实查发现 config.json 与实际表结构不符，以实查为准并同时回填 config.json 与 system-config.md（双写）。
+钉钉 AI 表格 Base「招聘筛选」（或 replicate 复刻出的同构 Base），四表：岗位JD表 / 简历库管理 / 智能匹配 / 权限配置。脚本通过 emit/replay 两阶段模式访问表格，**业务名 → 真实 ID 的映射唯一来源是插件根目录的 `config.json`**（由 [复刻部署](../replicate/SKILL.md) 技能生成，格式见根目录 `config.example.json`）。脚本内零硬编码 ID；若实查发现 config.json 与实际表结构不符，以实查为准并同时回填 config.json 与 system-config.md（双写）。
 
 ## 运行时前提
 
-- 机器上存在可用的 Python 3（3.9~3.14 均可，脚本零第三方 pip 依赖，olefile/pypdf 已 vendor 进 `shared/vendor/`）。千问办公不自带 python 运行时，缺失时需先安装。
+- 机器上存在可用的 Python 3（3.9+ 均可，脚本零第三方 pip 依赖，olefile/pypdf 已 vendor 进 `shared/vendor/`）。千问办公不自带 python 运行时，缺失时需先安装。
 - `dws` CLI 已登录且授权组织与目标 Base 一致。
-- 自检一条命令：`python3 -V && dws aitable base list --limit 1`（Windows 用 `py -3 -V && dws aitable base list --limit 1`）。
+- 自检两条命令，**分开执行、不要用 `&&` 串**（PowerShell 5.1 不认 `&&`，Windows 用户粘进去直接报「标记"&&"不是此版本中的有效语句分隔符」）：① `python3 -c "import sys;assert sys.version_info[:2]>=(3,9),sys.version;print(sys.version)"` 查版本界（要求 Python **3.9+**，低于 3.9 当场抛 AssertionError，不会拖到 import 才炸）；② `dws aitable base list --limit 1` 查登录态。Windows 把 `python3` 换成 `py -3`，**不要用裸 `python`**（可能是 Microsoft Store 别名，静默失败、退出码 49）。

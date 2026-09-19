@@ -1,13 +1,13 @@
 ---
 name: resume-intake
 version: 0.2.0
-description: Fast resume ingestion - one bundled Python script does text extraction, field pre-fill, dedupe (real content MD5 within the batch/checkpoint AND against library attachments via the resume table's attachment-content-MD5 field; falls back to filename+byte-size with a warning on legacy bases that lack the field) + phone dedupe, batch write (<=100/call), concurrent attachment upload and readback in a single turn; the agent only reviews the report and confirms low-confidence orgs. Matching then continues via match-verify.
+description: Fast resume ingestion - one bundled Python script does text extraction, field pre-fill, dedupe (real content MD5 within the batch/checkpoint AND against library attachments via the resume table's attachment-content-MD5 field; falls back to filename+byte-size with a warning on legacy bases that lack the field) + phone dedupe, batch write (<=100/call), concurrent attachment upload (stage 6b fixup attachments has readback via poll_fixup_attachments; stage 7 batch upsert skips readback in emit/replay mode, extracting record_ids from the upsert response) in a single turn; the agent only reviews the report and confirms low-confidence orgs. Matching then continues via match-verify.
 name_en: Resume Intake
 name_zh: 简历入库
-description_en: Upload resumes (single or batch). One script call parses, dedupes, batch-writes and attaches; agent reviews the intake report only.
-description_zh: 上传简历（单个或批量）。一次脚本调用完成解析、按手机号查重、批量落库、原文件名并发附件与回读；agent 只审阅入库报告并复核低置信组织，随后接续定向匹配。
+description_en: Upload resumes (single or batch). Script parses, dedupes, batch-writes and attaches; agent reviews the intake report only.
+description_zh: 上传简历（单个或批量）。脚本解析、查重、批量落库、并发附件（stage 6b 补传附件带回读，stage 7 批量 upsert 不做回读）；agent 只审阅入库报告并复核低置信组织，随后接续定向匹配。
 user-invocable: true
-argument-hint: 上传 1 个或多个简历文件(PDF/Word)
+argument-hint: Upload one or more resume files (PDF/Word)
 argument-hint-en: Upload one or more resume files (PDF/Word)
 argument-hint-zh: 上传 1 个或多个简历文件(PDF/Word)
 ---
@@ -24,11 +24,11 @@ argument-hint-zh: 上传 1 个或多个简历文件(PDF/Word)
 > （`replicate/SKILL.md`）、扫描件/加密件解析细节、查询与看板、或 HOTPATH 未覆盖的边界情况。
 > 下面保留本 SKILL 的完整三步走说明作为**异常/批量场景的参考**，热路径不必逐字读它。
 
-**铁律：本技能全程只允许调用脚本，禁止 agent 逐条敲 `dws` 命令。**解析、查重、批量写库、并发附件、回读全部在脚本内部完成（实测：批量写 31 条 1.38s/1 次调用 vs 逐条 38.79s/31 次；批量查重 1.33s/1 次 vs 39.50s/31 次；附件并发 5 为 2.79s vs 串行 5.59s）。
+**铁律：agent 通过 Bash 工具执行 dws 命令，不在 Python subprocess 里调 dws。** 脚本在 emit 模式下完成解析、查重、批量写库、并发附件的全流程编排（stage 6b 补传附件带 `poll_fixup_attachments` 回读；stage 7 批量 upsert 不做回读，record_id 从 upsert 响应提取）（实测：批量写 31 条 1.38s/1 次调用 vs 逐条 38.79s/31 次；批量查重 1.33s/1 次 vs 39.50s/31 次；附件并发 5 为 2.79s vs 串行 5.59s）。但 emit 模式不真正写表格——产出 dws 命令清单后，agent 需通过 Bash 工具执行 dws 命令（或走 `scripts/run_pipeline.py` 编排的 emit→exec→replay 三步走，或走 `scripts/upload_attachments.py` 三阶段）。详见插件根目录 `AGENTS.md`。
 
 ## 三步走
 
-### Turn 1 —— 跑入库脚本（一次调用，整批完成）
+### Turn 1 —— 跑入库脚本 emit 模式（一次调用，整批解析 + 收集 dws 命令）
 
 ```bash
 # macOS / Linux
@@ -45,14 +45,32 @@ py -3 scripts\intake_resume.py --config <config.json绝对路径> --files <文�
 - `--files`：用户本次上传的全部简历文件，**一次全给**，不要分多次调用。
 - `--out-dir`：本批产物目录（建议工作区下专用目录），同一批次的后续步骤复用同一目录。
 - `--wall-budget <秒>`：墙钟预算（默认 100，必须小于 agent 工具 120s 超时）。到点脚本 **graceful 停**：checkpoint 逐条落盘、stdout 打印已完成/未完成清单与一行 `RESUME:`、退出码 0、报告 `ok=true` 且 `partial=true`（附 `pending_files`/`deferred_attachment_files` 名单）。**续跑 = 重跑同一条命令**（checkpoint 增量落盘 + 幂等，不产生重复记录）；见 `RESUME:` 就重跑，最多 3 次，仍 partial 才把已完成/未完成清单报给用户。脚本内部**不循环子批**（那只会把总墙钟拖过外部超时）。
-- `--no-attachment`：用户明确说"先不传附件"时加；之后"补传附件"= **重跑同一命令不带此参数**——checkpoint 把「记录已写」与「附件已传」分开记状态（契约 v3 §9#6），且 P3 起**每个状态一确立就原子落盘**（中途被杀/超时不丢已完成进度），重跑时已完整成功的文件整条跳过，只欠附件的文件**仅补传附件**（按 record_id 更新附件字段并回读，绝不重复建记录）。补传路径每轮最多处理 **100 份**（P4a 主控裁决），超出部分 defer 到下一轮：stdout 会说明，重跑同一命令续补（RESUME 语义，幂等）。
+- `--no-attachment`：用户明确说"先不传附件"时加；之后"补传附件"= **重跑同一命令不带此参数**——checkpoint 把「记录已写」与「附件已传」分开记状态（契约 v3 §9#6），且 P3 起**每个状态一确立就原子落盘**（中途被杀/超时不丢已完成进度），重跑时已完整成功的文件整条跳过，只欠附件的文件**仅补传附件**（按 record_id 更新附件字段，stage 6b 通过 `poll_fixup_attachments` 回读附件非空才算完成，绝不重复建记录）。补传路径每轮最多处理 **100 份**（P4a 主控裁决），超出部分 defer 到下一轮：stdout 会说明，重跑同一命令续补（RESUME 语义，幂等）。
 - `--reset`：仅用户明确要求"从头重来"时加。
-- `--apply-vision-patch <补丁.json>`（P4a，**agent 多模态兜底通道**）：本机读不出文字的文件（chain 终态 `no_text_layer`，即非 macOS 或 Vision OCR 失败/不可信）不再判死——entry 记 `parse_status="needs_agent_vision"`，stdout 打印一行 `VISION_NEEDED: <绝对路径1> <绝对路径2> ...`（清单同时进 `intake_report.json` 的 `vision_needed_files`）。agent **一轮**多模态读完全部列出文件，按补丁 schema（`{"<文件绝对路径>": {"text": "...", "fields_draft": {...}, "confidence": 0.0, "notes": "..."}}`，逐字定义见 [HOTPATH.md](HOTPATH.md)）Write 补丁 json，**重跑同一命令**加本参数。合并规则（FieldMerger）：先对 `patch.text` 跑正则抽取，**regex 有值的字段用 regex，regex 为空才取 `fields_draft`**；取自草稿的字段打 `field_source="agent_vision"` 并追加进该候选人 `needs_review`（回合 2 用 evidence 原文复核）；`patch.text` 写入简历全文并记 `backend="agent_vision"`。**agent 只产出结构化补丁，绝不写库**——写库仍走脚本正常查重/护栏/回读；补丁没覆盖的文件维持失败清单语义（如实告知，不硬造）。
-- **20% 闸门（用户拍板，P4a）**：`needs_agent_vision` 份数 / 总份数 > 0.20 → 疑似整批格式问题，脚本**不写任何记录**，stdout 业务话提示「本批 X/Y 份读不出文字，超过 20% 阈值，疑似整批格式问题，请确认后重试或提供文字版」并列出名单，退出码 0、报告 `ok=true`、`partial=true`、`reason="vision_gate"`。agent 此时不走补丁协议，把业务话转给用户确认。`RECRUIT_NO_VISION=1` 为**仅测试用**环境变量（Vision OCR 梯队恒不受理，用于演练兜底通道），生产不设置。
-- 脚本内部完成：提取文本（**macOS 上扫描件/图片简历自动走系统自带 Vision OCR 救回**：零 pip 依赖、纯本地不出网、多份并行 ≤4、单份约 1.2~1.6s；OCR 文本必须过「水印/重复串/数字字符数」护栏，不可信则如实报失败，绝不假成功。**首次运行可能触发 macOS TCC 授权弹窗**，需用户点一次允许）→ 正则预抽字段 → 去重（本批内/checkpoint/库内附件**一律真 MD5**：库内比对键 = 简历库「附件内容MD5」字段，附件上传成功后由脚本写入；内容相同（换文件名也算）→ 判重复跳过，同名同大小但内容不同 → **不判重复**、按简历新版本走覆盖更新并在清单说明；老库没有该字段则自动回退「文件名+字节大小」并告警说明未启用内容级去重与如何启用，不崩溃、不自建字段）→ 一次批量查重（手机号主键）→ 批量写简历库（≤100 条/次，命中即覆盖更新）→ 技能标签只增不删补选项 → 期望地点兜底「不限」→ 并发上传附件（原始文件名）→ 写后回读。
+- `--apply-vision-patch <补丁.json>`（P4a，**agent 多模态兜底通道**）：本机读不出文字的文件（chain 终态 `no_text_layer`，即非 macOS 或 Vision OCR 失败/不可信）不再判死——entry 记 `parse_status="needs_agent_vision"`，stdout 打印一行 `VISION_NEEDED: <绝对路径1> <绝对路径2> ...`（清单同时进 `intake_report.json` 的 `vision_needed_files`）。agent **一轮**多模态读完全部列出文件，按补丁 schema（`{"<文件绝对路径>": {"text": "...", "fields_draft": {...}, "confidence": 0.0, "notes": "..."}}`，逐字定义见 [HOTPATH.md](HOTPATH.md)）Write 补丁 json，**重跑同一命令**加本参数。合并规则（FieldMerger）：先对 `patch.text` 跑正则抽取，**regex 有值的字段用 regex，regex 为空才取 `fields_draft`**；取自草稿的字段打 `field_source="agent_vision"` 并追加进该候选人 `needs_review`（回合 2 用 evidence 原文复核）；`patch.text` 写入简历全文并记 `backend="agent_vision"`。**agent 只产出结构化补丁，绝不写库**——写库仍走脚本正常查重/护栏流程（stage 6b 补传附件带 `poll_fixup_attachments` 回读；stage 7 批量 upsert 不做回读，record_id 从 upsert 响应提取）；补丁没覆盖的文件维持失败清单语义（如实告知，不硬造）。
+- **20% 闸门（用户拍板，P4a）**：本批 ≥5 份且 `needs_agent_vision` 份数 / 总份数 > 0.20 → 脚本本轮**不写任何记录**，stdout 业务话提示「本批 X/Y 份读不出文字，超过 20% 阈值 → 本轮不写任何记录」并列出名单，退出码 0、报告 `ok=true`、`partial=true`、`reason="vision_gate"`。闸门只拦本轮写入、不拦补救：`VISION_NEEDED:` 行照常打印，agent **仍走补丁协议**（一轮读完清单全部文件 → Write 补丁 json → 重跑同一命令加 `--apply-vision-patch`），重跑时补丁件即可解析、照常入库；补丁之后仍读不出的才是真正的「疑似整批格式问题」，那时再把业务话转给用户、请其提供文字版。`RECRUIT_NO_VISION=1` 为**仅测试用**环境变量（Vision OCR 梯队恒不受理，用于演练兜底通道），生产不设置。
+- 脚本内部完成：提取文本（**macOS 上扫描件/图片简历自动走系统自带 Vision OCR 救回**：零 pip 依赖、纯本地不出网、多份并行 ≤4、单份约 1.2~1.6s；OCR 文本必须过「水印/重复串/数字字符数」护栏，不可信则如实报失败，绝不假成功。**首次运行可能触发 macOS TCC 授权弹窗**，需用户点一次允许）→ 正则预抽字段 → 去重（本批内/checkpoint/库内附件**一律真 MD5**：库内比对键 = 简历库「附件内容MD5」字段，附件上传成功后由脚本写入；内容相同（换文件名也算）→ 判重复跳过，同名同大小但内容不同 → **不判重复**、按简历新版本走覆盖更新并在清单说明；老库没有该字段则自动回退「文件名+字节大小」并告警说明未启用内容级去重与如何启用，不崩溃、不自建字段）→ 一次批量查重（手机号主键）→ 批量写简历库（≤100 条/次，命中即覆盖更新）→ 技能标签只增不删补选项 → 期望地点兜底「不限」→ 并发上传附件（原始文件名）→ stage 6b 补传附件回读（`poll_fixup_attachments`）；stage 7 批量 upsert 不做回读，record_id 从 upsert 响应提取。
 - 产物：`<out-dir>/candidates.json`、`intake_report.json`、`checkpoint.json`；stdout 末行 `ARTIFACT:<绝对路径>/intake_report.json`。
 
 **产物凭证校验（D7，必做）**：读取 ARTIFACT 指向的 `intake_report.json`，确认文件存在且 `ok == true` 才能进 Turn 2。`partial == true`（有 `RESUME:` 行）→ 先重跑同一命令续跑（最多 3 次）补齐再进 Turn 2。不存在或非 ok → 重跑本步（checkpoint 幂等续跑，最多 2 次）；仍失败 → 如实告知用户失败原因与已完成部分，**禁止跳过或假装成功**。
+
+### Turn 1b —— agent 执行 dws 命令写库（emit 产出后，必做）
+
+> **dws 是宿主 shim，Python subprocess 调不了。** 只有 agent 通过 Bash 工具直接调 dws 才有效。
+
+emit 模式产出 `dws_commands.json` 后，需要执行其中的 dws 命令才能把记录和附件真正写进 AI 表格。有两条路径：
+
+**路径 A（run_pipeline.py 编排，推荐）**：`scripts/run_pipeline.py --phase emit` 会打印结构化 JSON 含所有步骤和 dws 命令，agent 按 steps 执行后跑 `--phase replay`。
+
+**路径 B（直接调脚本）**：
+1. 从 `dws_commands.json` 提取 upsert 命令，agent 通过 Bash 执行 → 记录写进表格
+2. `scripts/upload_attachments.py --phase prepare` → 生成附件上传清单
+3. agent 逐条执行 dws attachment upload → 拿 fileToken
+4. `scripts/upload_attachments.py --phase upload` → 脚本并发 PUT OSS + 组装 update JSON
+5. agent 执行 dws record update → 附件写回表格
+6. `scripts/upload_attachments.py --phase verify` → 验证
+
+详见 `AGENTS.md`（插件根目录）。
 
 ### Turn 2 —— agent 审阅与复核（不动表格，只读产物）
 
@@ -96,4 +114,4 @@ py -3 scripts\intake_resume.py --config <config.json绝对路径> --files <文�
 
 ## If Connectors Available
 
-数据表格（钉钉 AI 表格）已连（默认）→ 脚本直接批量落库。未连或 `dws` 未登录 → 脚本会失败并给出原因；此时只输出解析后的结构化草案，提示用户先在「设置 → 连接器」开启并授权钉钉。机器缺 python 运行时 → 引导安装 Python 3 后重跑（自检：`python3 -V && dws aitable base list --limit 1`）。
+数据表格（钉钉 AI 表格）已连（默认）→ 脚本直接批量落库。未连或 `dws` 未登录 → 脚本会失败并给出原因；此时只输出解析后的结构化草案，提示用户先在「设置 → 连接器」开启并授权钉钉。机器缺 python 运行时 → 引导安装 Python 3 后重跑（自检两条命令，**分开执行、不要用 `&&` 串**：PowerShell 5.1 不认 `&&`，Windows 用户粘进去直接报「标记"&&"不是此版本中的有效语句分隔符」；① `python3 -c "import sys;assert sys.version_info[:2]>=(3,9),sys.version;print(sys.version)"` 查版本界，要求 Python **3.9+**、低于 3.9 当场抛 AssertionError 而不会拖到 import 才炸；② `dws aitable base list --limit 1` 查登录态；Windows 把 `python3` 换成 `py -3`，**不要用裸 `python`**，可能是 Microsoft Store 别名、静默失败退出码 49）。

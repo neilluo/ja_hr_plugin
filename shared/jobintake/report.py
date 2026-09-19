@@ -1,20 +1,14 @@
 # -*- coding: utf-8 -*-
-"""JobReport：intake_job 报告统计判定 + 组装 + 产物落盘 + 兜底产物（P9b）。
+"""JobReport：intake_job 报告统计判定 + 组装 + 产物落盘 + 兜底产物。
 
-收拢原脚本 run() 尾段（1222–1275）与两条兜底路径（config 失败 1204–1213、
-main() 异常兜底 1312–1331）。红线（裁判 REPORT/DRAFT/RAWBYTES 面）：
-
-  * report 是 **8 键**（ok/elapsed_ms/dws_calls/turns_saved_estimate/rows/summary/
-    warnings/retry_count），A 侧 14 键——**不得互相补齐**（P6 分析 §5.6）。
-  * summary 从 rows **重算**（不是累加值直传）；`if mode == "turn1"` 才从
-    draft.jobs 重算 attachment 两项 → **apply 模式 attachment_uploaded/failed
-    恒为 0** 是既有行为，禁止「顺手修好」（P6 分析 §3.2 D13）。
+  * report 是 8 键（ok/elapsed_ms/dws_calls/turns_saved_estimate/rows/summary/
+    warnings/retry_count）。
+  * summary 从 rows 重算；apply 模式 attachment_uploaded/failed 恒为 0。
   * draft 收尾三步顺序：draft["report"] = report → draft["ok"] = … →
-    `pop("_warnings")` **只在 turn1**；apply 模式 draft 根本不落盘。
-  * `ok = rc == 0 and bool(rows)`——B 的 turn1 内层 rc **不含** bool(rows)
-    （rows 判定只在外层这一处），与 A 侧口径不同，不得对齐（P6 分析 §5.4）。
-  * tbl.warnings 合并是**保序去重**（`if w not in warnings`），不是 set()。
-  * 两条兜底报告的键序/文案/`ARTIFACT:` 行逐字；异常兜底自身失败 → 静默吞掉
+    pop("_warnings") 只在 turn1；apply 模式 draft 不落盘。
+  * ok = rc == 0 and bool(rows)。
+  * tbl.warnings 合并是保序去重（if w not in warnings），不是 set()。
+  * 两条兜底报告的键序/文案/ARTIFACT: 行逐字；异常兜底自身失败 → 静默吞掉
     （except Exception: pass）后仍 traceback.print_exc() + return 1。
 """
 
@@ -28,6 +22,7 @@ from typing import Any, Dict, List, Optional
 from aitable.client import now_iso                  # noqa: E402
 from jobintake.constants import NEW_TURNS, OLD_TURNS_PER_FILE
 from jobintake.textutil import new_batch_id, write_json
+from runtime_compat import default_out_root
 
 __all__ = ["JobReport"]
 
@@ -45,7 +40,7 @@ class JobReport:
 
     @staticmethod
     def merge_table_warnings(warnings: List[str], tbl_warnings: List[str]) -> None:
-        """tbl.warnings 保序去重合并（位置在 report 组装之后、落盘之前，原 945–947/1169–1171）。"""
+        """tbl.warnings 保序去重合并（位置在 report 组装之后、落盘之前）。"""
         for w in tbl_warnings:
             if w not in warnings:
                 warnings.append(w)
@@ -76,7 +71,7 @@ class JobReport:
                   "rows": rows, "summary": summary, "warnings": warnings,
                   "retry_count": self.counter.retries}
         draft["report"] = report
-        # 契约 v3 §9#2：所有产物统一 D7 凭证口径「文件存在 且 ok==true」→ jobs_draft 顶层也带 ok
+        # 所有产物统一凭证口径「文件存在 且 ok==true」→ jobs_draft 顶层也带 ok
         draft["ok"] = bool(report.get("ok"))
 
         write_json(self.report_path, report)
@@ -100,8 +95,7 @@ class JobReport:
         return 0 if report["ok"] else 1
 
     def write_config_failure(self, exc: Exception) -> int:
-        """AITable 装配失败：直接写报告 + ARTIFACT: + return 1（B 侧策略；A 侧是
-        fatal 后继续跑完——两侧刻意不同，不统一）。"""
+        """AITable 装配失败：直接写报告 + ARTIFACT: + return 1。"""
         write_json(self.report_path, {
             "ok": False, "elapsed_ms": int((time.monotonic() - self.t_start) * 1000),
             "dws_calls": self.counter.calls, "turns_saved_estimate": 0,
@@ -115,10 +109,10 @@ class JobReport:
 
     @staticmethod
     def crash_artifact(args: Any, exc: Exception, console: Any) -> int:
-        """main() 异常兜底产物（契约 D7：绝不静默早退）。只依赖 args——Pipeline
+        """main() 异常兜底产物（绝不静默早退）。只依赖 args——Pipeline
         构造失败时也要能走通，故为 staticmethod。"""
         out_dir: Optional[Path] = Path(args.out_dir).expanduser().resolve() if args.out_dir else \
-            Path("/tmp/recruit-fast") / (args.batch_id or new_batch_id())
+            default_out_root() / (args.batch_id or new_batch_id())
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
             names = [Path(f).name for f in (args.files or [])] or [str(args.apply or "")]

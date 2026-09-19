@@ -1,33 +1,15 @@
 # -*- coding: utf-8 -*-
-"""apply 编排（ApplyOrchestrator）：原 apply_decisions.apply（L575-994，420 行
-上帝函数）的 8 步分解。原代码的编号注释（L594/625/683/739/753/881/908/943）就是
-阶段切分线；跨阶段局部量提升为实例属性（沿 P7 IntakePipeline / P8 DigestBuilder
-黑板手法），每个阶段方法与原代码块**逐字**对应。
+"""apply 编排（ApplyOrchestrator）：apply() 的 8 步分解。
 
     _load_inputs()        1. 读 decisions / digest + config→AITable（dry-run 时 table=None）
-    _verify_decisions()   2. 先校验（不通过就不写库，契约 D6）；含无 digest 的两条降级路径
+    _verify_decisions()   2. 先校验（不通过就不写库）；含无 digest 的两条降级路径
     _merge_context()      索引构建 + overrides 合入/写回 + report["overrides*"]
     _fetch_table_facts()  3. 表内事实：沟通状态（已入职铁律）+ 删旧名单
     _delete_stale()       4. 幂等：批量查旧「系统匹配」记录 → 一次批量删
     _create_records()     5. 批量建匹配记录（只建 passed 且候选人未入职的）+ 受影响岗位集合
-    _refresh_job_stats()  6. D15：岗位统计脚本重算 + 一次 batch_update 回填
-    _readback()           7. 写后必回读（D6）
+    _refresh_job_stats()  6. 岗位统计脚本重算 + 一次 batch_update 回填
+    _readback()           7. 写后必回读
     _assemble_report()    8. 用户可读清单 + summary/job_stats/readback 组装 + ok 判定
-
-红线（原样保留）：
-  * `warnings is report["warnings"]` 的**单一 sink 别名**（原 L589-592 注释：第一版
-    漏了别名导致 report.warnings 恒空，违反 D6「失败可见」）；
-  * report 顶层键插入序与条件插入点（overrides/overrides_writeback/verify_problems/
-    turns_saved_estimate/skipped_invalid/dws_stats/readback/delete/create/stat_update
-    → _finish 追加 exit_code/python/_report_path）= 字节面，逐字保留；
-  * `--sem-*`/`--no-semantic-guards` 在 apply 路径**不可达**（原 L646 只传
-    (digest, decisions, check_coverage=…)）——现有 API 面不对称，不显式授权不修；
-  * dry-run 时 table=None、dws_calls=0（全部表操作分支短路）。
-
-依赖注入（入口装配）：verify_fn = verify_decisions 入口薄壳（同进程复用同一个
-verify()，且让入口 `_recommend_of` 锚点行为支配 apply 路径）；job_parser =
-match.jobparse.JobRecordParser（入口按 _LateBoundExtractor 接线）；create_chunk =
-入口 CREATE_CHUNK（裁判篡改自证 apply_chunk 的定位锚点在入口）。
 """
 
 import json
@@ -41,9 +23,9 @@ from aitable.table import AITable
 
 from match.applyreport import ApplyReportBuilder
 from match.applyvalues import as_list, as_text, join_list, _now
-from match.constants import COMM_STATUS_ONBOARDED
+from match.match_basics import COMM_STATUS_ONBOARDED
 from match.decisionctx import DecisionContextBuilder, resolve_job
-from match.jsonio import dump_json_doc, load_json
+from match.match_basics import dump_json_doc, load_json
 from match.matchgate import MatchTableGateway
 from match.overrides import OVERRIDE_WRITEBACK_MAP, OverrideMerger
 from match.recordfactory import MatchRecordFactory
@@ -55,7 +37,8 @@ class ApplyOrchestrator:
     def __init__(self, config_path: str, decisions_path: str, out_dir: str,
                  digest_path: Optional[str] = None, dry_run: bool = False,
                  batch_id: Optional[str] = None, create_chunk: int = 100,
-                 job_parser: Any = None, verify_fn: Any = None):
+                 job_parser: Any = None, verify_fn: Any = None,
+                 replay_path: Optional[str] = None):
         self.config_path = config_path
         self.decisions_path = decisions_path
         self.out_dir = out_dir
@@ -63,6 +46,7 @@ class ApplyOrchestrator:
         self.dry_run = dry_run
         self.batch_id = batch_id
         self.create_chunk = create_chunk
+        self.replay_path = replay_path
         self.ctx = DecisionContextBuilder(job_parser)
         self.merger = OverrideMerger()
         self.factory = MatchRecordFactory()
@@ -84,8 +68,7 @@ class ApplyOrchestrator:
             "verify": None, "job_stats": {}, "errors": [],
         }
         # ⚠️ 让 warnings 与 report["warnings"] 是**同一个 list 对象**：
-        #    本流程有多条提前 return 的失败路径，逐个赋值容易漏（第一版就漏了，
-        #    结果 apply_report.json 里 warnings 恒为空，违反契约 D6「失败可见」）。
+        #    本流程有多条提前 return 的失败路径，逐个赋值容易漏。
         self.warnings: List[str] = self.report["warnings"]
 
         for stage in (self._load_inputs, self._verify_decisions, self._merge_context,
@@ -128,7 +111,10 @@ class ApplyOrchestrator:
         self.table = None
         if not self.dry_run:
             try:
-                self.table = AITable(self.config_path)
+                # 两阶段模式：DwsClient 自动检测模式（replay_path → replay，否则 emit）
+                from aitable.client import DwsClient
+                client = DwsClient(replay_path=self.replay_path)
+                self.table = AITable(self.config_path, client=client)
             except Exception as exc:                          # config 坏 → 直接失败，别猜
                 report["errors"].append("打不开 config.json：%s" % exc)
                 self._finish(1)
@@ -138,7 +124,7 @@ class ApplyOrchestrator:
         return True
 
     def _verify_decisions(self) -> bool:
-        """2. 先校验（不通过就不写库，契约 D6）。"""
+        """2. 先校验（不通过就不写库）。"""
         report, warnings = self.report, self.warnings
         check_coverage = True
         if self.digest is None and self.table is not None:
@@ -166,7 +152,7 @@ class ApplyOrchestrator:
         for w in vres.get("warnings") or []:
             warnings.append("verify[%s] %s: %s" % (w["code"], w["key"], w["detail"]))
         if not vres.get("ok"):
-            report["errors"] = ["verify 不通过（%d 个问题），按契约 D6 **不写库**" % len(vres["errors"])]
+            report["errors"] = ["verify 不通过（%d 个问题），**不写库**" % len(vres["errors"])]
             report["errors"] += ["%s | %s | %s" % (e["code"], e["key"], e["detail"])
                                  for e in vres["errors"]]
             report["verify_problems"] = vres["errors"]
@@ -184,7 +170,7 @@ class ApplyOrchestrator:
         if self.n_ovr:
             warnings.append("已合入 %d 处 candidate_overrides（组织/分类/期望地点/工作年限复核/"
                             "技能补充/证书补充）" % self.n_ovr)
-        # override 明细进报告（含 org_reason，dry-run 也记录 → 契约 v3 §9#1 的凭证）
+        # override 明细进报告（含 org_reason，dry-run 也记录）
         cand_index = self.cand_index
         report["overrides"] = [
             {"candidate_key": ck,
@@ -195,7 +181,7 @@ class ApplyOrchestrator:
             for ck in sorted(cand_index)
             if cand_index[ck].get("_override_changes") or cand_index[ck].get("org_override_reason")]
         if self.n_ovr and self.table is not None:
-            # D13/D14：修正必须持久化到简历库（表是唯一事实源）；失败只进 warnings（D6 可见）
+            # 修正必须持久化到简历库（表是唯一事实源）；失败只进 warnings
             report["overrides_writeback"] = self.gw.writeback_overrides(cand_index, warnings)
         elif self.n_ovr and self.dry_run:
             report["overrides_writeback"] = {"skipped": "dry-run 不写库；实跑时会把上述修正写回简历库"}
@@ -222,8 +208,8 @@ class ApplyOrchestrator:
                 if cells:
                     self.table_cells[ck] = cells
                     c.setdefault("name", as_text(cells.get("name")) or c.get("name"))
-            # override 修正值优先于刚读回的表值：写回简历库与本次查询之间可能有传播延迟
-            # （契约 §10 R2），读到的可能是写回前的旧值 → 以 agent 修正值为准。
+            # override 修正值优先于刚读回的表值：写回简历库与本次查询之间可能有传播延迟，
+            # 读到的可能是写回前的旧值 → 以 agent 修正值为准。
             for ck, c in cand_index.items():
                 ch = c.get("_override_changes") or {}
                 if ch and ck in self.table_cells:
@@ -262,7 +248,7 @@ class ApplyOrchestrator:
         self.excluded_onboarded_names = excluded_onboarded_names
         self.names_for_delete = sorted(set(names) | set(excluded_onboarded_names))
         if self.table is not None and not names and self.ctx.rows_needed(self.decisions):
-            # 没姓名就没法定位本批候选人做「删旧建新」→ 宁可不写也不写出重复记录（D6 失败可见）
+            # 没姓名就没法定位本批候选人做「删旧建新」→ 宁可不写也不写出重复记录
             report["errors"].append(
                 "无法定位本批候选人（decisions 里没有姓名，且没传 --digest 拿不到候选人档案）→ "
                 "幂等「删旧建新」无法保证，拒绝写库。请加 --digest <digest.json> 重跑")
@@ -306,7 +292,7 @@ class ApplyOrchestrator:
             jk = str(p.get("job_key"))
             a = self.audit.get((ck, jk))
             if not a or not a.get("valid"):
-                # D16：命中项越界（编造）→ 该条无效，不建记录；D6：必须可见，进 warnings 与清单
+                # 命中项越界（编造）→ 该条无效，不建记录；必须可见，进 warnings 与清单
                 self.skipped_invalid.append({
                     "candidate_key": ck, "job_key": jk,
                     "candidate_name": (cand_index.get(ck) or {}).get("name"),
@@ -338,15 +324,10 @@ class ApplyOrchestrator:
             if jid and jid not in self.affected_job_ids:
                 self.affected_job_ids.append(jid)
 
-        # 缺陷3 修复（W-F S9 实测，2026-09-17）：**受本批影响的岗位**不止「建了记录/删了旧记录」
-        # 的岗位，还包括「本批对它做过判定但一个达标者都没有」的零匹配岗位。这类岗位此前
-        # 不进 affected_job_ids → 四个统计字段（候选人总数/推荐数/待定数/不推荐数）留空，
-        # recruit-dashboard 的「待补/标红」逻辑分不清"还没算"和"算出来是 0"。
-        # 现在把 decisions 里 passed/rejected 引用到的岗位全部算作受影响：
-        # 即使重算结果四个数字都是 0，也**显式写入 0**（recompute_job_stats 对查不到
-        # 匹配记录的岗位返回全 0，stat_updates 会原样回填并回读校验）。
-        # 边界：只动 decisions 引用到的岗位（= 与本批判定相关），digest 里没有被本批
-        # 判定触及的岗位（如其它组织的岗位）不写，避免无谓写调用与权限风险。
+        # **受本批影响的岗位**不止「建了记录/删了旧记录」的岗位，
+        # 还包括「本批对它做过判定但一个达标者都没有」的零匹配岗位。这类岗位
+        # 四个统计字段需要显式写入 0，避免分不清"还没算"和"算出来是 0"。
+        # 边界：只动 decisions 引用到的岗位（= 与本批判定相关）。
         for p in self.passed:
             job_r = resolve_job(job_index, p, str(p.get("job_key")))
             jid_r = as_text((job_r or {}).get("job_id")).strip()
@@ -368,7 +349,7 @@ class ApplyOrchestrator:
         return True
 
     def _refresh_job_stats(self) -> bool:
-        """6. D15：岗位统计脚本重算 + 一次 batch_update 回填。"""
+        """6. 岗位统计脚本重算 + 一次 batch_update 回填。"""
         warnings = self.warnings
         self.stats: Dict[str, Dict[str, int]] = {}
         self.stat_update_res: Dict[str, Any] = {"updated": 0, "failed": [], "dws_calls": 0}
@@ -398,7 +379,7 @@ class ApplyOrchestrator:
         return True
 
     def _readback(self) -> bool:
-        """7. 写后必回读（D6）。"""
+        """7. 写后必回读。"""
         warnings = self.warnings
         self.rb_match: Dict[str, Any] = {}
         self.rb_job: Dict[str, Any] = {}
@@ -444,7 +425,7 @@ class ApplyOrchestrator:
                                for jid, s in sorted(self.stats.items())}
         report["skipped_invalid"] = self.skipped_invalid
         for si in self.skipped_invalid:
-            warnings.append("未建记录（D16 命中项越界）：%s × %s ｜%s ｜越界项=%s"
+            warnings.append("未建记录（命中项越界）：%s × %s ｜%s ｜越界项=%s"
                             % (si.get("candidate_name"), si.get("job_name"), si.get("reason"),
                                json.dumps(si.get("fabricated_hits"), ensure_ascii=False)[:200]))
         report["dws_calls"] = self.table.dws_calls if self.table is not None else 0
@@ -479,7 +460,10 @@ class ApplyOrchestrator:
         path = self.outdir / "apply_report.json"
         tmp = self.outdir / ("apply_report.json.tmp-%d" % int(time.time() * 1000))
         dump_json_doc(report, tmp)
-        tmp.replace(path)                                 # 原子落盘（D7：产物必须存在且完整）
+        tmp.replace(path)                                 # 原子落盘（产物必须存在且完整）
+        # 暴露 DwsClient 引用给 main()，以便 emit 模式写 dws_commands.json
+        # （放在 dump_json_doc 之后，避免 DwsClient 对象进 JSON 报告）
+        report["_dws_client"] = self.table.client if self.table is not None else None
         # abspath 而非 resolve()：macOS 上 /tmp 是 /private/tmp 的符号链接，
         # resolve() 会让 ARTIFACT 行跟用户传进来的 --out-dir 长得不一样。
         report["_report_path"] = os.path.abspath(str(path))

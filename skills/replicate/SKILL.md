@@ -7,7 +7,7 @@ name_zh: 复刻部署
 description_en: Build the 招聘筛选 four-table base in a new org from standard schema, then backfill config.json (single ID source for scripts) and system-config.md.
 description_zh: 在新组织按标准表结构搭建「招聘筛选」四表，再反查真实 ID 生成 config.json（脚本唯一 ID 源）并同步 system-config.md 人读视图；各机器各自一份 config.json，互不污染。
 user-invocable: true
-argument-hint: 说"在新组织复刻一套招聘系统"
+argument-hint: Say "replicate the recruitment system in a new org"
 argument-hint-en: Say "replicate the recruitment system in a new org"
 argument-hint-zh: 说"在新组织复刻一套招聘系统"
 ---
@@ -26,7 +26,7 @@ argument-hint-zh: 说"在新组织复刻一套招聘系统"
 
 - 确认部署目标是用户自己的钉钉组织 + 钉钉 AI 表格；连接器授权组织、`dws` 登录态与目标 Base 同一组织（授权哪个组织读写的就是哪个组织的表）。
 - 对齐组织分类取值（默认 职能中心/制造中心，可按新组织改名，但**岗位表/简历库/匹配表三处必须一致**）。
-- 自检运行时：`python3 -V && dws aitable base list --limit 1`（Windows 用 `py -3 -V && ...`；裸 `python` 别名可能静默失败、退出码 49）。缺 python 先引导安装（脚本兼容 3.9~3.14，零第三方 pip 依赖）。
+- 自检运行时（两条命令，**分开执行、不要用 `&&` 串**：PowerShell 5.1 不认 `&&`，Windows 用户粘进去直接报「标记"&&"不是此版本中的有效语句分隔符」）：① `python3 -c "import sys;assert sys.version_info[:2]>=(3,9),sys.version;print(sys.version)"` 查版本界（要求 Python **3.9+**，低于 3.9 当场抛 AssertionError，不会拖到 import 才炸）；② `dws aitable base list --limit 1` 查登录态。Windows 把 `python3` 换成 `py -3`，**不要用裸 `python`**（别名可能静默失败、退出码 49）。缺 python 或版本越界先引导安装（脚本兼容 3.9+，零第三方 pip 依赖）。
 
 ### ② 搭 Base 与四表（标准结构见下）
 
