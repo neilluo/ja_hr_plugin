@@ -26,6 +26,12 @@ from jobintake.report import JobReport                 # noqa: E402
 from jobintake.table_gateway import JobTableGateway    # noqa: E402
 from jobintake.textutil import clean, new_batch_id     # noqa: E402
 from runtime_compat import default_out_root            # noqa: E402
+from performance_timing import (                       # noqa: E402
+    append_events,
+    child_timing_enabled,
+    start_run,
+    timeline_exists,
+)
 
 from pipeline_base import PipelineBase                   # noqa: E402
 
@@ -78,6 +84,7 @@ class JobPipeline(PipelineBase):
         self.meta: List[Dict[str, Any]] = []
         self.granularity_items: List[Tuple[str, Any, Any]] = []
         self.res: Dict[str, Any] = {}
+        self.stage_timings: List[Dict[str, Any]] = []
 
     # ------------------------------------------------------------------ #
     # CLI 校验（main() 的两条 rc=2 路径，顺序即优先级）
@@ -96,11 +103,40 @@ class JobPipeline(PipelineBase):
         """当前 dws 调用计数（jobintake 侧：self.counter.calls）。"""
         return self.counter.calls
 
+    def _persist_performance(self, run_started_ms: int, returncode: int) -> None:
+        """旁路落盘本次岗位流水线阶段耗时，不进入任何业务判断。"""
+        if self.out_dir is None:
+            return
+        run_finished_ms = int(time.time() * 1000)
+        is_child = child_timing_enabled()
+        if not is_child and (not self.is_replay or not timeline_exists(self.out_dir)):
+            start_run(self.out_dir, "job", "intake_job", run_started_ms)
+        events = [{
+            "name": "job.%s" % stage["name"],
+            "category": "intake_stage",
+            "started_at_ms": stage["started_at_ms"],
+            "finished_at_ms": stage["finished_at_ms"],
+            "elapsed_ms": stage["elapsed_ms"],
+            "dws_calls": stage["dws_calls"],
+        } for stage in self.stage_timings]
+        if not is_child:
+            events.append({
+                "name": "intake_job_%s" % ("replay" if self.is_replay else "emit"),
+                "category": "orchestrator_local",
+                "started_at_ms": run_started_ms,
+                "finished_at_ms": run_finished_ms,
+                "dws_calls": self._safe_calls(),
+                "metadata": {"returncode": returncode, "mode": self.mode},
+            })
+        append_events(self.out_dir, events)
+
     # ------------------------------------------------------------------ #
     # 装配 + 调度
     # ------------------------------------------------------------------ #
     def run(self) -> int:
         args = self.args
+        run_started_ms = int(time.time() * 1000)
+        self.stage_timings = []
         self.t_start = time.monotonic()
         self.batch_id = args.batch_id or new_batch_id()
         out_dir = Path(args.out_dir).expanduser() if args.out_dir else \
@@ -126,7 +162,9 @@ class JobPipeline(PipelineBase):
         try:
             tbl = AITable(args.config, client=self.client)
         except Exception as exc:
-            return self.report.write_config_failure(exc)
+            rc_failure = self.report.write_config_failure(exc)
+            self._persist_performance(run_started_ms, rc_failure)
+            return rc_failure
         self.console.base_info(tbl.base_name, tbl.base_id,
                                tbl.table_name("job"), tbl.table_id("job"))
         self.gateway = JobTableGateway(tbl, self.counter)
@@ -144,6 +182,7 @@ class JobPipeline(PipelineBase):
             self.client.write_emit_file(str(emit_path))
             print("emit 模式：%d 条 dws 命令已写入 %s" %
                   (len(self.client.emit_commands()), emit_path))
+        self._persist_performance(run_started_ms, rc_final)
         return rc_final
 
     # ------------------------------------------------------------------ #
@@ -162,16 +201,16 @@ class JobPipeline(PipelineBase):
         self.have = set(self.gateway.field_keys("job"))
         self.known_locs = self.gateway.known_location_options()
 
-        self.turn1_extract()
-        self.turn1_scan()
-        self.turn1_dedupe()
-        self.turn1_ensure_options()
-        self.turn1_build_rows()
-        self.turn1_upload()
-        self.turn1_write()
-        self.turn1_readback()
-        self.turn1_assemble()
-        return self.turn1_finalize()
+        self._run_named_stage("turn1_extract", self.turn1_extract)
+        self._run_named_stage("turn1_scan", self.turn1_scan)
+        self._run_named_stage("turn1_dedupe", self.turn1_dedupe)
+        self._run_named_stage("turn1_ensure_options", self.turn1_ensure_options)
+        self._run_named_stage("turn1_build_rows", self.turn1_build_rows)
+        self._run_named_stage("turn1_upload", self.turn1_upload)
+        self._run_named_stage("turn1_write", self.turn1_write)
+        self._run_named_stage("turn1_readback", self.turn1_readback)
+        self._run_named_stage("turn1_assemble", self.turn1_assemble)
+        return self._run_named_stage("turn1_finalize", self.turn1_finalize)
 
     def turn1_extract(self) -> None:
         """阶段 1：提取 + 正则预填（纯本地）。"""
@@ -487,11 +526,11 @@ class JobPipeline(PipelineBase):
             items = []
             self.warnings.append("jobs_final.json 里没有 jobs 数组，无可应用项")
 
-        self.apply_lookup(items)
-        self.apply_build(items)
-        self.apply_guards()
-        self.apply_write()
-        return self.apply_finalize(path)
+        self._run_named_stage("apply_lookup", lambda: self.apply_lookup(items))
+        self._run_named_stage("apply_build", lambda: self.apply_build(items))
+        self._run_named_stage("apply_guards", self.apply_guards)
+        self._run_named_stage("apply_write", self.apply_write)
+        return self._run_named_stage("apply_finalize", lambda: self.apply_finalize(path))
 
     def apply_lookup(self, items: List[Dict[str, Any]]) -> None:
         """需要时用一次 filter 查询把 job_name → record_id 补齐。"""

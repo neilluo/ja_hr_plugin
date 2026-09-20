@@ -45,8 +45,21 @@ import argparse
 import json
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PLUGIN_ROOT = SCRIPT_DIR.parent
+SHARED_DIR = str(PLUGIN_ROOT / "shared")
+if SHARED_DIR not in sys.path:
+    sys.path.insert(0, SHARED_DIR)
+
+from performance_timing import (  # noqa: E402
+    TIMING_FILE_NAME,
+    append_event_and_observe,
+    read_summary,
+)
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -94,6 +107,13 @@ def extract_flag_value(argv: List[str], flag: str) -> Optional[str]:
 # 读取 dws 输出文件
 # ---------------------------------------------------------------------------
 
+def _measured_elapsed(data: Dict[str, Any]) -> Tuple[int, bool]:
+    value = data.get("elapsed_ms")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return 0, False
+    return int(value), True
+
+
 def read_dws_output(file_path: Path) -> Optional[Dict[str, Any]]:
     """读取 agent 写入的 dws 输出文件，支持多种格式。
 
@@ -125,16 +145,19 @@ def read_dws_output(file_path: Path) -> Optional[Dict[str, Any]]:
             "stdout": raw,
             "stderr": "",
             "elapsed_ms": 0,
+            "elapsed_measured": False,
         }
 
     # 方式 B: 包装格式
     if isinstance(data, dict) and ("returncode" in data or "stdout" in data):
-        # 确保有必要字段存在
+        # 确保有必要字段存在；elapsed_ms 只有合法非负数才算真实测量
+        elapsed_ms, elapsed_measured = _measured_elapsed(data)
         return {
             "returncode": data.get("returncode", 0),
             "stdout": data.get("stdout", raw if isinstance(raw, str) else json.dumps(data)),
             "stderr": data.get("stderr", ""),
-            "elapsed_ms": data.get("elapsed_ms", 0),
+            "elapsed_ms": elapsed_ms,
+            "elapsed_measured": elapsed_measured,
         }
 
     # 方式 A: dws 完整输出 {status:success, data:{...}}
@@ -144,6 +167,7 @@ def read_dws_output(file_path: Path) -> Optional[Dict[str, Any]]:
             "stdout": raw,
             "stderr": "",
             "elapsed_ms": 0,
+            "elapsed_measured": False,
         }
 
     # 方式 C: 纯 data（如 {fileToken:"ft_xxx", uploadUrl:"..."}）
@@ -155,6 +179,7 @@ def read_dws_output(file_path: Path) -> Optional[Dict[str, Any]]:
         "stdout": json.dumps(wrapped, ensure_ascii=False),
         "stderr": "",
         "elapsed_ms": 0,
+        "elapsed_measured": False,
     }
 
 
@@ -189,7 +214,8 @@ def parse_attachment_token(stdout_str: str) -> Optional[Tuple[str, str]]:
 # ---------------------------------------------------------------------------
 
 def build_token_map(commands: List[Dict[str, Any]],
-                    results_dir: Path) -> Dict[str, str]:
+                    results_dir: Path,
+                    result_reader: Any = read_dws_output) -> Dict[str, str]:
     """构建 {fake_token -> real_token} 映射。
 
     附件上传命令的 fake_token 格式为 emit_fake_token_<seq>。
@@ -210,7 +236,7 @@ def build_token_map(commands: List[Dict[str, Any]],
 
         # 读取 dws 输出
         result_file = results_dir / ("dws_out_%d.json" % seq)
-        result = read_dws_output(result_file)
+        result = result_reader(result_file)
         if result is None:
             print("[build_replay] 警告: 附件上传结果缺失: %s" % result_file.name,
                   file=sys.stderr)
@@ -294,12 +320,43 @@ def main() -> int:
     commands_path = Path(args.commands)
     results_dir = Path(args.results_dir)
     out_path = Path(args.out)
+    started_at_ms = int(time.time() * 1000)
+    commands: List[Dict[str, Any]] = []
+    result_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+
+    def cached_read(path: Path) -> Optional[Dict[str, Any]]:
+        key = str(path)
+        if key not in result_cache:
+            result_cache[key] = read_dws_output(path)
+        return result_cache[key]
+
+    def finish_timing(returncode: int) -> int:
+        finished_at_ms = int(time.time() * 1000)
+        observed_commands = []
+        for command in commands:
+            tagged = dict(command)
+            tagged["command_type"] = classify_command(command.get("argv") or [])
+            observed_commands.append(tagged)
+        append_event_and_observe(
+            results_dir,
+            {"name": "build_replay", "category": "orchestrator_local",
+             "started_at_ms": started_at_ms, "finished_at_ms": finished_at_ms,
+             "metadata": {"returncode": returncode}},
+            observed_commands,
+            cached_read,
+        )
+        timing_path = results_dir.resolve() / TIMING_FILE_NAME
+        print("PERFORMANCE:%s" % timing_path, file=sys.stderr)
+        print("[performance] %s" % json.dumps(read_summary(results_dir),
+                                                ensure_ascii=False),
+              file=sys.stderr)
+        return returncode
 
     # --- 1. 读取 dws_commands.json ---
     if not commands_path.exists():
         print("[build_replay] dws_commands.json 不存在: %s" % commands_path,
               file=sys.stderr)
-        return 1
+        return finish_timing(1)
 
     with open(commands_path, encoding="utf-8") as f:
         cmd_data = json.load(f)
@@ -309,10 +366,10 @@ def main() -> int:
         print("[build_replay] 没有命令", file=sys.stderr)
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump({"results": []}, f, ensure_ascii=False, indent=2)
-        return 0
+        return finish_timing(0)
 
     # --- 2. 构建 token map（附件上传 → 真实 token）---
-    token_map = build_token_map(commands, results_dir)
+    token_map = build_token_map(commands, results_dir, cached_read)
     if token_map:
         print("[build_replay] token_map (%d 个):" % len(token_map), file=sys.stderr)
         for k, v in token_map.items():
@@ -404,7 +461,7 @@ def main() -> int:
         # 跳过记录命令（upsert/create/update）— 检查是否已执行
         if cmd_type in RECORDS_CMD_TYPES:
             rc_result_file = results_dir / ("dws_out_%d.json" % seq)
-            result = read_dws_output(rc_result_file)
+            result = cached_read(rc_result_file)
             if result is not None:
                 # 记录命令已执行
                 for rc_info in rc_info_list:
@@ -425,7 +482,7 @@ def main() -> int:
 
         # 其他命令
         result_file = results_dir / ("dws_out_%d.json" % seq)
-        result = read_dws_output(result_file)
+        result = cached_read(result_file)
         if result is None:
             missing_seqs.append(seq)
             continue
@@ -492,7 +549,7 @@ def main() -> int:
             "results_file": str(out_path),
         }, ensure_ascii=False, indent=2))
 
-    return 0
+    return finish_timing(0)
 
 
 if __name__ == "__main__":
