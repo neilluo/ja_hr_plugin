@@ -40,6 +40,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -49,6 +50,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PLUGIN_ROOT = SCRIPT_DIR.parent
+SHARED_DIR = str(PLUGIN_ROOT / "shared")
+if SHARED_DIR not in sys.path:
+    sys.path.insert(0, SHARED_DIR)
+
+from performance_timing import (  # noqa: E402
+    TIMING_FILE_NAME,
+    append_event,
+    read_summary,
+    start_run,
+)
 
 INTAKE_SCRIPTS = {
     "resume": PLUGIN_ROOT / "skills" / "resume-intake" / "scripts" / "intake_resume.py",
@@ -533,14 +544,41 @@ def main() -> int:
 
     # 确保 out_dir 存在
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
-
+    started_at_ms = int(time.time() * 1000)
     if args.phase == "emit":
-        return phase_emit(args)
-    elif args.phase == "replay":
-        return phase_replay(args)
-    else:
-        print("未知 phase: %s" % args.phase, file=sys.stderr)
-        return 2
+        start_run(args.out_dir, args.intake_type, "run_pipeline", started_at_ms)
+
+    previous_parent = os.environ.get("RECRUIT_TIMING_PARENT")
+    os.environ["RECRUIT_TIMING_PARENT"] = "1"
+    rc = 2
+    try:
+        if args.phase == "emit":
+            rc = phase_emit(args)
+        elif args.phase == "replay":
+            rc = phase_replay(args)
+        else:
+            print("未知 phase: %s" % args.phase, file=sys.stderr)
+            rc = 2
+        return rc
+    finally:
+        if previous_parent is None:
+            os.environ.pop("RECRUIT_TIMING_PARENT", None)
+        else:
+            os.environ["RECRUIT_TIMING_PARENT"] = previous_parent
+        finished_at_ms = int(time.time() * 1000)
+        append_event(
+            args.out_dir,
+            "run_pipeline.%s" % args.phase,
+            "orchestrator_local",
+            started_at_ms,
+            finished_at_ms,
+            metadata={"returncode": rc, "intake_type": args.intake_type},
+        )
+        timing_path = Path(args.out_dir).resolve() / TIMING_FILE_NAME
+        print("PERFORMANCE:%s" % timing_path, file=sys.stderr)
+        print("[performance] %s" % json.dumps(read_summary(args.out_dir),
+                                                ensure_ascii=False),
+              file=sys.stderr)
 
 
 if __name__ == "__main__":

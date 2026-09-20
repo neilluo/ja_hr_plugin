@@ -39,6 +39,12 @@ from intake.table_gateway import TableGateway       # noqa: E402
 from runtime_compat import default_out_root         # noqa: E402
 
 from jsonio import write_json as _write_json          # noqa: E402
+from performance_timing import (                       # noqa: E402
+    append_events,
+    child_timing_enabled,
+    start_run,
+    timeline_exists,
+)
 
 from pipeline_base import PipelineBase               # noqa: E402
 
@@ -316,6 +322,7 @@ class IntakePipeline(PipelineBase):
         self.store: Optional[CheckpointStore] = None
         self.report: Optional[IntakeReport] = None
         self.ok = False
+        self.stage_timings: List[Dict[str, Any]] = []
 
     # ------------------------------------------------------------------ #
     # 状态与所有权
@@ -333,21 +340,52 @@ class IntakePipeline(PipelineBase):
     # 主入口
     # ------------------------------------------------------------------ #
     def run(self) -> int:
-        self.prepare()
-        self.extract()
-        self.budget_gate_a()
-        self.dedupe_local()
-        self.dedupe_library()
-        self.apply_vision_gate()
-        self.dedupe_phone()
-        self.build_rows()
-        self.ensure_options()
-        self.upload_attachments()
-        self.fixup_attachments()
-        self.write_records()
-        self.readback_verify()
-        self.assemble()
-        return self.finish()
+        run_started_ms = int(time.time() * 1000)
+        self.stage_timings = []
+        rc = 1
+        try:
+            self._run_named_stage("prepare", self.prepare)
+            self._run_named_stage("extract", self.extract)
+            self._run_named_stage("budget_gate_a", self.budget_gate_a)
+            self._run_named_stage("dedupe_local", self.dedupe_local)
+            self._run_named_stage("dedupe_library", self.dedupe_library)
+            self._run_named_stage("apply_vision_gate", self.apply_vision_gate)
+            self._run_named_stage("dedupe_phone", self.dedupe_phone)
+            self._run_named_stage("build_rows", self.build_rows)
+            self._run_named_stage("ensure_options", self.ensure_options)
+            self._run_named_stage("upload_attachments", self.upload_attachments)
+            self._run_named_stage("fixup_attachments", self.fixup_attachments)
+            self._run_named_stage("write_records", self.write_records)
+            self._run_named_stage("readback_verify", self.readback_verify)
+            self._run_named_stage("assemble", self.assemble)
+            rc = self._run_named_stage("finish", self.finish)
+            return rc
+        finally:
+            if self.out_dir is not None:
+                run_finished_ms = int(time.time() * 1000)
+                is_child = child_timing_enabled()
+                if not is_child and (getattr(self.args, "replay_path", None) is None
+                                     or not timeline_exists(self.out_dir)):
+                    start_run(self.out_dir, "resume", "intake_resume", run_started_ms)
+                events = [{
+                    "name": "resume.%s" % stage["name"],
+                    "category": "intake_stage",
+                    "started_at_ms": stage["started_at_ms"],
+                    "finished_at_ms": stage["finished_at_ms"],
+                    "elapsed_ms": stage["elapsed_ms"],
+                    "dws_calls": stage["dws_calls"],
+                } for stage in self.stage_timings]
+                if not is_child:
+                    events.append({
+                        "name": "intake_resume_%s" % (
+                            "replay" if getattr(self.args, "replay_path", None) else "emit"),
+                        "category": "orchestrator_local",
+                        "started_at_ms": run_started_ms,
+                        "finished_at_ms": run_finished_ms,
+                        "dws_calls": self._safe_calls(),
+                        "metadata": {"returncode": rc},
+                    })
+                append_events(self.out_dir, events)
 
     # ------------------------------------------------------------------ #
     # 序幕：路径 / 状态 / dws 装配 / 开场打印 / --reset / checkpoint / 补丁装载

@@ -83,6 +83,34 @@ class PipelineBase:
         """计时上下文管理器：封装 ``t0=monotonic(); calls0=...`` 样板。"""
         return self._StageTimer(self._calls_fn)
 
+    def _safe_calls(self) -> int:
+        """在 pipeline 尚未完成 gateway/counter 装配时安全读取调用数。"""
+        try:
+            return int(self._calls_fn())
+        except (AttributeError, TypeError):
+            return 0
+
+    def _run_named_stage(self, name: str, fn: Callable[[], Any]) -> Any:
+        """执行一个既有阶段并旁路记录耗时，不改变返回值与异常传播。"""
+        started = time.time()
+        t0 = time.monotonic()
+        calls0 = self._safe_calls()
+        try:
+            return fn()
+        finally:
+            finished = time.time()
+            timings = getattr(self, "stage_timings", None)
+            if timings is None:
+                timings = []
+                self.stage_timings = timings
+            timings.append({
+                "name": name,
+                "started_at_ms": int(started * 1000),
+                "finished_at_ms": int(finished * 1000),
+                "elapsed_ms": int((time.monotonic() - t0) * 1000),
+                "dws_calls": max(0, self._safe_calls() - calls0),
+            })
+
     # ------------------------------------------------------------------ #
     # fatal 唯一写点（统一 intake _set_fatal 与 jobintake 的内联 fatal=…;append）
     # ------------------------------------------------------------------ #

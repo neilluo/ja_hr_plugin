@@ -27,6 +27,23 @@ Step 6  agent 调 dws     执行 dws record update → 附件字段写回表格
 
 **Step 2 也可走 build_replay.py + replay 路径**（见下方"两种执行路径"）。
 
+### 性能埋点（诊断旁路，不参与业务判断）
+
+`run_pipeline.py`、两条 intake pipeline、`build_replay.py` 和 `upload_attachments.py`
+会向 `<out-dir>/performance_timing.json` 追加计时事件。该文件独立于
+`intake_report.json` / `dws_results.json`，删除或缺失均不影响业务流程。
+
+- `intake_stage`：简历/岗位各业务阶段的本地耗时与逻辑 dws 调用数；
+- `orchestrator_local`：emit、build_replay、replay、附件 prepare/upload/verify 的本地墙钟；
+- `dws_reported_elapsed_ms`：只汇总包装格式 `dws_out_<seq>.json` 明确提供的
+  `elapsed_ms`；旧格式没有该字段时不按 0 毫秒冒充已测量；
+- `dws_share_of_wall`：仅当全部已观测 dws 结果都有 `elapsed_ms` 时计算，否则为 null；
+- `orchestration_gap_ms`：本地阶段之间的间隙，包含 dws、agent 调度与人工停顿，
+  只能视为宿主往返上界，不能当作纯 dws 耗时。
+
+Windows 实测时必须保留同一个 `out-dir` 走完整个 emit → build_replay → replay，
+并尽量把每条 dws 结果保存为带 `returncode/stdout/stderr/elapsed_ms` 的包装格式。
+
 ### 操作文档索引（详细步骤在各 skill 的 HOTPATH.md / SKILL.md 里，本文件只留指针）
 
 | 操作 | 文档位置 |

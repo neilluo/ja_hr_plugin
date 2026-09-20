@@ -31,8 +31,22 @@ import json
 import mimetypes
 import os
 import sys
+import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PLUGIN_ROOT = SCRIPT_DIR.parent
+SHARED_DIR = str(PLUGIN_ROOT / "shared")
+if SHARED_DIR not in sys.path:
+    sys.path.insert(0, SHARED_DIR)
+
+from performance_timing import (  # noqa: E402
+    TIMING_FILE_NAME,
+    append_event_and_observe,
+    read_summary,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +61,49 @@ def load_json(path):
 def write_json(path, data):
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=2)
+
+
+def unwrap_dws_json(payload):
+    """兼容 raw dws JSON 与 {stdout, elapsed_ms, ...} 包装格式。"""
+    if isinstance(payload, dict) and "stdout" in payload:
+        stdout = payload.get("stdout")
+        if isinstance(stdout, str):
+            try:
+                payload = json.loads(stdout)
+            except ValueError:
+                return {}
+        elif isinstance(stdout, dict):
+            payload = stdout
+    return payload if isinstance(payload, dict) else {}
+
+
+def read_timed_dws_result(path):
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"elapsed_ms": 0, "elapsed_measured": False}
+    value = payload.get("elapsed_ms") if isinstance(payload, dict) else None
+    measured = (not isinstance(value, bool)
+                and isinstance(value, (int, float)) and value >= 0)
+    return {"elapsed_ms": int(value) if measured else 0,
+            "elapsed_measured": measured}
+
+
+def attachment_dws_commands(out_dir):
+    manifest_path = Path(out_dir) / "attachment_manifest.json"
+    commands = []
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            commands = [{"seq": item.get("seq"), "command_type": "attachment upload"}
+                        for item in (manifest.get("attachments") or [])]
+        except (OSError, ValueError):
+            commands = []
+    commands.append({"seq": "update", "result_file": "dws_out_update.json",
+                     "command_type": "record update"})
+    return commands
 
 
 def load_config(config_path, intake_type="resume"):
@@ -318,7 +375,8 @@ def phase_upload(args):
             missing.append(seq)
             continue
 
-        data = dws_result.get("data", {})
+        dws_result = unwrap_dws_json(dws_result)
+        data = dws_result.get("data", dws_result)
         file_token = data.get("fileToken")
         upload_url = data.get("uploadUrl")
         if not file_token or not upload_url:
@@ -521,20 +579,42 @@ def main():
         help="Path to records template file (defaults to <out-dir>/upsert_records_template.json for resume, create_records_template.json for job)",
     )
     args = parser.parse_args()
+    started_at_ms = int(time.time() * 1000)
 
     if args.phase == "prepare":
         if not args.config:
             parser.error("--config is required for --phase prepare")
-        return phase_prepare(args)
+        rc = phase_prepare(args)
     elif args.phase == "upload":
         if not args.config:
             parser.error("--config is required for --phase upload")
-        return phase_upload(args)
+        rc = phase_upload(args)
     elif args.phase == "verify":
         if not args.config:
             parser.error("--config is required for --phase verify")
-        return phase_verify(args)
-    return 0
+        rc = phase_verify(args)
+    else:
+        rc = 0
+
+    finished_at_ms = int(time.time() * 1000)
+    append_event_and_observe(
+        args.out_dir,
+        {"name": "upload_attachments.%s" % args.phase,
+         "category": "orchestrator_local",
+         "started_at_ms": started_at_ms,
+         "finished_at_ms": finished_at_ms,
+         "metadata": {"returncode": rc, "intake_type": args.intake_type}},
+        attachment_dws_commands(args.out_dir),
+        read_timed_dws_result,
+        scope_complete=False,
+        scope="attachment_workflow_partial",
+    )
+    timing_path = Path(args.out_dir).resolve() / TIMING_FILE_NAME
+    sys.stderr.write("PERFORMANCE:%s\n" % timing_path)
+    sys.stderr.write("[performance] %s\n" % json.dumps(read_summary(args.out_dir),
+                                                        ensure_ascii=False))
+    sys.stderr.flush()
+    return rc
 
 
 if __name__ == "__main__":
