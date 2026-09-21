@@ -90,7 +90,24 @@ def main():
     except NotableError as e:
         print(json.dumps({**report, "error": str(e)}, ensure_ascii=False))
         sys.exit(1)
-    back = {r["fields"].get("job_id") for r in nt.list_records("job", biz_fields=["job_id"])}
+
+    try:
+        # 写后查重自愈：重试双写或历史残留的重复 job_id，保留最早一条删其余
+        back_all = nt.list_records("job", biz_fields=["job_id"])
+        groups = {}
+        for r in back_all:
+            jid = r["fields"].get("job_id")
+            if jid:
+                groups.setdefault(jid, []).append(r["id"])
+        dup_ids = [rid for ids in groups.values() if len(ids) > 1 for rid in ids[1:]]
+        if dup_ids:
+            nt.delete_records("job", dup_ids)
+        report["duplicates_removed"] = len(dup_ids)
+        back = set(groups)
+    except NotableError as e:
+        print(json.dumps({**report, "created": len(ids),
+                          "error": "回读/查重失败: %s" % e}, ensure_ascii=False))
+        sys.exit(1)
     report["created"] = len(ids)
     report["readback_missing"] = [r["job_id"] for r in write_rows if r["job_id"] not in back]
     print(json.dumps(report, ensure_ascii=False, indent=2))

@@ -43,9 +43,30 @@ def _validate(nt, table, row):
     return bad, ", ".join(sorted(valid))
 
 
+def _dedupe_selfheal(nt, table, key_of):
+    """写后查重自愈：按业务键聚合，>1 副本保留最早一条、删其余。
+    治愈重试双写与历史残留；返回删除条数。key_of(fields) -> 键或 None。"""
+    back = nt.list_records(table, biz_fields=["phone", "attach_md5"])
+    groups = {}
+    for r in back:
+        k = key_of(r["fields"])
+        if k:
+            groups.setdefault(k, []).append(r["id"])
+    dup_ids = [rid for ids in groups.values() if len(ids) > 1 for rid in ids[1:]]
+    if dup_ids:
+        nt.delete_records(table, dup_ids)
+    return len(dup_ids)
+
+
 def _finalize(nt, table, rows, report):
-    """批量与补录共用尾部：附件先传 → 写表 → 按手机号回读。rows 含 _file/attach_md5。"""
+    """批量与补录共用尾部：附件先传 → 写表 → 写后查重自愈 → 按手机号回读。rows 含 _file/attach_md5。"""
     if not rows:
+        try:
+            report["duplicates_removed"] = _dedupe_selfheal(
+                nt, table, lambda f: f.get("phone") or f.get("attach_md5"))
+        except NotableError as e:
+            print(json.dumps({**report, "error": "查重失败: %s" % e}, ensure_ascii=False))
+            sys.exit(1)
         report["created"] = 0
         report["readback_missing"] = []
         print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -68,7 +89,14 @@ def _finalize(nt, table, rows, report):
         print(json.dumps({**report, "error": str(e)}, ensure_ascii=False))
         sys.exit(1)
 
-    back = {r["fields"].get("phone") for r in nt.list_records(table, biz_fields=["phone"])}
+    try:
+        report["duplicates_removed"] = _dedupe_selfheal(
+            nt, table, lambda f: f.get("phone") or f.get("attach_md5"))
+        back = {r["fields"].get("phone") for r in nt.list_records(table, biz_fields=["phone"])}
+    except NotableError as e:
+        print(json.dumps({**report, "created": len(ids),
+                          "error": "回读/查重失败: %s" % e}, ensure_ascii=False))
+        sys.exit(1)
     report["created"] = len(ids)
     report["readback_missing"] = [r["phone"] for r in write_rows
                                   if r.get("phone") and r["phone"] not in back]

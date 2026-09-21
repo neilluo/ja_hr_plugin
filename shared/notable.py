@@ -11,9 +11,11 @@
     ids = nt.create_records("resume", [{"name": "张三", ...}])   # 业务键入参
 """
 
+import http.client
 import json
 import mimetypes
 import os
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -83,8 +85,12 @@ class Notable:
         os.replace(tmp, CACHE)
         return self._token
 
-    def call(self, method, path, body=None, raw=None, retries=3):
-        """调钉钉 OpenAPI。path 不含 operatorId，自动追加。raw=bytes 时裸请求（OSS PUT）。"""
+    def call(self, method, path, body=None, raw=None, retries=3, idempotent=True):
+        """调钉钉 OpenAPI。path 不含 operatorId，自动追加。raw=bytes 时裸请求（OSS PUT）。
+
+        idempotent=False（create 等非幂等写）：429/5xx 不盲重试——服务端可能已提交，
+        重投会把整块写第二遍；直接抛错交给入口脚本的「写后查重自愈」与重跑兜底。
+        """
         sep = "&" if "?" in path else "?"
         url = API + path + ("" if raw is not None else sep + "operatorId=" + self.op)
         data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
@@ -102,7 +108,7 @@ class Notable:
                     err = json.loads(payload or b"{}")
                 except ValueError:
                     err = {"message": payload[:200].decode("utf-8", "replace")}
-                retryable = e.code in RETRY_STATUS or err.get("code") in RETRY_CODES
+                retryable = (e.code in RETRY_STATUS or err.get("code") in RETRY_CODES) and idempotent
                 if e.code == 401 and attempt == 0:
                     self.token(force=True)
                     headers["x-acs-dingtalk-access-token"] = self._token
@@ -111,11 +117,14 @@ class Notable:
                     time.sleep(1.5 * 2 ** attempt)
                     continue
                 raise NotableError("HTTP %s %s: %s" % (e.code, err.get("code", ""), err.get("message", "")))
-            except urllib.error.URLError as e:
-                if attempt < retries:
+            except (urllib.error.URLError, http.client.HTTPException,
+                    socket.timeout, ConnectionError, TimeoutError) as e:
+                # 连接层故障（含响应丢失的 RemoteDisconnected/IncompleteRead）：
+                # 写请求结果未知，重试可能双写，一律不重试直接抛错，由查重自愈兜底。
+                if attempt < retries and idempotent:
                     time.sleep(1.5 * 2 ** attempt)
                     continue
-                raise NotableError("网络错误 %s: %s" % (path, e.reason))
+                raise NotableError("网络错误 %s: %s" % (path, getattr(e, "reason", e)))
         raise NotableError("重试耗尽: " + path)
 
     def put(self, url, raw, mime, retries=3):
@@ -218,13 +227,14 @@ class Notable:
         return cn_name
 
     def create_records(self, table, rows):
-        """rows: [{业务键: 值}]。返回新建 record id 列表（顺序不保证，需回读确认）。"""
+        """rows: [{业务键: 值}]。返回新建 record id 列表（顺序不保证，需回读确认）。
+        非幂等写：不盲重试，重复风险由入口脚本写后查重自愈。"""
         sheet = self.sheet(table)
         ids = []
         for i in range(0, len(rows), 10):
             chunk = [{"fields": self._cells(table, row)} for row in rows[i:i + 10]]
             r = self.call("POST", "/v1.0/notable/bases/%s/sheets/%s/records" % (self.base, sheet),
-                          {"records": chunk})
+                          {"records": chunk}, idempotent=False)
             ids += [v["id"] for v in r.get("value", [])]
         return ids
 
