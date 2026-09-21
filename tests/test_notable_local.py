@@ -55,6 +55,34 @@ class TestCast(unittest.TestCase):
         self.assertEqual(self.nt._biz("resume", "手机号"), "phone")
         self.assertEqual(self.nt._biz("resume", "不存在的字段"), "不存在的字段")
 
+    def test_cn_unknown_key_raises_readable(self):
+        from notable import NotableError
+        with self.assertRaises(NotableError) as ctx:
+            self.nt.cn("resume", "gender")
+        msg = str(ctx.exception)
+        self.assertIn("gender", msg)
+        self.assertIn("phone", msg)  # 提示里列出可用字段
+
+
+class TestBackfillValidate(unittest.TestCase):
+    """扫描件补录的字段校验：非法业务键被挑出，内部键(_file)与合法键放行。"""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        self.nt = Notable(os.path.join(ROOT, "config.json"))
+        import upload_resumes as ur
+        self.validate = ur._validate
+
+    def test_flags_unknown_and_ignores_internal(self):
+        bad, valid = self.validate(self.nt, "resume", {
+            "name": "张三", "phone": "13800000000", "gender": "男", "_file": "/x.pdf"})
+        self.assertEqual(bad, ["gender"])
+        self.assertIn("phone", valid)  # 可用字段提示
+
+    def test_all_valid_returns_empty(self):
+        bad, _ = self.validate(self.nt, "resume", {"name": "张三", "skills": ["CAD"], "_file": "/x.pdf"})
+        self.assertEqual(bad, [])
+
 
 class TestParse(unittest.TestCase):
     def test_resume_phone_email(self):

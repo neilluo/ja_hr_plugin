@@ -159,7 +159,11 @@ class Notable:
         return self.cfg["tables"][table]["table_id"]
 
     def cn(self, table, biz):
-        return self.cfg["fields"][table][biz]
+        try:
+            return self.cfg["fields"][table][biz]
+        except KeyError:
+            valid = ", ".join(sorted(self.cfg["fields"].get(table, {})))
+            raise NotableError("未知业务键 '%s'（表 %s）。可用: %s" % (biz, table, valid))
 
     def list_records(self, table, flt=None, biz_fields=None, limit=0):
         """全量分页拉取。返回 [{id, fields:{业务键: 原始值}}]。flt = {业务键: 值} 等值过滤。"""

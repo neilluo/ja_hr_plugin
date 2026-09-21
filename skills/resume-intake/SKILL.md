@@ -33,22 +33,29 @@ python3 scripts/upload_resumes.py <目录> --dry-run  # 预演
 | `failed` | 看 error 文本；附件类错误重跑可恢复 |
 | `needs_ocr` | 扫描件/图片，按下节补录 |
 
-## 扫描件补录（agent 唯一需要动脑的环节）
+## 扫描件补录（agent 只读图给字段，入库仍走脚本）
 
 1. 用视觉能力读取 `needs_ocr` 里的每个文件（Read 工具直接看图/扫描 PDF）。
-2. 抽出姓名/手机号/学历/技能等字段后，用 Python 一行补录：
+2. 把每个文件抽出的字段 + **原文件绝对路径**写成一个 JSON 数组文件（如 `/tmp/ocr.json`）：
 
-```bash
-python3 -c "
-import sys; sys.path.insert(0,'shared')
-from notable import Notable
-nt = Notable()
-print(nt.create_records('resume', [{'name':'张三','phone':'138...','education':'本科',
-      'comm_status':'待筛选'}]))"
+```json
+[
+  {"name": "张三", "phone": "13800000000", "email": "z@x.com",
+   "education": "本科", "school": "XX大学", "major": "机械工程",
+   "years_experience": 5, "expected_position": "设备工程师",
+   "skills": ["PLC", "CAD"], "_file": "/abs/path/扫描件.pdf"}
+]
 ```
 
-3. 补录后 `python3 scripts/query.py resume --filter phone=<手机号>` 确认。
-   无法识别联系方式的文件不入库，向用户说明原因。
+3. 交给脚本补录，**不要自己 `python3 -c` 调 API**——脚本会做和批量入库完全一致的
+   字段校验、附件上传、MD5 去重与手机号回读（原件也会进表）：
+
+```bash
+python3 scripts/upload_resumes.py --backfill /tmp/ocr.json
+```
+
+合法业务键见 README「表结构」；写错字段名（如 `gender`）会在报告 `failed` 里明确提示可用字段。
+无法识别联系方式的文件不入库，脚本会拒绝，向用户说明原因。
 
 ## 边界
 
