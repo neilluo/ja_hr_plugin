@@ -1,6 +1,6 @@
 # AGENTS.md — 招聘智能匹配（OpenAPI 直连版）工程约束
 
-> 代码是唯一事实来源。CLI 参数以 `python3 scripts/<name>.py --help` 为准。
+> 代码是唯一事实来源。CLI 参数以 `python3 <入口脚本> --help` 为准。
 > 旧 emit/replay + agent 调 dws 的链路已整体废弃，代码在 `.trash/` 仅供考古，禁止参考、禁止复活。
 
 ## 架构
@@ -11,9 +11,11 @@
   仓库是 public 的，**任何凭证不得写入会被提交的文件**。
 - 表结构映射在 `config.json`：业务键 → 中文字段名。OpenAPI 记录接口以中文字段名为 key，
   不需要字段 ID；新增字段只需在 Base 里建列并往 config.json 加一行。
-- 入口脚本：`scripts/upload_resumes.py`、`scripts/upload_jobs.py`、`scripts/query.py`、
-  `scripts/match.py`（匹配打分）、`scripts/replicate_base.py`（建表）。
+- 入口脚本：跨 skill 公共入口 `shared/query.py`；单 skill 私有入口
+  `skills/resume-intake/scripts/upload_resumes.py`、`skills/job-intake/scripts/upload_jobs.py`、
+  `skills/match-verify/scripts/match.py`（匹配打分）、`skills/replicate/scripts/replicate_base.py`（建表）。
   agent 直接 Bash 跑脚本，读 JSON 报告即可，不需要中间回合。
+- 命令一律以仓库根为 CWD 执行：跨 skill 公共入口 python3 shared/query.py、bash shared/preflight.sh（Windows 用 shared/preflight.ps1）；单 skill 私有入口 python3 skills/<skill>/scripts/<entry>.py；shared/ 只放跨 skill 公共库与公共入口，skills/<skill>/scripts/ 只放该 skill 私有入口，scripts/ 下入口为执行而非阅读。
 
 ## 不变量
 
@@ -32,9 +34,9 @@
 
 ```bash
 python3 -m unittest discover -s tests          # 本地无副作用（含 mock HTTP 传输测试）
-python3 -m py_compile shared/*.py scripts/*.py
-python3 scripts/upload_resumes.py <目录> --dry-run   # 只解析不触网写表
-python3 scripts/query.py resume --fields name,phone  # 只读，需真实凭证
+python3 -m py_compile shared/*.py skills/*/scripts/*.py
+python3 skills/resume-intake/scripts/upload_resumes.py <目录> --dry-run   # 只解析不触网写表
+python3 shared/query.py resume --fields name,phone  # 只读，需真实凭证
 ```
 
 真实端到端：对 data 目录跑 upload_jobs → upload_resumes → query 核对计数。

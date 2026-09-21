@@ -2,9 +2,9 @@
 """岗位 JD 入库：扫描目录 → 解析 → 去重 → 批量写「岗位JD表」→ 回读校验。
 
 用法:
-    python3 scripts/upload_jobs.py <目录> [--dry-run]
+    python3 skills/job-intake/scripts/upload_jobs.py <目录> [--dry-run]
 示例:
-    python3 scripts/upload_jobs.py /path/to/岗位说明书
+    python3 skills/job-intake/scripts/upload_jobs.py /path/to/岗位说明书
 """
 
 import argparse
@@ -14,13 +14,13 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "shared"))
 from extract import extract                      # noqa: E402
 from notable import Notable, NotableError       # noqa: E402
 from parse_job import parse                     # noqa: E402
 from preflight import run_preflight             # noqa: E402
 
-_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.json")
+_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "config.json")
 
 EXTS = (".doc", ".docx", ".pdf")
 

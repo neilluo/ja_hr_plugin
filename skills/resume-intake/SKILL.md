@@ -18,9 +18,11 @@ author:
 ## 执行
 
 ```bash
-python3 scripts/upload_resumes.py <目录>            # 真实入库
-python3 scripts/upload_resumes.py <目录> --dry-run  # 预演
+python3 skills/resume-intake/scripts/upload_resumes.py <目录>            # 真实入库
+python3 skills/resume-intake/scripts/upload_resumes.py <目录> --dry-run  # 预演
 ```
+
+以上命令以仓库根为 CWD；scripts/ 下入口为执行（run）而非阅读。
 
 一条命令跑完全链路，读 stdout 的 JSON 报告即可，**不要拆步骤、不要自己调 API**。
 
@@ -51,8 +53,10 @@ python3 scripts/upload_resumes.py <目录> --dry-run  # 预演
    字段校验、附件上传、MD5 去重与手机号回读（原件也会进表）：
 
 ```bash
-python3 scripts/upload_resumes.py --backfill /tmp/ocr.json
+python3 skills/resume-intake/scripts/upload_resumes.py --backfill /tmp/ocr.json
 ```
+
+以上命令以仓库根为 CWD；scripts/ 下入口为执行（run）而非阅读。
 
 合法业务键见 README「表结构」；写错字段名（如 `gender`）会在报告 `failed` 里明确提示可用字段。
 无法识别联系方式的文件不入库，脚本会拒绝，向用户说明原因。

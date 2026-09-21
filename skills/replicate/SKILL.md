@@ -18,8 +18,10 @@ author:
 ## 执行
 
 ```bash
-python3 scripts/replicate_base.py <新baseId> [--operator <unionId>]
+python3 skills/replicate/scripts/replicate_base.py <新baseId> [--operator <unionId>]
 ```
+
+以上命令以仓库根为 CWD；scripts/ 下入口为执行（run）而非阅读。
 
 脚本按 `SCHEMA`（与 config.json 口径一致）逐表建 sheet + 逐字段建列（单选/多选带选项），
 stdout 输出可合并进 config.json 的片段：`{base_id, tables, fields, types}`。
@@ -30,7 +32,7 @@ stdout 输出可合并进 config.json 的片段：`{base_id, tables, fields, typ
    （`operator_id` 换成新组织操作人 unionId）。
 2. 新 Base 需给应用加协作者：钉钉 AI 表格无组织级公共表，企业应用身份操作必须把
    机器人显式加为协作者，仅开 API 权限点不够。
-3. 跑 `python3 scripts/query.py job` 验证连通（应返回 count=0）。
+3. 跑 `python3 shared/query.py job` 验证连通（应返回 count=0）。
 
 ## 边界与已知约束
 

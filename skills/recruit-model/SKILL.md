@@ -30,6 +30,6 @@ candidate-query / match-verify 四个 skill。
 
 ## 三条铁律
 
-1. 代码是唯一事实来源：口径以 `shared/*.py` + `scripts/*.py` 为准，文档与代码冲突时信代码。
+1. 代码是唯一事实来源：口径以 `shared/*.py` + `skills/*/scripts/*.py` 为准，文档与代码冲突时信代码。
 2. 所有远端调用走 `shared/notable.py`，禁止脚本里直接 urllib 调钉钉（OSS PUT 除外）。
 3. 凭证只在 `.secrets.json` 或环境变量；仓库 public，任何凭证不得进 git。

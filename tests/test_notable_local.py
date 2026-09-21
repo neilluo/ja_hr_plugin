@@ -68,7 +68,7 @@ class TestBackfillValidate(unittest.TestCase):
     """扫描件补录的字段校验：非法业务键被挑出，内部键(_file)与合法键放行。"""
 
     def setUp(self):
-        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        sys.path.insert(0, os.path.join(ROOT, "skills", "resume-intake", "scripts"))
         self.nt = Notable(os.path.join(ROOT, "config.json"))
         import upload_resumes as ur
         self.validate = ur._validate
@@ -101,7 +101,7 @@ class TestParse(unittest.TestCase):
         self.assertTrue(j["job_name"])
 
     def test_job_id_deterministic(self):
-        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        sys.path.insert(0, os.path.join(ROOT, "skills", "job-intake", "scripts"))
         from upload_jobs import job_id_of
         self.assertEqual(job_id_of("技术部", "工程师"), job_id_of("技术部", "工程师"))
         self.assertNotEqual(job_id_of("技术部", "工程师"), job_id_of("技术部", "主管"))

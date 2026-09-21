@@ -16,15 +16,17 @@ author:
 # 查询与统计
 
 ```bash
-python3 scripts/query.py resume --filter phone=13812345678
-python3 scripts/query.py resume --fields name,phone,education,skills
-python3 scripts/query.py job --fields job_id,job_name,department,status
-python3 scripts/query.py match --stats          # 按岗位聚合 推荐/待定/不推荐
-python3 scripts/query.py perm
+python3 shared/query.py resume --filter phone=13812345678
+python3 shared/query.py resume --fields name,phone,education,skills
+python3 shared/query.py job --fields job_id,job_name,department,status
+python3 shared/query.py match --stats          # 按岗位聚合 推荐/待定/不推荐
+python3 shared/query.py perm
 ```
+
+以上命令以仓库根为 CWD；scripts/ 下入口为执行（run）而非阅读。
 
 - 表名：`resume | job | match | perm`；过滤键用业务键（name/phone/job_id/recommend…）。
 - `--filter` 可重复传多个，关系为 AND，等值匹配。
 - 输出 JSON：`{count, records:[{id, fields}]}`；select 类字段已归一为字符串。
 - 本 skill 只读；写操作一律走 resume-intake / job-intake 的脚本。
-- 需要 HTML 看板时：读 `query.py job` + `match --stats` 的 JSON 自行渲染，勿改脚本。
+- 需要 HTML 看板时：读 `shared/query.py job` + `match --stats` 的 JSON 自行渲染，勿改脚本。

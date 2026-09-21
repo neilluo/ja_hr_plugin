@@ -3,10 +3,10 @@
 
 两种模式:
     # A. 批量入库（可解析的 pdf/docx/doc；扫描件/图片进 needs_ocr 队列）
-    python3 scripts/upload_resumes.py <目录> [--dry-run]
+    python3 skills/resume-intake/scripts/upload_resumes.py <目录> [--dry-run]
 
     # B. 扫描件补录（agent 用视觉读取 needs_ocr 文件后，把字段+原文件路径写成 JSON 交给本命令）
-    python3 scripts/upload_resumes.py --backfill records.json
+    python3 skills/resume-intake/scripts/upload_resumes.py --backfill records.json
     # records.json = [{"name":"张三","phone":"138...","_file":"/abs/扫描件.pdf", ...}, ...]
 
 两种模式共用同一套尾部流程：字段校验 → 附件先传（失败则该条不写表）→ 写表 → 按手机号回读。
@@ -22,13 +22,13 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "shared"))
 from extract import extract                      # noqa: E402
 from notable import Notable, NotableError       # noqa: E402
 from parse_resume import parse                  # noqa: E402
 from preflight import run_preflight             # noqa: E402
 
-_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.json")
+_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "config.json")
 
 EXTS = (".pdf", ".doc", ".docx", ".png", ".jpg", ".jpeg")
 FULL_TEXT_MAX = 20000  # 全文参考字段截断上限（打分用 skills，不依赖此字段）

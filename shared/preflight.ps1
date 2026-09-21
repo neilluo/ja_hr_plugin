@@ -6,9 +6,9 @@
 # DINGTALK_APP_KEY / DINGTALK_APP_SECRET environment variables.
 #
 # Manual verification (no automated smoke test in CI):
-#   powershell -File shared\scripts\preflight.ps1                          # repo defaults
-#   powershell -File shared\scripts\preflight.ps1 -Config C:\tmp\x.json    # missing config -> blocker=config
-#   powershell -File shared\scripts\preflight.ps1 -Files nope.pdf          # missing file   -> blocker=files
+#   powershell -File shared\preflight.ps1                          # repo defaults
+#   powershell -File shared\preflight.ps1 -Config C:\tmp\x.json    # missing config -> blocker=config
+#   powershell -File shared\preflight.ps1 -Files nope.pdf          # missing file   -> blocker=files
 
 param(
   [string]$Config = "",
@@ -20,7 +20,7 @@ param(
 # Variable computation
 # ----------------------------------------------------------------------------
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$PluginDir = Resolve-Path (Join-Path $ScriptDir "..\..")
+$PluginDir = Resolve-Path (Join-Path $ScriptDir "..")
 
 if ([string]::IsNullOrEmpty($Config)) {
   $ConfigPath = Join-Path $PluginDir "config.json"

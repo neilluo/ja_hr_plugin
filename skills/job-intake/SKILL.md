@@ -18,9 +18,11 @@ author:
 ## 执行
 
 ```bash
-python3 scripts/upload_jobs.py <目录>            # 真实入库
-python3 scripts/upload_jobs.py <目录> --dry-run  # 预演，stdout 含全部 rows
+python3 skills/job-intake/scripts/upload_jobs.py <目录>            # 真实入库
+python3 skills/job-intake/scripts/upload_jobs.py <目录> --dry-run  # 预演，stdout 含全部 rows
 ```
+
+以上命令以仓库根为 CWD；scripts/ 下入口为执行（run）而非阅读。
 
 ## 规则
 
@@ -28,7 +30,7 @@ python3 scripts/upload_jobs.py <目录> --dry-run  # 预演，stdout 含全部 r
 - 组织/部门从文件名拆（形如 `岗位说明书-制造中心-曲靖制造基地-单晶制造部-设备部 - 工程师.doc`），
   部门归一到 Base 已有枚举；两级部门（硅片制造部-工艺部）保留连字符。
 - 必备/加分技能从任职要求按词表命中；权重默认 0.7/0.3，dry-run 里可先看再人工调整：
-  用 `scripts/query.py job --fields job_id,must_weight` 查 id，再经 Notable.update_records 改。
+  用 `shared/query.py job --fields job_id,must_weight` 查 id，再经 Notable.update_records 改。
 - JD 附件与简历同纪律：先传后写，附件失败该条不入库。
 - 统计字段（候选人总数/推荐数等）入库时留空，由匹配流程后续刷新。
 

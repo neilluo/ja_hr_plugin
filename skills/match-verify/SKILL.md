@@ -1,6 +1,6 @@
 ---
 name: match-verify
-description: 智能匹配两步走：先跑 scripts/match.py 确定性打分落库并刷新岗位统计，再由 agent 对「待定」区间做批量语义复核（技能同义/门槛冲突），结论回写 match 表。Use when 用户说 跑匹配/智能匹配/匹配复核/刷新匹配/谁适合这个岗位。
+description: 智能匹配两步走：先跑 skills/match-verify/scripts/match.py 确定性打分落库并刷新岗位统计，再由 agent 对「待定」区间做批量语义复核（技能同义/门槛冲突），结论回写 match 表。Use when 用户说 跑匹配/智能匹配/匹配复核/刷新匹配/谁适合这个岗位。
 argument-hint: [--job-id Jxxx] [--min-score N]
 argument-hint-en: [--job-id Jxxx] [--min-score N]
 argument-hint-zh: [--job-id Jxxx] [--min-score N]
@@ -20,10 +20,12 @@ author:
 ## 第一步：确定性打分（一条命令，agent 不介入）
 
 ```bash
-python3 scripts/match.py                      # 全量：所有岗位 × 所有简历
-python3 scripts/match.py --job-id J64B1DFFB12 # 单岗位
-python3 scripts/match.py --dry-run            # 预演，stdout 含全部 rows
+python3 skills/match-verify/scripts/match.py                      # 全量：所有岗位 × 所有简历
+python3 skills/match-verify/scripts/match.py --job-id J64B1DFFB12 # 单岗位
+python3 skills/match-verify/scripts/match.py --dry-run            # 预演，stdout 含全部 rows
 ```
+
+以上命令以仓库根为 CWD；scripts/ 下入口为执行（run）而非阅读。
 
 脚本自带：按 job_id 先删旧匹配（幂等）、落库、刷新岗位 stat_*、按岗位回读比对。
 `failed` 非空或 exit 1 时重跑一次再看 error。
@@ -32,7 +34,7 @@ python3 scripts/match.py --dry-run            # 预演，stdout 含全部 rows
 
 对 `recommend=待定` 的配对做批量判定，一次回合处理完：
 
-1. `python3 scripts/query.py match --filter recommend=待定 --fields name,job_name,cand_skills,must_skills,hard_gates,evidence`
+1. `python3 shared/query.py match --filter recommend=待定 --fields name,job_name,cand_skills,must_skills,hard_gates,evidence`
 2. 逐条判断：技能是否同义（暖通运维≈HVAC）、hard_gates 是否硬冲突（学历/证书/年限）。
    结论三选一：升「推荐」/降「不推荐」/维持「待定」。
 3. 回写（source 置「人工匹配」）：
@@ -48,7 +50,7 @@ rows = nt.list_records('match', flt={'recommend':'待定'}, biz_fields=[])
 "
 ```
 
-4. 复核后跑 `python3 scripts/query.py match --stats` 给用户看分布。
+4. 复核后跑 `python3 shared/query.py match --stats` 给用户看分布。
 
 ## 边界
 

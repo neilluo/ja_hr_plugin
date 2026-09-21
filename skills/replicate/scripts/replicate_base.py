@@ -2,7 +2,7 @@
 """在新 Base 复制四表结构（表+字段+单选选项），并打印新 config.json 片段。
 
 用法:
-    python3 scripts/replicate_base.py <新baseId> [--operator <unionId>]
+    python3 skills/replicate/scripts/replicate_base.py <新baseId> [--operator <unionId>]
 
 说明：钉钉 AI 表格无组织级公共表，跨组织分发=新建 Base 后跑本脚本重建结构，
 再用输出的 config 片段替换 config.json 的 base_id/tables 段。
@@ -15,11 +15,11 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "shared"))
 from notable import Notable, NotableError  # noqa: E402
 from preflight import run_preflight  # noqa: E402
 
-_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.json")
+_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "config.json")
 
 # 表结构 = 业务键: (中文字段名, 类型, [单选/多选选项])；与 config.json 的 types/fields 对齐
 SCHEMA = {

@@ -11,20 +11,20 @@ echo '{"app_key":"...","app_secret":"..."}' > .secrets.json
 # 或 export DINGTALK_APP_KEY=... DINGTALK_APP_SECRET=...
 
 # 1. 岗位 JD 入库
-python3 scripts/upload_jobs.py /path/to/岗位说明书
+python3 skills/job-intake/scripts/upload_jobs.py /path/to/岗位说明书
 
 # 2. 简历入库（含附件上传）
-python3 scripts/upload_resumes.py /path/to/AI简历
+python3 skills/resume-intake/scripts/upload_resumes.py /path/to/AI简历
 
 # 3. 查询
-python3 scripts/query.py resume --fields name,phone,education
-python3 scripts/query.py match --stats
+python3 shared/query.py resume --fields name,phone,education
+python3 shared/query.py match --stats
 
 # 4. 匹配打分（写 match 表 + 刷新岗位统计，幂等）
-python3 scripts/match.py
+python3 skills/match-verify/scripts/match.py
 
 # 5. 跨组织复制表结构（可选）
-python3 scripts/replicate_base.py <新baseId>
+python3 skills/replicate/scripts/replicate_base.py <新baseId>
 ```
 
 每条命令输出 JSON 报告：`total / parsed / skipped_dup / needs_ocr / failed /
@@ -39,11 +39,11 @@ created / readback_missing`。`readback_missing` 非空或 `failed` 非空时 ex
 | `shared/extract.py` | ~105 | 文本提取：pdf(pdftotext→pypdf) / docx(zip→textutil) / doc(textutil→olefile) / 图片标记 OCR |
 | `shared/parse_resume.py` | ~160 | 简历字段抽取（正则+词表） |
 | `shared/parse_job.py` | ~120 | JD 字段抽取（文件名拆部门+正文切段） |
-| `scripts/upload_resumes.py` | ~105 | 简历入库入口 |
-| `scripts/upload_jobs.py` | ~90 | 岗位入库入口 |
-| `scripts/query.py` | ~60 | 只读查询/统计入口 |
-| `scripts/match.py` | ~130 | 匹配打分：简历×岗位 → match 表 + 岗位统计 |
-| `scripts/replicate_base.py` | ~110 | 新 Base 重建四表结构 |
+| `skills/resume-intake/scripts/upload_resumes.py` | ~105 | 简历入库入口 |
+| `skills/job-intake/scripts/upload_jobs.py` | ~90 | 岗位入库入口 |
+| `shared/query.py` | ~60 | 只读查询/统计入口 |
+| `skills/match-verify/scripts/match.py` | ~130 | 匹配打分：简历×岗位 → match 表 + 岗位统计 |
+| `skills/replicate/scripts/replicate_base.py` | ~110 | 新 Base 重建四表结构 |
 | `shared/vendor/` | — | 内置 pypdf / olefile（零 pip 依赖） |
 
 ## 表结构（config.json）

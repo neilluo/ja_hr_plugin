@@ -18,16 +18,18 @@ author:
 ## 数据源（只读两条命令）
 
 ```bash
-python3 scripts/query.py job --fields job_id,job_name,department,status,stat_total,stat_recommend,stat_pending,stat_reject
-python3 scripts/query.py match --stats
+python3 shared/query.py job --fields job_id,job_name,department,status,stat_total,stat_recommend,stat_pending,stat_reject
+python3 shared/query.py match --stats
 ```
+
+以上命令以仓库根为 CWD；scripts/ 下入口为执行（run）而非阅读。
 
 ## 生成
 
 - 单文件 HTML（内联 CSS/JS，无外部依赖），默认写 `outputs/dashboard.html`。
 - 三块内容：① 岗位漏斗（总数→推荐→待定→不推荐，按 stat_* 画条）；
   ② 推荐 Top 榜（match 表 recommend=推荐 按 total_score 降序，取前 20，
-  用 `query.py match --filter recommend=推荐 --fields name,job_name,total_score,evidence`）；
+  用 `shared/query.py match --filter recommend=推荐 --fields name,job_name,total_score,evidence`）；
   ③ 部门分布（job 按 department 聚合在招数）。
 - 数字一律来自上面命令的 JSON，不要手填、不要推算；stat_* 为空（未跑匹配）的岗位
   显示「未匹配」而不是 0。

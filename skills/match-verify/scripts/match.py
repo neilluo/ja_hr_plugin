@@ -2,7 +2,7 @@
 """智能匹配：简历 × 岗位 确定性打分 → 写「智能匹配」表 → 刷新岗位统计。
 
 用法:
-    python3 scripts/match.py [--job-id Jxxx ...] [--min-score N] [--dry-run]
+    python3 skills/match-verify/scripts/match.py [--job-id Jxxx ...] [--min-score N] [--dry-run]
 
 规则（与 skills/recruit-model/references/ai-analysis-spec.md 一致）：
     skill_score = round(100 * must_weight * 必备命中率)
@@ -18,11 +18,11 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "shared"))
 from notable import Notable, NotableError  # noqa: E402
 from preflight import run_preflight  # noqa: E402
 
-_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.json")
+_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "config.json")
 
 THRESHOLDS = ((70, "推荐"), (40, "待定"))
 

@@ -2,11 +2,11 @@
 """只读查询：列出/过滤四张表记录，或输出岗位维度匹配统计。
 
 用法:
-    python3 scripts/query.py <resume|job|match|perm> [--filter 业务键=值 ...] [--fields 业务键,业务键]
-    python3 scripts/query.py match --stats        # 按岗位聚合推荐/待定/不推荐数
+    python3 shared/query.py <resume|job|match|perm> [--filter 业务键=值 ...] [--fields 业务键,业务键]
+    python3 shared/query.py match --stats        # 按岗位聚合推荐/待定/不推荐数
 示例:
-    python3 scripts/query.py resume --filter phone=13900000001
-    python3 scripts/query.py job --fields job_id,job_name,department
+    python3 shared/query.py resume --filter phone=13900000001
+    python3 shared/query.py job --fields job_id,job_name,department
 """
 
 import argparse
@@ -15,11 +15,11 @@ import os
 import sys
 from collections import Counter
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from notable import Notable  # noqa: E402
 from preflight import run_preflight  # noqa: E402
 
-_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.json")
+_CONFIG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
 
 
 def main():

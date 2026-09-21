@@ -1,6 +1,6 @@
 # ai-analysis-spec — 匹配打分与推荐口径
 
-实现：`scripts/match.py`（确定性，无 LLM 参与）。agent 只在语义复核时用算力（见 match-verify）。
+实现：`skills/match-verify/scripts/match.py`（确定性，无 LLM 参与）。agent 只在语义复核时用算力（见 match-verify）。
 
 ## 打分公式
 

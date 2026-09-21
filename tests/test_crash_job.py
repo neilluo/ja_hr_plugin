@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""崩溃安全故障注入测试：岗位 JD 入库 (scripts/upload_jobs.py)。
+"""崩溃安全故障注入测试：岗位 JD 入库 (skills/job-intake/scripts/upload_jobs.py)。
 
 不触真网。用 ThreadingHTTPServer 起一个内存版 Notable + OSS mock，
 monkeypatch notable.API / notable.CACHE 到临时路径，然后进程内 patch
@@ -10,7 +10,7 @@ sys.argv 调用 upload_jobs.main()，捕获 SystemExit，检查内存表状态�
 覆盖场景 J1-J8（见 report）。运行：
     python3 tests/test_crash_job.py
 
-设计纪律：本文件只读生产代码，绝不修改 shared/*.py / scripts/*.py / config.json。
+设计纪律：本文件只读生产代码，绝不修改 shared/*.py / skills/*/scripts/*.py / config.json。
 所有 monkeypatch 都在测试进程内、运行期完成（与 tests/test_notable_local.py 同手法）。
 """
 import json
@@ -25,7 +25,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "shared"))
-sys.path.insert(0, os.path.join(ROOT, "scripts"))
+sys.path.insert(0, os.path.join(ROOT, "skills", "job-intake", "scripts"))
 
 DATA_DIR = "/Users/neil/Desktop/qwenworklearn/jahrplugin/data/岗位说明书"
 

@@ -8,16 +8,16 @@
 # DINGTALK_APP_KEY / DINGTALK_APP_SECRET environment variables.
 #
 # Manual verification (no automated smoke test in CI):
-#   bash shared/scripts/preflight.sh                       # repo config + credentials
-#   bash shared/scripts/preflight.sh --config /tmp/x.json  # missing config -> blocker=config
-#   bash shared/scripts/preflight.sh --files /nope.pdf     # missing file   -> blocker=files
+#   bash shared/preflight.sh                       # repo config + credentials
+#   bash shared/preflight.sh --config /tmp/x.json  # missing config -> blocker=config
+#   bash shared/preflight.sh --files /nope.pdf     # missing file   -> blocker=files
 #   DINGTALK_APP_KEY= DINGTALK_APP_SECRET= ... (no .secrets.json) -> blocker=credentials
 
 # ----------------------------------------------------------------------------
 # Variable computation
 # ----------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PLUGIN_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PLUGIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ----------------------------------------------------------------------------
 # Argument parsing
