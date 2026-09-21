@@ -8,6 +8,8 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "shared"))
+sys.path.insert(0, os.path.join(ROOT, "skills", "resume-intake", "scripts"))
+sys.path.insert(0, os.path.join(ROOT, "skills", "job-intake", "scripts"))
 
 from notable import Notable  # noqa: E402
 from parse_job import parse as parse_job  # noqa: E402

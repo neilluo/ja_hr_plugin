@@ -37,8 +37,8 @@ created / readback_missing`。`readback_missing` 非空或 `failed` 非空时 ex
 |---|---|---|
 | `shared/notable.py` | ~230 | 唯一传输层：token 缓存、重试、记录 CRUD、类型转换、附件三步上传 |
 | `shared/extract.py` | ~105 | 文本提取：pdf(pdftotext→pypdf) / docx(zip→textutil) / doc(textutil→olefile) / 图片标记 OCR |
-| `shared/parse_resume.py` | ~160 | 简历字段抽取（正则+词表） |
-| `shared/parse_job.py` | ~120 | JD 字段抽取（文件名拆部门+正文切段） |
+| `skills/resume-intake/scripts/parse_resume.py` | ~160 | 简历字段抽取（正则+词表），resume-intake 私有 |
+| `skills/job-intake/scripts/parse_job.py` | ~120 | JD 字段抽取（文件名拆部门+正文切段），job-intake 私有 |
 | `skills/resume-intake/scripts/upload_resumes.py` | ~105 | 简历入库入口 |
 | `skills/job-intake/scripts/upload_jobs.py` | ~90 | 岗位入库入口 |
 | `shared/query.py` | ~60 | 只读查询/统计入口 |

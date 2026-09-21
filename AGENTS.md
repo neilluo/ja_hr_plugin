@@ -16,6 +16,9 @@
   `skills/match-verify/scripts/match.py`（匹配打分）、`skills/replicate/scripts/replicate_base.py`（建表）。
   agent 直接 Bash 跑脚本，读 JSON 报告即可，不需要中间回合。
 - 命令一律以仓库根为 CWD 执行：跨 skill 公共入口 python3 shared/query.py、bash shared/preflight/preflight.sh（Windows 用 shared/preflight/preflight.ps1）；预检三件套（py/sh/ps1）同居 shared/preflight/；单 skill 私有入口 python3 skills/<skill>/scripts/<entry>.py；shared/ 只放跨 skill 公共库与公共入口，skills/<skill>/scripts/ 只放该 skill 私有入口，scripts/ 下入口为执行而非阅读。
+- 代码归属按共享范围：**只被单个 skill 引用的代码（入口或库）一律放该 skill 的 scripts/，禁止放 shared/**；
+  shared/ 只收跨 skill 公共物——公共库（notable/extract）、公共入口（query.py）、预检三件套（preflight/）。
+  其他 skill 的 references/ 可以文档化指引私有脚本（只读），但禁止代码级跨 skill import。
 
 ## 不变量
 

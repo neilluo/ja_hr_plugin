@@ -17,14 +17,14 @@ subprocess 一律 capture_output + timeout=30；返回 `{text, needs_ocr, error}
 **抽不出手机号且抽不出邮箱 → 进 needs_ocr 队列，不入库。**
 不用文本长度判：扫描件 pdftotext 输出是乱码但非空（实测 134~1051 字）。
 
-## 简历字段（shared/parse_resume.py）
+## 简历字段（skills/resume-intake/scripts/parse_resume.py）
 
 姓名优先序：①「姓名：X」标签 ②文件名拆段（剔除【岗位_城市_薪资】前缀、黑名单段）
 ③首行启发式；三者都过黑名单（自我评价/专业技能/核心优势/学历词/裸地名）。
 学校/专业带左右边界与裸词黑名单；年限正文未命中时用文件名「N年」兜底；
 薪资支持区间（15k-20k）。技能/分类为词表命中启发式，允许少量偏差。
 
-## JD 字段（shared/parse_job.py）
+## JD 字段（skills/job-intake/scripts/parse_job.py）
 
 - 组织/部门从文件名拆：`岗位说明书-制造中心-曲靖制造基地-<部门段> - <岗位名>.doc`，
   部门归一到 Base 枚举（含两级部门连字符、别名映射如 电池设备部→电池制造部-设备部）。
