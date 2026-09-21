@@ -18,6 +18,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from extract import extract                      # noqa: E402
 from notable import Notable, NotableError       # noqa: E402
 from parse_job import parse                     # noqa: E402
+from preflight import run_preflight             # noqa: E402
+
+_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.json")
 
 EXTS = (".doc", ".docx", ".pdf")
 
@@ -31,6 +34,9 @@ def main():
     ap.add_argument("dir", help="岗位说明书目录")
     ap.add_argument("--dry-run", action="store_true", help="只解析不写表")
     args = ap.parse_args()
+
+    # stage 0: 环境预检
+    run_preflight(config_path=_CONFIG, files_dir=args.dir)
 
     nt = Notable()
     files = sorted(f for f in os.listdir(args.dir) if f.lower().endswith(EXTS))

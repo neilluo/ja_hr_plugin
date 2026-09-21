@@ -20,6 +20,9 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
 from notable import Notable, NotableError  # noqa: E402
+from preflight import run_preflight  # noqa: E402
+
+_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.json")
 
 THRESHOLDS = ((70, "推荐"), (40, "待定"))
 
@@ -59,6 +62,9 @@ def main():
     ap.add_argument("--min-score", type=int, default=1, help="落库最低总分（默认 1）")
     ap.add_argument("--dry-run", action="store_true", help="只打分不写表")
     args = ap.parse_args()
+
+    # stage 0: 环境预检
+    run_preflight(config_path=_CONFIG)
 
     nt = Notable()
     jobs = [r for r in nt.list_records("job")

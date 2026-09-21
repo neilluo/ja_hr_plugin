@@ -26,6 +26,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from extract import extract                      # noqa: E402
 from notable import Notable, NotableError       # noqa: E402
 from parse_resume import parse                  # noqa: E402
+from preflight import run_preflight             # noqa: E402
+
+_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.json")
 
 EXTS = (".pdf", ".doc", ".docx", ".png", ".jpg", ".jpeg")
 FULL_TEXT_MAX = 20000  # 全文参考字段截断上限（打分用 skills，不依赖此字段）
@@ -226,6 +229,9 @@ def main():
 
     if bool(args.dir) == bool(args.backfill):
         ap.error("二选一：提供 <目录> 走批量，或用 --backfill JSON 走补录")
+
+    # stage 0: 环境预检
+    run_preflight(config_path=_CONFIG, files_dir=args.dir)
 
     nt = Notable()
     if args.backfill:

@@ -17,6 +17,9 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
 from notable import Notable, NotableError  # noqa: E402
+from preflight import run_preflight  # noqa: E402
+
+_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.json")
 
 # 表结构 = 业务键: (中文字段名, 类型, [单选/多选选项])；与 config.json 的 types/fields 对齐
 SCHEMA = {
@@ -84,6 +87,9 @@ def main():
     ap.add_argument("base_id")
     ap.add_argument("--operator", default=None, help="覆盖 config 的 operator_id")
     args = ap.parse_args()
+
+    # stage 0: 环境预检（Notable() 要读现有 config.json 拿凭证与 operator_id 缺省值）
+    run_preflight(config_path=_CONFIG)
 
     nt = Notable()
     nt.base = args.base_id

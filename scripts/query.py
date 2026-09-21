@@ -17,6 +17,9 @@ from collections import Counter
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared"))
 from notable import Notable  # noqa: E402
+from preflight import run_preflight  # noqa: E402
+
+_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.json")
 
 
 def main():
@@ -26,6 +29,9 @@ def main():
     ap.add_argument("--fields", default="", help="逗号分隔的业务键，缺省全字段")
     ap.add_argument("--stats", action="store_true", help="match 表按岗位聚合统计")
     args = ap.parse_args()
+
+    # stage 0: 环境预检
+    run_preflight(config_path=_CONFIG)
 
     nt = Notable()
     bad = [kv for kv in args.filter if "=" not in kv]

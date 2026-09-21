@@ -59,3 +59,4 @@ python3 scripts/query.py resume --fields name,phone  # 只读，需真实凭证
 - 扫描件 PDF 的 pdftotext 输出是乱码但非空 → 用"抽不出手机号/邮箱"判扫描件，不用文本长度。
 - 解析器返回 list 而表字段是 text（certificates）→ 由入口脚本 join，_cast 不做 str(list)。
 - mock HTTP 测试：handler 必须先读 Content-Length body，否则连接 RST；测试模块别漏 import。
+- 曾在 OpenAPI 重写时连带删掉 shared/preflight.* → preflight 是 stage 0 强制门禁，重写业务脚本时必须同步迁移，不得丢弃。
