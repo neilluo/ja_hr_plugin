@@ -29,6 +29,7 @@
 5. 扫描件/图片（抽不出手机号和邮箱）进 `needs_ocr` 队列不入库，由 agent 用视觉读取后
    经 `Notable.create_records` 补录（见 skills/resume-intake）。
 6. 读回值已归一：singleSelect→字符串、multipleSelect→字符串数组（`Notable._norm`）。
+7. QPS 403（QpsLimitForApi/QpsLimitForAppkeyAndApi）为网关级拒绝、请求未被服务端处理，故可重试且不受 idempotent 门禁约束；stage-0 含整点峰值规避（整点±10s 内等待至整点+10s）；call() 全局 pacing 20 req/s。
 
 ## 验证命令
 

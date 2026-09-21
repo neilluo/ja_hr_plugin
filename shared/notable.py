@@ -15,7 +15,10 @@ import http.client
 import json
 import mimetypes
 import os
+import random
+import re
 import socket
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -26,6 +29,38 @@ API = "https://api.dingtalk.com"
 CACHE = os.path.join(ROOT, ".dingtalk_token_cache.json")
 RETRY_STATUS = {429, 500, 503}
 RETRY_CODES = {"invalidRequest.document.stillInitializing"}
+# 钉钉 QPS 限流的 body code 关键字（HTTP 403 形态）
+QPS_CODES = ("QpsLimitForApi", "QpsLimitForAppkeyAndApi")
+QPS_MAX_ATTEMPTS = 5           # QPS 403 独立重试预算：最多打满 5 次请求
+MIN_INTERVAL = 0.05            # 客户端全局 pacing：相邻请求最小间隔（20 req/s）
+_PACE_LOCK = threading.Lock()
+_PACE_LAST = [0.0]
+_sleep = time.sleep            # 模块级引用，测试可 monkeypatch
+_QPS_END_RE = re.compile(r"限制将在 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) 结束")
+
+
+def _qps_wait(message, now=None):
+    """QPS 403 的等待秒数：解析 message 中「限制将在 YYYY-mm-dd HH:MM:SS 结束」，
+    wait=(结束-now)，clamp 到 [1.0, 5.0]；解析失败退化为 1.5 + [0, 0.5) 随机抖动。"""
+    now = time.time() if now is None else now
+    m = _QPS_END_RE.search(message or "")
+    if not m:
+        return 1.5 + random.uniform(0, 0.5)
+    try:
+        end = time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
+    except (ValueError, OverflowError):
+        return 1.5 + random.uniform(0, 0.5)
+    return max(1.0, min(5.0, end - now))
+
+
+def _pace():
+    """客户端全局 pacing：持锁计算距上一请求的间隔，不足 MIN_INTERVAL 则补齐。
+    sleep 期间持锁使并发线程排队为均匀间隔。OSS PUT 走 put() 不经此处，天然豁免。"""
+    with _PACE_LOCK:
+        delta = MIN_INTERVAL - (time.monotonic() - _PACE_LAST[0])
+        if delta > 0:
+            _sleep(delta)
+        _PACE_LAST[0] = time.monotonic()
 
 
 class NotableError(Exception):
@@ -97,7 +132,9 @@ class Notable:
         headers = {"Content-Type": "application/json"} if raw is None else {"Content-Type": "application/octet-stream"}
         if raw is None:
             headers["x-acs-dingtalk-access-token"] = self.token()
-        for attempt in range(retries + 1):
+        attempt, qps_attempts = 0, 0
+        while True:
+            _pace()
             req = urllib.request.Request(url, data=data, headers=headers, method=method)
             try:
                 with urllib.request.urlopen(req, timeout=60) as r:
@@ -108,24 +145,35 @@ class Notable:
                     err = json.loads(payload or b"{}")
                 except ValueError:
                     err = {"message": payload[:200].decode("utf-8", "replace")}
+                msg = err.get("message", "")
+                # QPS 403 限流：网关级拒绝，请求未被服务端业务处理，故重试不会双写，
+                # 可豁免 idempotent 门禁；独立预算最多 QPS_MAX_ATTEMPTS 次请求，不消耗
+                # 普通 attempt 计数。耗尽后 fall through 到原抛错路径。
+                # 普通权限类 403 不含 QpsLimit 码，不进此分支，维持零重试。
+                if e.code == 403 and any(c in err.get("code", "") for c in QPS_CODES):
+                    qps_attempts += 1
+                    if qps_attempts < QPS_MAX_ATTEMPTS:
+                        _sleep(_qps_wait(msg))
+                        continue
                 retryable = (e.code in RETRY_STATUS or err.get("code") in RETRY_CODES) and idempotent
                 if e.code == 401 and attempt == 0:
                     self.token(force=True)
                     headers["x-acs-dingtalk-access-token"] = self._token
                     retryable = True
                 if retryable and attempt < retries:
-                    time.sleep(1.5 * 2 ** attempt)
+                    _sleep(1.5 * 2 ** attempt)
+                    attempt += 1
                     continue
-                raise NotableError("HTTP %s %s: %s" % (e.code, err.get("code", ""), err.get("message", "")))
+                raise NotableError("HTTP %s %s: %s" % (e.code, err.get("code", ""), msg))
             except (urllib.error.URLError, http.client.HTTPException,
                     socket.timeout, ConnectionError, TimeoutError) as e:
                 # 连接层故障（含响应丢失的 RemoteDisconnected/IncompleteRead）：
                 # 写请求结果未知，重试可能双写，一律不重试直接抛错，由查重自愈兜底。
                 if attempt < retries and idempotent:
-                    time.sleep(1.5 * 2 ** attempt)
+                    _sleep(1.5 * 2 ** attempt)
+                    attempt += 1
                     continue
                 raise NotableError("网络错误 %s: %s" % (path, getattr(e, "reason", e)))
-        raise NotableError("重试耗尽: " + path)
 
     def put(self, url, raw, mime, retries=3):
         """裸 PUT（OSS 直传），带指数退避重试；失败抛 NotableError。"""

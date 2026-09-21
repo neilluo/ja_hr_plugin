@@ -21,11 +21,44 @@ On success: prints a brief summary to stderr and returns normally.
 import json
 import os
 import sys
+import time as _time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 _CREDS_MSG = ("凭证缺失：请创建 .secrets.json (gitignored) "
               "或设置 DINGTALK_APP_KEY / DINGTALK_APP_SECRET 环境变量")
+
+# 整点峰值规避：钉钉 QPS 配额按整点重置，整点前后是全网请求高峰。
+# [整点-10s, 整点+10s) 窗口内等待到「整点+10s」（最长 20s）。
+_PEAK_WINDOW = 10.0
+
+# 时钟与 sleep 可注入（模块级引用，测试 monkeypatch 后不真等）
+_localtime = _time.localtime
+_sleep = _time.sleep
+
+
+def _peak_wait(now=None):
+    """返回距「整点+10s」的等待秒数；窗口外返回 0。
+
+    窗口 = [整点-10s, 整点+10s)，即 minute==59 且 second>=50（跨小时边界），
+    或 minute==0 且 second<10。
+    """
+    now = _localtime() if now is None else now
+    if now.tm_min == 59 and now.tm_sec >= 60 - _PEAK_WINDOW:
+        return (60 - now.tm_sec) + _PEAK_WINDOW
+    if now.tm_min == 0 and now.tm_sec < _PEAK_WINDOW:
+        return _PEAK_WINDOW - now.tm_sec
+    return 0.0
+
+
+def _avoid_peak(checks):
+    """整点峰值规避：窗口内 sleep 到整点+10s，peak_wait 写入 checks 供报告输出。"""
+    wait = _peak_wait()
+    if wait > 0:
+        _sleep(wait)
+    checks["peak_wait"] = {"pass": True, "info": "%.1fs" % wait, "error": None,
+                           "seconds": round(wait, 1)}
+    return wait
 
 
 # --------------------------------------------------------------------------- #
@@ -187,6 +220,9 @@ def run_preflight(config_path=None, files=None, files_dir=None, secrets_path=Non
     if blocker:
         _report_and_exit(checks, blocker)
 
+    # 6. 整点峰值规避：全部检查通过、即将进入触网阶段时才等待（阻断路径无请求，不等）
+    _avoid_peak(checks)
+
     # All pass — brief summary to stderr
     _print_summary(checks)
     print("  全部通过，可继续执行", file=sys.stderr)
@@ -204,6 +240,8 @@ def _print_summary(checks):
                 print("  [OK] %s: %s" % (key, c.get("info", "")), file=sys.stderr)
             else:
                 print("  [FAIL] %s: %s" % (key, c.get("error", "")), file=sys.stderr)
+    if "peak_wait" in checks:
+        print("  [OK] peak_wait: %.1fs" % checks["peak_wait"]["seconds"], file=sys.stderr)
 
 
 def _report_and_exit(checks, blocker):
@@ -216,6 +254,7 @@ def _report_and_exit(checks, blocker):
     print("处理: %s" % next_action, file=sys.stderr)
 
     # Machine-readable line for agent
-    result = {"ok": False, "blocker": blocker, "next_action": next_action}
+    result = {"ok": False, "blocker": blocker, "next_action": next_action,
+              "peak_wait": checks.get("peak_wait", {}).get("seconds", 0)}
     print("PREFLIGHT:" + json.dumps(result, ensure_ascii=False))
     sys.exit(1)
