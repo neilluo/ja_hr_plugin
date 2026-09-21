@@ -1,172 +1,85 @@
-招聘智能匹配套件·极速版 recruit-match-suite-fast · 说明文档
-版本：v0.2.0（2026-09-17）｜ 适用对象：套件使用者和复制/复用方 ｜ 数据底座：钉钉 AI 表格（Base「招聘筛选」）+ 钉钉
+# 招聘智能匹配（OpenAPI 直连版）
 
-一句话：业务口径与老版 recruit-match-suite 完全一致的招聘全链路套件——「建坑 → 收人 → 匹配 → 核查 → 推荐 → 复盘」；差别在执行机制：解析、查重、批量落库、附件上传、评分与岗位统计全部下沉到自带 Python 脚本批量完成，AI 只在一个回合里做一次批量语义判定。**脚本批量驱动，只在语义判定用算力。**
+基于钉钉 AI 表格（Notable）OpenAPI 的 HR 招聘套件。Python 直连云端，无 dws 中转、
+无状态机：解析 → 查重 → 附件上传 → 批量写表 → 回读校验，一条命令完成。
 
-为什么快（实测支撑数字）：
-- 老版 agent 在对话里逐条敲 dws 命令，一份简历 20~40 个工具回合，每回合边际墙钟成本 5.4 秒（大模型推理 ~4s + 命令本身 ~1.3s）。
-- 批量写 31 条记录：1.38s / 1 次调用（逐条：38.79s / 31 次）。
-- 批量查重 31 人：1.33s / 1 次（逐条：39.50s / 31 次）。
-- 附件并发 5 上传：2.79s（串行：5.59s）。
-- 批量语义判定 10人×19岗：一次 368s（逐人串行外推 2534s，6.88×）。
-- 结果：整批工作只花 3~4 个 agent 回合（Turn 1 跑脚本 → Turn 2 一次批量判定 → Turn 3 跑脚本）。
+## 快速开始
 
-核心闭环（表格内闭环，暂不含消息推送与 cron）：
+```bash
+# 0. 凭证（二选一，仓库 public 切勿提交）
+echo '{"app_key":"...","app_secret":"..."}' > .secrets.json
+# 或 export DINGTALK_APP_KEY=... DINGTALK_APP_SECRET=...
 
-建坑 ──────► 收人 ──────► 匹配 ──────► 打分 ──────► 推荐
-（岗位入库）  （简历入库）  （定向生成）  （脚本重算）  （阈值定状态+汇总）
+# 1. 岗位 JD 入库
+python3 scripts/upload_jobs.py /path/to/岗位说明书
 
-    ▲                                              │
-    │                                              ▼
-    └────────────── 复盘（看板 / 候选人查询）◄──────┘
+# 2. 简历入库（含附件上传）
+python3 scripts/upload_resumes.py /path/to/AI简历
 
+# 3. 查询
+python3 scripts/query.py resume --fields name,phone,education
+python3 scripts/query.py match --stats
 
-一、开始之前：依赖与准备
+# 4. 匹配打分（写 match 表 + 刷新岗位统计，幂等）
+python3 scripts/match.py
 
-1. 连接器（开启即用）
+# 5. 跨组织复制表结构（可选）
+python3 scripts/replicate_base.py <新baseId>
+```
 
-数据底座是钉钉 AI 表格，走千问办公内置的「钉钉」连接器：开启路径 千问办公 → 设置 → 连接器 → 找到「DingTalk / 钉钉」→ 开启并授权。不连的降级行为：只能输出结构化草案/建议清单，无法落库。本套件不含 .mcp.json 引导配置项。
+每条命令输出 JSON 报告：`total / parsed / skipped_dup / needs_ocr / failed /
+created / readback_missing`。`readback_missing` 非空或 `failed` 非空时 exit 1。
+`--dry-run` 只解析不触网写表。
 
-2. 本机 Python 运行时（诚实前提，必读）
+## 代码地图（全部 Python 约 860 行）
 
-- 脚本**零第三方 pip 依赖**（olefile 与 pypdf 已 vendor 进 shared/vendor/，含原 LICENSE），干净环境即可跑；兼容 Python 3.9+。
-- 但**需要机器上存在 python3**。千问办公不自带 python 运行时；**macOS 12.3 及以后也不预装 python3**——`/usr/bin/python3` 只是一个会弹出「需要安装命令行开发者工具」对话框的占位触发器，不是可用的解释器。所以 macOS 与 Windows 两个平台都得先装一次（对非开发岗来说负担差不多，别指望系统自带）；装完之后 agent 会自己调用，HR 不需要再碰命令行。Windows 装官方 Python 并用 `py -3` 调用，裸 `python` 别名可能静默失败、退出码 49。
-- `dws` CLI 需已登录且授权组织与目标 Base 一致。
+| 文件 | 行数 | 职责 |
+|---|---|---|
+| `shared/notable.py` | ~230 | 唯一传输层：token 缓存、重试、记录 CRUD、类型转换、附件三步上传 |
+| `shared/extract.py` | ~105 | 文本提取：pdf(pdftotext→pypdf) / docx(zip→textutil) / doc(textutil→olefile) / 图片标记 OCR |
+| `shared/parse_resume.py` | ~160 | 简历字段抽取（正则+词表） |
+| `shared/parse_job.py` | ~120 | JD 字段抽取（文件名拆部门+正文切段） |
+| `scripts/upload_resumes.py` | ~105 | 简历入库入口 |
+| `scripts/upload_jobs.py` | ~90 | 岗位入库入口 |
+| `scripts/query.py` | ~60 | 只读查询/统计入口 |
+| `scripts/match.py` | ~130 | 匹配打分：简历×岗位 → match 表 + 岗位统计 |
+| `scripts/replicate_base.py` | ~110 | 新 Base 重建四表结构 |
+| `shared/vendor/` | — | 内置 pypdf / olefile（零 pip 依赖） |
 
-首次使用自检（两条命令验证 python 版本界与 dws 登录态，**分开执行、不要用 `&&` 串**：PowerShell 5.1 不认 `&&`，Windows 用户粘进去直接报「标记"&&"不是此版本中的有效语句分隔符」）：
+## 表结构（config.json）
 
-    # ① Python 版本界检查：要求 >= 3.9。低于 3.9 当场抛 AssertionError，不会拖到 import 才炸
-    python3 -c "import sys;assert sys.version_info[:2]>=(3,9),sys.version;print(sys.version)"
-    # ② dws 登录态检查
-    dws aitable base list --limit 1
-    # Windows: 把 ① 的 python3 换成 py -3（不要用裸 python，可能是 Microsoft Store 别名，静默失败、退出码 49）
+四张表：`resume` 简历库管理 / `job` 岗位JD表 / `match` 智能匹配 / `perm` 权限配置。
+config.json 只存 `base_id`、`operator_id`、每表的 `table_id` 与 业务键→中文字段名 映射、
+字段类型表。OpenAPI 记录接口以中文字段名为 key，无需字段 ID。
 
-两项都通过（打印版本号 + 返回 Base 列表）即可开始；任何一项失败先修环境再入库。
+简历业务键：name phone email education school school_rank years_experience major
+certificates expected_position expected_location expected_salary skills attachment
+upload_time category comm_status org full_text attach_md5
 
-3. 组织口径（重要，与老版一致）
+岗位业务键：job_id job_name department org status work_location responsibilities
+requirements hard_gates must_skills bonus_skills must_weight bonus_weight submit_time
+attachment stat_total stat_recommend stat_pending stat_reject
 
-- 匹配只在同一「组织分类」内发生：简历的「简历库所属组织」必须等于岗位的「组织分类」。当前组织取值：职能中心 / 制造中心。
-- 新增组织（如研发中心）时，岗位表 / 简历库 / 匹配表三处的组织选项都要同步添加，缺一侧即匹配不到。
-- 连接器授权哪个组织，读写的就是哪个组织的 AI 表格；出现"查不到数据/匹配不到"先检查登录组织是否漂移。
+## 业务规则
 
-4. 首次配置：config.json（脚本唯一 ID 源）
+- **查重**：简历 附件MD5 → 手机号（含批内）；岗位 md5(部门|岗位名)。重跑幂等。
+- **扫描件**：抽不出手机号且抽不出邮箱 → `needs_ocr`，不入库，交 agent 视觉补录。
+- **附件**：uploadInfos 取 uploadUrl/resourceId → 裸 PUT OSS → 记录里写
+  `[{filename,size,type,url:resourceUrl,resourceId}]`。附件失败则该条不写表。简历与 JD 同纪律。
+- **回读**：写后按手机号/job_id 全量回读比对，缺失即失败。
+- **限流**：429/5xx/文档初始化中 指数退避重试 3 次；401 自动刷 token 重试一次。
+- **并发**：附件上传经 `Notable.map_parallel` 5 线程并发（I/O 密集）；解析与记录写串行。
+  实测 28 简历+附件全链路 27s（串行附件版 42s）。
+- **留空字段**：`org`（简历库所属组织）与岗位统计四字段由人工/匹配流程维护，脚本不写。
 
-所有脚本通过插件根目录的 `config.json` 做业务名→真实 ID 映射（脚本内零硬编码 ID）。**存放位置已冻结（契约 v3 §9#8）：插件根目录 `$PLUGIN_ROOT/config.json`，与 `config.example.json` 同级**；脚本只认 `--config` 传入的绝对路径，各 SKILL.md 一律用相对路径 `../../config.json`（相对技能目录）表述。结构示例见根目录 `config.example.json`（示例文件不可直接运行）。
-两条分支：
-- 已有招聘筛选表（只是没接套件）→ 走「复刻部署」技能的阶段③：反查表/字段/选项 ID，生成本机 config.json，并同步人读视图 skills/recruit-model/references/system-config.md（双写）。
-- 还没有表（新组织从零搭建）→ 说"在新组织复刻一套招聘系统"，走「复刻部署」四阶段：建 Base 与四表 → 接线生成 config.json → 端到端验收。
-多公司/一部门一表：各自机器上各自生成自己的 config.json（不进版本库），互不污染；换机器复制 config.json 或重跑接线。
+## 依赖
 
-注意：极速版标准结构比老版多了几个普通字段（简历：专业/证书/简历全文/附件内容MD5；智能匹配：岗位ID(text)/匹配依据）。接入老的生产表前需先补建这些字段并重新接线（复刻部署技能会引导）。其中「附件内容MD5」(text, 业务键 `attach_md5`) 是**可选键**：配了库内附件去重才走内容级比对（真 MD5），没配则自动回退「文件名+字节大小」并在报告里告警说明如何启用——脚本不崩溃、不自建字段。
+- Python ≥ 3.9，stdlib only（+ vendor 内 pypdf/olefile）。
+- 外部二进制（可选回退）：`pdftotext`、`textutil`(macOS)。
+- 钉钉应用权限点：`Notable.Base.Read.All`、`Notable.Base.Write.All`、`Storage.File.Read`。
 
+## 测试
 
-二、角色与能力全景
-
-角色              可用技能                                                        核心动作
-HR专员/HRBP       岗位入库 / 简历入库 / 定向匹配 / 招聘查询 / 招聘看板 / 复刻部署   建坑、收人、核查匹配、看全局、跟进进展
-用人经理          招聘查询                                                          看某岗位有哪些推荐候选人
-HR/用人经理共用   招聘查询（候选人向）                                              查某候选人匹配了哪些岗位
-（内部）          招聘底座 recruit-model                                            共享知识库：口径、纪律、判定规范，不直接调用
-
-入库技能对单个与批量文件共享同一脚本链路：一次调用整批完成（提取 → 预填 → 批量查重 → 批量写 → 并发附件 → 回读 → 报告），文件数量不同、落库规则一致；agent 只在报告审阅与批量语义判定回合出手。
-
-
-三、快速上手：5 分钟跑通主链路
-
-建坑：上传一批岗位说明书说"入库这些 JD" → 脚本一次完成解析/查重/批量写入/附件 → agent 一个回合规整硬性门槛四项、切分必备/加分技能、归一部门与组织 → 脚本一次应用并回读 → 出岗位入库清单。
-收人：上传一摞简历说"解析入库" → 脚本一次完成解析/手机号查重/批量写库/原文件名并发附件 → agent 转述清单、复核低置信组织与估算年限 → 默认接续定向匹配。
-匹配：脚本生成判定输入（≤8 人/片）→ agent 逐片做批量语义判定（硬门槛一票否决 + 命中项 + 原文引用，不输出分数）→ 脚本校验后批量建匹配记录、重算分数与岗位统计、回读 → 出匹配结果清单。
-查询：说"暖通工程师有哪些候选人""石昊匹配了哪些岗位""现在招聘进展如何" → 一次批量只读查询 → 业务化清单返回。
-看全局：说"招聘看板" → 一屏 HTML（在招岗位、候选人总数、已推荐、待补缺口）。
-
-
-四、技能详解（每个入库/匹配技能都是固定"三步走"）
-
-4.1 岗位入库 /job-intake（HR）
-怎么说：上传 1 个或多个岗位说明书（Word/PDF），说"入库这些 JD"。
-三步走：Turn 1 `intake_job.py --files ...`（解析+正则预填+按"岗位名+部门+组织"批量查重+批量写+并发附件；岗位ID 由脚本分配 JOB-序号、全表唯一，agent 只在缺失时续编）→ Turn 2 agent 一次批量归一化（硬性门槛四项拆解、"持证者优先"归加分不归门槛、必备/加分技能切分、部门与组织归一、权重与岗位ID核对）产出 jobs_final.json（=草稿元素原样保留 key/record_id，仅修订语义字段，结构已冻结）→ Turn 3 `intake_job.py --apply jobs_final.json`（批量写回+回读+报告）。
-产出：岗位入库清单（逐文件一行 ✅/⏭️/❌ + 小计）。
-**一处业务语义弱化需客户决定**：老插件「需求提交人」为必填（=当前登录用户）；极速版按契约 v3 §9#5 降级为**可选**——config.json 的 `fields.job` 配置了可选键 `submitter` 时脚本自动回填当前登录用户，未配置时该列留空并在报告 warnings 里说明。客户表里保留/需要该列的，请补建 user 字段并在 config.json 补 `submitter` 映射（是否补由客户决定）。
-
-4.2 简历入库 /resume-intake（HR）
-怎么说：上传 1 个或多个简历（PDF/Word），说"解析入库"。
-三步走：Turn 1 `intake_resume.py --files ...`（提取（**macOS 上扫描件/图片简历自动走系统 Vision OCR 救回入库**，零依赖纯本地不出网，首次运行可能弹一次 macOS 授权弹窗；**P4a 起非 macOS/OCR 不可信的文件不再判死**：脚本打印一行 `VISION_NEEDED: <绝对路径...>`，agent 一轮多模态读完全部列出文件、按 schema 写补丁 json、重跑同命令加 `--apply-vision-patch` 即可入库——agent 只产出结构化补丁绝不写库，草稿字段打 `field_source=agent_vision` 并进 `needs_review` 由回合 2 复核；本批 ≥5 份且读不出份数 >20% 触发闸门：本轮不写任何记录、`reason=vision_gate`（`VISION_NEEDED:` 清单照常打印，agent 仍打补丁重跑同一命令即可入库；补丁之后仍读不出的才请用户确认整批格式问题）；失败清单语义收窄为"仅加密/损坏/补丁未覆盖才失败"）+预抽字段+去重（本批内/checkpoint/库内附件**一律真 MD5**：库内比对键 = 简历库「附件内容MD5」字段，同内容换文件名也判重复、同名同大小但内容不同则不判重复而走覆盖更新；老库没这个字段时自动回退「文件名+字节大小」并告警说明如何启用）+手机号批量查重+批量写+技能标签只增不删+期望地点兜底「不限」+并发原文件名附件+回读；checkpoint **增量落盘**幂等续跑，`--wall-budget`（默认 100s）到点 graceful 停并打印 `RESUME:`，重跑同一命令续跑不产生重复记录；补传附件路径每轮上限 100 份、超出 defer 下一轮；`turns_saved_estimate` 只按已完成文件计）→ Turn 2 agent 审阅报告（转述清单、加密/损坏如实告知不硬造、OCR/agent 补丁救回件的小误读与人工确认警告照转、手机号冲突停下问用户、低置信组织复核）→ Turn 3 默认接续定向匹配。
-产出：简历入库清单 + 待关注项；用户可"先不传附件"（--no-attachment）之后补传。
-
-4.3 定向匹配 /match-verify（HR）
-怎么说："匹配"／"定向匹配"，或"给汪一兵做匹配""重建全部匹配"（破坏性，先业务话确认 + --dry-run 预演）。
-三步走：Turn 1 `build_match_input.py --candidates candidates.json`（本批候选人）或 `--from-table [--org 制造中心|职能中心] [--exclude-onboarded]`（**表内存量候选人**，供"指定岗位反向匹配/重建全部匹配"；两种模式产出的 candidates 结构完全同构），从表里查在招岗位，生成 digest（顶层带 ok/errors，D7 口径统一）并按 ≤8 人/片切分（用户明确知情可上调至 16，禁止 >16）→ Turn 2 agent 逐片批量语义判定（硬门槛四项一票否决、skill_hits/bonus_hits/recommend/evidence≤80字原文、估算年限复核、稀疏字段补齐——candidate_overrides 七个键 org/category/expected_location/skills_extra/certificates_extra/years_experience/org_reason、低置信组织判定；**不输出分数**）产出稀疏 decisions.json，`verify_decisions.py` 校验通过 → Turn 3 `apply_decisions.py`（脚本重算分数与推荐状态、批量建匹配记录、从表内全部匹配记录重算岗位统计并回填、overrides 写回简历库、回读）。
-产出：定向匹配清单（候选人｜岗位｜匹配度｜技能｜加分｜结论）+ 未过门槛岗数与原因汇总。
-
-4.4 招聘查询 /candidate-query（HR·用人经理共用）
-怎么说："暖通工程师有哪些候选人"／"石昊匹配了哪些岗位"／"现在招聘进展如何"。
-纯读、一次批量查询取整批（不逐条敲命令）；重名列候选让用户辨认、绝不默认取第一条；不依赖 filterUp/AI 字段，明细按岗位ID查匹配表。产出业务化清单。
-
-4.5 招聘看板 /recruit-dashboard（HR·主管，精简版）
-怎么说："招聘看板"。一次只读查询在招岗位与四个统计数（由匹配脚本重算回填，看板直接读取），渲染单文件 HTML `招聘看板_YYYYMMDD.html`：KPI 行 + 岗位卡片（推荐数 0 标红"待补"）+ 最紧缺 Top3。
-
-4.6 复刻部署 /replicate（新组织落地 / 接线）
-怎么说："在新组织复刻一套招聘系统"，或已有表要生成本机 config.json。
-四阶段（每阶段确认再继续）：① 环境与组织口径确认（含 python/dws 自检）② 按标准结构建 Base 与四表 ③ 反查真实 ID 生成 config.json + 同步 system-config.md（双写）④ 各入库 1 JD + 1 简历端到端验收。
-铁律：不跨组织搭建、不猜 schema、写前确认 + 写后回读。AI 字段/双向关联/filterUp 为可选表格侧增强，极速版一律不依赖，是否补建由客户决定。
-
-4.7 招聘底座 /recruit-model（内部，不可直接调用）
-共享知识库：system-config.md（四表结构、组织口径、评分与推荐口径、查重主键、config.json 说明）、execution-notes.md（沟通铁律、三段式纪律、产物凭证校验、分片、跨平台、选项维护、清单式输出）、parsing-methods.md（提取梯队与失败口径）、ai-analysis-spec.md（Turn 2 批量判定规范 + 旧版 AI 字段同构规范）。所有技能执行前先读它。
-
-
-五、数据模型一览（极速版）
-
-四表：岗位JD表 / 简历库管理 / 智能匹配 / 权限配置。关键逻辑：
-- **岗位ID（JOB-序号）是唯一键**：匹配表用普通 text 字段存岗位ID 与岗位表勾连（不依赖 lookup/双向关联），同名岗不串档。
-- **四个统计数是普通数字字段、由脚本重算**：每次应用匹配后，脚本从表里查该岗位全部匹配记录（含人工匹配与历史）重算 候选人总数/推荐数/待定数/不推荐数，一次批量回填——不用本批判定直接累加，杜绝统计漂移。
-- **分数由脚本重算，模型不输出分数**：agent 只给命中项（skill_hits/bonus_hits，必须是岗位技能分母的子集，越界作废）与推荐预判；技能得分=命中率×100、总分=70%/30% 加权（权重取岗位字段）、≥80 推荐 / 60–79 待定 / <60 不推荐、硬门槛一票否决——全部由 apply 脚本按口径执行并回读。
-- **匹配依据（evidence）**：agent 判定的原文引用（≤80字）写入匹配表普通 text 字段，替代老版 AI匹配分析的作用；可追溯、零 AI 额度。
-- AI 字段（AI结构化提取/AI深度解析/AI匹配分析）已移出热路径：异步 1~3 分钟且吃 AI 额度（免费版 500 次/月），插件不依赖其结果，是否保留在表里由客户决定。
-
-推荐口径：总分 = 技能得分×必备技能权重 + 加分项得分×加分项权重（缺省 70/30），≥80 推荐、60–79 待定、<60 不推荐；硬性门槛（学历/专业/经验年限/证书）任一不达标直接出局、不建记录。
-
-
-六、安全与行为约定（与老版一致）
-
-- 写前确认、写后回读：覆盖、删除、重建全部匹配等落库前用业务话讲清"对谁做什么、后果"，确认才执行；破坏性场景先 --dry-run 预演。写后回读由脚本自动完成，agent 只认产物报告 ok==true 与逐行结果，不只凭退出码宣称成功。
-- 防静默早退：每个脚本在 stdout 末行打印 ARTIFACT:<路径> 产物凭证；agent 必须校验产物存在且 ok==true 才进下一步，否则重跑该步（最多 2 次），仍失败如实告知——禁止跳过或假装成功。
-- 只说业务语言：对用户只讲岗位/候选人/匹配结果/推荐状态，绝不出现表ID、字段ID、fieldId、命令、JSON、脚本路径。
-- 不猜原则：组织判不了就问（低置信由 agent 依原文复核，判不了才问用户）、手机号冲突但姓名不同就停、解析不出可信文本（加密/损坏/OCR 不可信/乱码）不硬造字段（macOS 上扫描件/图片会先自动 OCR 救回，救回件的"可能有小误读"警告照转）、估算的工作年限必须用原文复核后才可用于硬门槛、部门或标签缺失先补选项再入库且保留原有全部选项及其 id（只增不删）。
-- 清单式留痕：单个/批量、入库/匹配/查询，每次操作后必出清单（✅/⏭️/❌ + 小计 + 失败原因与下一步建议），失败项与警告不隐藏。
-- 已入职不再匹配：沟通状态=已入职为终止态，不参与匹配、其系统匹配记录删除（长期规则，无需逐次确认）。
-- 岗位判重三段式：岗位名称+部门+组织分类三者全同才算重复；不同组织下同名同部门岗视为不同。
-- 期望地点必填：没有明确地点一律「不限」（脚本兜底），agent 从原文看出明确城市再覆盖。
-- 附件一律原始文件名，禁止改名/加序号前缀；脚本并发上传（并发度 5）。
-- 查重重试与限流由脚本内部处理（3 次指数退避；越权/校验失败进报告失败行与警告，禁止静默丢弃）。
-- 本版本边界：不含钉钉消息推送、DING、晨报 cron、发群通晒；纯表格内闭环。匹配非"永远在线"：由技能触发（入库后接续，或说"匹配/重建全部匹配"）；有人绕过技能直接改表时，跑一次"重建全部匹配"对齐。
-
-
-七、FAQ
-
-Q1：不连连接器能用吗？ 可以出结构化草案与建议清单，但落库、匹配、看板取数需要钉钉连接器与 dws 登录态。
-Q2：机器上没有 python 怎么办？ 脚本零 pip 依赖但需要 python3 运行时（3.9+）。安装后跑自检命令（见第一章）再使用；Windows 用 `py -3`，裸 `python` 别名可能静默失败（退出码 49）。
-Q3：为什么某人入库了却没匹配到岗位？ 九成是"所属组织"为空或与岗位不一致——匹配只在同一组织内发生；其次是硬性门槛未过（不达标根本不建记录，清单里会写明原因与岗数）。
-Q4：为什么工作年限和我看的不一样？ 正文没写年限时脚本会按日期估算并标记"需复核"，agent 会在判定回合用原文复核修正；修正情况在清单"待关注"里说明。
-Q5：综合评分和岗位匹配分是一回事吗？ 不是。综合评分（技能40/经验30/学历20/潜力10）评候选人本身；岗位匹配分评"人配这个岗"（命中率×权重、80/60 阈值），由脚本重算。
-Q6：会不会误删匹配？ 门槛不过的组合根本不建记录（无需删）；"重建全部匹配"是破坏性重算，执行前业务话确认 + --dry-run 预演，人工匹配记录永不动。查询与看板全程只读。
-Q7：表里原来的 AI 字段还要吗？ 插件不依赖（异步 1~3 分钟、吃 AI 额度）。留着不影响运行、删掉也不影响；由客户决定。agent 的判定依据写在「匹配依据」普通字段里，即时可查。
-Q8：换组织/新团队/第二家公司要用怎么办？ 各自机器跑「复刻部署」：建四表 → 接线生成各自的 config.json → 端到端验收。config.json 互不污染，不进版本库。
-Q9：想退回老版逐条模式？ 老插件目录 recruit-match-suite-v0.1.0 原样保留，业务口径两版一致，数据同库可互换使用（极速版新增字段对老版无影响）。
-Q10：上传到一半失败了怎么办？ 直接重跑同一命令——checkpoint.json 增量记录每份文件的「记录已写/附件已传」状态（一确立就落盘，被杀也不丢进度），重跑跳过已成功项不重放、只欠附件的仅补附件；stdout 出现 `RESUME:` 行（墙钟预算耗尽，报告 partial=true）同样重跑同一命令续跑。要彻底重来加 --reset。
-
-
-八、速查卡
-
-场景        你说/你做                            你拿到
-建一个坑    [JD文件] 入库这些JD                  岗位入库清单（✅/⏭️/❌ + 小计）
-收一个人    [简历] 解析入库                      简历入库清单 + 接续匹配结果
-一次多份    一次传多个 JD/简历                   同一链路整批处理，批量汇总清单
-做匹配      匹配 / 给XX做匹配 / 重建全部匹配     只建达标岗 + 脚本重算三项分与推荐状态 + 岗位统计回填
-找人        暖通工程师有哪些候选人               候选人清单（按匹配度排序）
-查人        石昊匹配了哪些岗位                   岗位匹配清单
-问进展      现在招聘进展如何                     各在招岗位候选人/推荐汇总
-看全局      招聘看板                             一屏 HTML（含待补缺口）
-新组织落地  在新组织复刻一套招聘系统             四阶段部署 + config.json 接线 + 端到端验收
-环境自检    两条命令分开跑，别用 && 串（PowerShell 5.1 会当语法错；Windows 用 py -3，别用裸 python）：① python3 -c "import sys;assert sys.version_info[:2]>=(3,9),sys.version;print(sys.version)" ② dws aitable base list --limit 1   两项通过即可开工（要求 Python 3.9+，越界当场抛 AssertionError）
-
-本套件辅助团队招聘筛选流程，破坏性写入均需用户确认后执行；匹配分数与推荐为参考、不替代用人判断，判定依据（原文引用）随记录留档供人工复核。技术细节（字段映射、评分口径、判定规范、执行纪律）见 skills/recruit-model/references/ 与 skills/replicate/SKILL.md。
+```bash
+python3 -m unittest discover -s tests
+```

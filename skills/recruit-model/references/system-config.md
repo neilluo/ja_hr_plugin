@@ -1,158 +1,45 @@
-# 招聘筛选系统配置（Recruitment System Config · 极速版）
+# system-config — 表结构与运行配置（OpenAPI 直连版）
 
-> 本文件是套件所有技能的共享事实源（**人读视图**）。执行任何操作前先读本文件，任何写入前必须遵守本文件的字段与规则。
-> **脚本运行时的唯一 ID 源是插件根目录的 `config.json`**（业务名 → 真实 ID 映射，由「复刻部署」技能生成，格式见根目录 `config.example.json`）。本文件与 config.json 是**双写**关系：改动任一侧必须同步另一侧；若实查发现与实际表结构不符，以 `dws aitable field list` / `+field-get` 实查为准，回填 config.json 并同步本文件。
-> 表内 ID 仅供代理与脚本内部使用，**严禁在对话中向用户暴露**（表名/字段名可用业务话，ID 一律不出现）。
+## Base 与表
 
-## 0. 数据底座与连接
+Base「招聘筛选」`0eMKjyp813njqxkNhrKkx0nPVxAZB1Gv`，四表：
 
-- 数据底座：钉钉 AI 表格（通过已连接的钉钉/DWS 连接器访问），命令前缀 `dws aitable`。**热路径上的全部 dws 调用通过 emit/replay 两阶段模式完成**，agent 不逐条敲命令。
-- Base 名称：**招聘筛选**（客户生产环境默认值；复刻部署到其它组织时以该机器的 config.json 为准）。
-- 运行时前提：本机存在 Python 3（3.9+，零第三方 pip 依赖）+ `dws` 已登录。千问办公不自带 python 运行时。
-- 无需 `.mcp.json` 引导配置；钉钉连接器在「设置 → 连接器」开启即可。
-
-## 1. 四张表总览（config.json 里的 table_key）
-
-| table_key | 表名（业务） | 作用 |
+| 业务键 | 表名 | table_id |
 |---|---|---|
-| `job` | 岗位JD表 | 在招岗位主表；四个统计数由脚本重算回填 |
-| `resume` | 简历库管理 | 候选人简历主表；查重主键=手机号 |
-| `match` | 智能匹配 | 简历↔岗位的匹配记录，评分与推荐状态在此 |
-| `perm` | 权限配置 | 用户↔组织分类的可见范围（一般不改动） |
+| resume | 简历库管理 | ohY4Dp6 |
+| job | 岗位JD表 | 5Y4JylL |
+| match | 智能匹配 | PpMmjfG |
+| perm | 权限配置 | Sz7mZDn |
 
-## 2. 组织口径（匹配的前提，最容易踩坑）
+config.json 只存 `base_id` / `operator_id` / 每表 `table_id` / 业务键→中文字段名 /
+字段类型表。**OpenAPI 记录接口以中文字段名为 key，不需要字段 ID**；Base 里新增列时
+往 config.json 加一行即可。
 
-- 组织分类可选值（三张表一致）：**职能中心** / **制造中心**。
-- 匹配只在**同一组织分类**内发生：简历的「简历库所属组织」必须等于岗位的「组织分类」，否则匹配不到任何岗位。
-- 新增组织（如「研发中心」）时，**岗位表 / 简历库 / 匹配表三处的组织选项都要同步新增**，缺一侧即匹配不到。
-- 判断不了归属时从简历/JD 文本推断：制造基地/厂务/设备/EHS → 制造中心；财务/行政/人力/数据信息 → 职能中心；**仍无法判断 → 问用户，不猜**。digest 中 `org_confidence=="low"` 的候选人由 agent 在批量判定回合复核，判不了才问用户。
-- **已入职不再匹配**：候选人「沟通状态=已入职」视为终止态，不参与匹配、其系统匹配记录一律删除、不打分、不推荐（长期规则，无需逐次确认）。其余状态（待筛选/流程中/简历未通过/面试未通过）正常参与、可复捞。
-- **匹配由本套件定向生成**：只对通过硬性门槛的人↔岗组合创建记录，不做 N×R 笛卡尔积；表格侧旧自动化「简历自动匹配岗位」（生产环境 flowId `G-FLOW-103B4F2A47F62132F520000X`）保持停用，本插件不依赖任何表格自动化。
+## 字段口径（业务键）
 
-## 3. 岗位JD表字段（table_key = `job`）
+- resume：name phone email education school school_rank years_experience major
+  certificates expected_position expected_location expected_salary skills attachment
+  upload_time category comm_status org full_text attach_md5
+- job：job_id job_name department org status work_location responsibilities
+  requirements hard_gates must_skills bonus_skills must_weight bonus_weight
+  submit_time attachment stat_total stat_recommend stat_pending stat_reject
+- match：name phone job_name job_id org source cand_skills must_skills bonus_skills
+  hard_gates expected_position years_experience skill_score bonus_score total_score
+  recommend update_time evidence
+- perm：user org
 
-| 业务字段 | field_key | 类型 | 说明 / 选项 |
-|---|---|---|---|
-| 岗位ID | `job_id` | text | **唯一键**（JOB-序号），新建岗位必分配；匹配表按此 ID 文本勾连，同名岗不串档 |
-| 岗位名称 | `job_name` | text | 重名不唯一，勿单用作匹配键 |
-| 所属部门 | `department` | singleSelect | 技术部/产品部/市场部/运营部/厂务管理部/EHS管理部/单晶制造部-设备部/单晶制造部-生产部/数据信息部-系统组/财经管理部/硅片制造部-工艺部/硅片制造部-设备部/组件制造部-工艺部/组件制造部-设备部/电池制造部-工艺部/电池制造部-设备部（以实查为准，缺失时只增不删补选项） |
-| 组织分类 | `org` | singleSelect | 职能中心/制造中心（必填，决定匹配范围） |
-| 状态 | `status` | singleSelect | 招聘中/草稿/已关闭（入库默认「招聘中」） |
-| 工作地点 | `work_location` | multipleSelect | 北京/上海/深圳/杭州/成都/广州/南京/武汉/曲靖/不限 |
-| 岗位职责 | `responsibilities` | richText | |
-| 任职要求 | `requirements` | richText | |
-| 硬性门槛 | `hard_gates` | text | 学历/专业/经验年限/证书四项一票否决，供匹配逐项对照 |
-| 必备技能 | `must_skills` | text | 计技能得分的分母 |
-| 加分项 | `bonus_skills` | text | 计加分项得分的分母 |
-| 必备技能权重 | `must_weight` | number(PERCENT) | 总分加权用，缺省 0.7（70%） |
-| 加分项权重 | `bonus_weight` | number(PERCENT) | 总分加权用，缺省 0.3（30%） |
-| 提交时间 | `submit_time` | date | 入库填当天（脚本自动） |
-| JD附件 | `attachment` | attachment | 用原始文件名上传，单个/批量都必须传，禁止改名 |
-| 候选人总数 | `stat_total` | number(INT) | **不自动**：由 apply_decisions.py 查该岗位全部匹配记录（含人工匹配）重算后批量回填（D15） |
-| 推荐数 | `stat_recommend` | number(INT) | 同上 |
-| 待定数 | `stat_pending` | number(INT) | 同上 |
-| 不推荐数 | `stat_reject` | number(INT) | 同上 |
-| 需求提交人（可选） | `submitter` | user | 老版规则：填当前登录用户（JD 明确写了需求提出人且能唯一定位账号时优先该人）。该键为可选映射，客户表里有此字段时在 config.json 补配 |
+留空字段：`resume.org` 与 `job.stat_*` 由人工/匹配流程维护，入库脚本不写。
 
-> 老版岗位表上的「推荐候选人」（filterUp）与「匹配记录」（双向关联）属表格侧可选增强：**极速版不依赖**（D1），查询与看板直接按岗位ID查智能匹配表。是否保留由客户决定。
+## 类型与写入格式
 
-## 4. 简历库管理字段（table_key = `resume`）
+- singleSelect 写字符串、读回 `{id,name}`（客户端 `_norm` 归一成字符串）
+- multipleSelect 写字符串数组、读回归一成字符串数组
+- number 写 float；date 写毫秒时间戳
+- attachment 写 `[{"filename","size","type","url":resourceUrl,"resourceId"}]`
+- text 一律字符串；解析器产出 list 的（certificates）由入口脚本 join 成「、」分隔
 
-| 业务字段 | field_key | 类型 | 说明 / 选项 |
-|---|---|---|---|
-| 姓名 | `name` | text | |
-| 手机号 | `phone` | telephone | **查重主键** |
-| 邮箱 | `email` | email | |
-| 最高学历 | `education` | singleSelect | 博士/硕士/本科/大专 |
-| 院校 | `school` | text | |
-| 院校排名 | `school_rank` | singleSelect | 985/211/双一流/普通本科/大专 |
-| 工作年限 | `years_experience` | number(INT) | 来源分 正文/文件名/估算 三档；**估算值（estimated）必须由 agent 在批量判定回合用原文复核**（D13） |
-| 专业 | `major` | text | 极速版新增字段，供专业硬门槛对照 |
-| 证书 | `certificates` | text | 极速版新增字段；缺失时 agent 从原文证书段补齐（D14） |
-| 期望职位 | `expected_position` | text | |
-| 期望地点 | `expected_location` | singleSelect | 城市同岗位工作地点枚举；**必填，没有明确地点一律填「不限」**（脚本兜底），agent 从原文看出明确城市则覆盖 |
-| 期望薪资 | `expected_salary` | text | |
-| 技能标签 | `skills` | multipleSelect | 大标签池；新技能**追加选项并保留全部已有选项及其 id**，只增不删 |
-| 简历附件 | `attachment` | attachment | 用原始文件名上传，禁止改名/加序号前缀 |
-| 上传时间 | `upload_time` | date | |
-| 简历库分类 | `category` | singleSelect | 技术类/产品类/市场类/运营类/其他（以实查为准）；默认「技术类」 |
-| 沟通状态 | `comm_status` | singleSelect | 已入职/流程中/待筛选/简历未通过/面试未通过；新入库默认「待筛选」 |
-| 简历库所属组织 | `org` | singleSelect | 职能中心/制造中心，**必填**，决定匹配范围 |
-| 简历全文 | `full_text` | text | 极速版新增字段：入库时留档提取出的纯文本，供后续复核（可选，客户可裁掉） |
-| 附件内容MD5 | `attach_md5` | text | **P4b 新增（可选键）**：附件上传成功后由脚本写入本地文件真 MD5，是**库内附件内容级去重的比对键**。缺失（客户现存库）→ 库内去重自动回退「文件名+字节大小」并告警，脚本不崩溃、不自建字段；存量老记录被覆盖更新/补传附件时自动回填（懒回填） |
+## 凭证与权限
 
-> 老版的「AI结构化提取」「AI深度解析」AI 字段：**已移出热路径，插件不依赖其结果**（D2）。是否在表里保留由客户决定——它们异步 1~3 分钟才出结果且消耗 AI 额度（免费版 500 次/月）。agent 的判定结论写入普通 text 字段（智能匹配.匹配依据）。
-
-## 5. 智能匹配字段（table_key = `match`）
-
-| 业务字段 | field_key | 类型 | 说明 |
-|---|---|---|---|
-| 候选人姓名 | `name` | text | |
-| 手机号 | `phone` | telephone | 与简历库勾连 |
-| 匹配岗位 | `job_name` | text | 岗位名称文本 |
-| 岗位ID | `job_id` | text | **与岗位表勾连的唯一键**（老版是 lookup，极速版改为脚本直接写文本，D1）；岗位统计按此重算 |
-| 组织分类 | `org` | singleSelect | 职能中心/制造中心 |
-| 匹配来源 | `source` | singleSelect | 系统匹配（本套件生成）/人工匹配（统计重算时一并计入） |
-| 候选人技能 | `cand_skills` | text | 打分输入 |
-| 岗位必备技能 | `must_skills` | text | 打分输入（分母） |
-| 岗位加分项 | `bonus_skills` | text | 打分输入（分母） |
-| 硬性门槛 | `hard_gates` | text | 门槛判定依据，四项逐项对照 |
-| 期望职位 | `expected_position` | text | |
-| 工作年限 | `years_experience` | text | |
-| 技能得分 | `skill_score` | number(INT) | **由脚本重算写入，模型不输出分数**（D16） |
-| 加分项得分 | `bonus_score` | number(INT) | 同上 |
-| 匹配总分 | `total_score` | number(INT) | 同上 |
-| 推荐状态 | `recommend` | singleSelect | 推荐/待定/不推荐；最终值由脚本按总分阈值定 |
-| 更新时间 | `update_time` | date | |
-| 匹配依据 | `evidence` | text | 极速版新增：agent 批量判定的原文引用（≤80字），替代老版 AI匹配分析字段的作用（D2） |
-
-> 老版的「关联岗位」（双向关联）、「岗位ID」（lookup）、「AI匹配分析」（AI text）在极速版均**不作为依赖**（D1/D2）；是否保留由客户决定。
-
-## 6. 权限配置字段（table_key = `perm`）
-
-| 业务字段 | field_key | 类型 |
-|---|---|---|
-| 用户 | `user` | user/text |
-| 组织分类 | `org` | singleSelect |
-
-## 7. 评分与推荐口径（岗位匹配侧，与"综合评分"区分）
-
-以下口径**原文**由脚本执行重算（apply_decisions.py），agent 在批量判定时不输出任何分数（D16）：
-
-- **技能得分** = 必备技能命中数 / 岗位必备技能总数 × 100
-- **加分项得分** = 命中加分项数 / 岗位加分项总数 × 100（岗位无加分项时该项不计或记 100 前需与用户确认口径，不默认满分）
-- **匹配总分** = 技能得分 × 必备技能权重 + 加分项得分 × 加分项权重（权重取岗位表字段；缺省 70% / 30%）
-- **推荐阈值**：总分 ≥ 80 记「推荐」；60–79 记「待定」；< 60 记「不推荐」。
-- **硬性门槛（学历/专业/经验年限/证书）任一不达标 → 一票否决，不创建匹配记录、不进入评分**。
-- 命中项校验：`skill_hits` 必须是岗位必备技能的子集、`bonus_hits` 必须是加分项的子集，越界条目作废并进 warnings（防编造命中项）。
-- 注：老版简历库上的「AI综合评分」（技能40/经验30/学历20/潜力10，见 ai-analysis-spec.md）评价候选人本身、与岗位无关；岗位匹配分才是本表口径。二者勿混淆。
-
-## 8. 查重与写入主键
-
-- 简历查重：**手机号**。命中 → 覆盖更新（业务话告知"用最新简历覆盖"）；同手机号多条记录 → 停止并报告，不自动选。**手机号相同但姓名不同 = 疑似重名/录入错误，停止让用户确认**（digest 中 `dedupe=="conflict"`）。姓名相同但手机号不同 = 不同人，正常新建。
-- JD 查重：**岗位名称 + 所属部门 + 组织分类** 三者全同才算重复（不同组织下的同名同部门岗视为不同岗位、各自新建）。命中 → 覆盖更新；不同 → 新建。
-- 附件查重（P4b 起 = **内容级**）：库内比对键是简历库「附件内容MD5」(`attach_md5`, text) 列里存的**附件内容真 MD5**（附件上传成功后由脚本写入）。三层判定：① 本地文件真 MD5 命中库内哈希 → 判重复上传，跳过并告知"库内已存在内容相同的简历附件（附件内容MD5 比对命中）"——**换了文件名也命中**（修掉老键的漏判）；② 未命中但 (文件名, 字节大小) 命中且库内那条有哈希 → 内容确实不同 → **不判重复**，按同一候选人的简历新版本走覆盖更新（new/overwrite 由手机号查重决定），清单里说明"同名同大小但内容不同"（修掉老键的误判：改一版重投不再被静默跳过）；③ 命中的库内记录没有哈希（P4b 之前写入的老记录）→ 无从比内容，按老键「文件名+字节大小」回退判重复并告警。**老库容忍**：config.json 的 `fields.resume.attach_md5` 缺失（客户现存库没建该列）→ 整库自动回退 `NameSizeDeduper` + 一条 warning（说明未启用内容级去重与启用方法），不崩溃、**不自建字段**（建字段属复刻部署）。**懒回填**：老记录被覆盖更新（手机号命中）、6b 补传附件、回读补附件时一并把哈希补上，库随之收敛到内容级去重。本批内部去重与 `checkpoint.json` 幂等续跑用的是同一套真 MD5。
-- 幂等续跑：intake 脚本落 `checkpoint.json`（已成功文件的**真 MD5** 列表），重跑跳过已成功项、不重放（D12）；`--reset` 显式清空断点重来。P3 起 checkpoint **增量落盘**（「记录已写」状态在 upsert 响应返回 record_id 后即落盘，「附件已传」状态在 stage 6b `poll_fixup_attachments` 回读确认后落盘——各自一确立就原子写盘，version=2 带 progress 段；stage 7 批量 upsert 不做单独回读查询；读不懂视为空并告警不崩溃），并新增 `--wall-budget <秒>`（默认 100 < 工具 120s 超时）：到点 graceful 停、报告 `partial=true` 并打印一行 `RESUME:`，重跑同一命令续跑（见 execution-notes「幂等与续跑」）。
-- 扫描件/图片简历：macOS 上由提取层自动走系统 Vision OCR 入库（backend=vision_ocr，零依赖纯本地；首次可能弹 macOS 授权弹窗）。**P4a 起 OCR 不可用/不可信（非 macOS 等）不再判死**：转 agent 多模态兜底——脚本打印 `VISION_NEEDED:` 清单，agent 一轮读完写补丁 json，重跑加 `--apply-vision-patch`（backend=agent_vision，草稿字段 field_source=agent_vision 进 needs_review；agent 绝不写库）；本批 ≥5 份且读不出份数 >20% 触发闸门（本轮不写任何记录，reason=vision_gate；`VISION_NEEDED:` 清单照常打印，agent 仍打补丁重跑同一命令即可入库，补丁之后仍读不出的才请用户提供文字版）。失败清单语义为「仅加密/损坏/补丁未覆盖才失败」。细节见 parsing-methods.md 与 resume-intake/HOTPATH.md。
-
-## 9. 不依赖的表格能力（D1/D2，与老版的关键差异）
-
-- **不依赖 lookup / filterUp / 双向关联**：岗位ID 勾连与岗位统计（候选人总数/推荐数/待定数/不推荐数）全部由脚本自己 join 和重算——写完匹配记录后从表里查该岗位**全部**匹配记录（含人工匹配）重算四个数字再一次批量回填（D15），避免服务端异步计算引入 1~3 分钟不可控延迟。
-- **不依赖 AI 字段**（AI结构化提取 / AI深度解析 / AI匹配分析）：与 agent 推理重复劳动、吃 AI 额度（免费版 500 次/月）、且异步 1~3 分钟。agent 的批量判定结果写进普通 text 字段（匹配依据）。这些列是否在表里保留由客户决定，插件不依赖其结果。
-
-## 10. config.json（脚本唯一 ID 源）
-
-- 位置：插件根目录 `config.json`（与 `config.example.json` 同级），**不进版本库**，由「复刻部署」技能反查真实 ID 生成/回填。
-- 结构：`base_name / base_id / tables / fields / field_names / types / formatters / options / options_cache_generated_at`，完整示例见根目录 `config.example.json`。
-- `options` 段是单选/多选选项的 id 缓存（写记录、只增不删补选项都用它）；过期或缺失时脚本会实查刷新。
-- **多公司/多组织隔离**：两家公司、或一部门一表的场景，各自机器上各自生成自己的 config.json，互不污染；换机器时复制 config.json 或重跑复刻部署的「接线」阶段。
-
-## 附录：环境参考 ID（仅供复刻/接线比对，运行时以本机 config.json 为准）
-
-### 生产环境（2026-09 实查）
-
-Base「招聘筛选」ID `lyQod3RxJKlq1q5jclwY77Qd8kb4Mw9r`；表：岗位JD表 `IWZ0aT4`、简历库管理 `jM3TFBf`、智能匹配 `PhF2w2g`、权限配置 `rzh5VaJ`。字段级 ID 以老版 system-config 实查记录为准（如 简历.姓名 `uHtg1Xj`、简历.手机号 `sVBJzE2`、岗位.岗位ID `vMQJaQN`）。**极速版新增字段（简历.专业/证书/简历全文/附件内容MD5，匹配.岗位ID(text)/匹配依据）在生产表中原本不存在**，接入生产环境前需先在表里补建这些普通字段并重新反查回填 config.json。其中「附件内容MD5」(text, `attach_md5`) 补建前脚本照常跑，只是库内附件去重回退「文件名+字节大小」并告警（不崩溃、不自建字段，见 §8）；补建命令与接线方式见 [复刻部署](../../replicate/SKILL.md)。
-
-### 测试环境（2026-09-19 由 replicate 技能创建）
-
-Base「招聘筛选」ID `amweZ92PV6DbOdgzUqer9gAo8xEKBD6p`；表：岗位JD表 `FmGPFhh`、简历库管理 `YjwifHF`、智能匹配 `TnVAvzk`、权限配置 `28cZkSE`。四表全量字段已按极速版标准 schema 建齐（含附件内容MD5），字段级 ID 见本机 config.json。运行时一切以该机器上的 config.json 为准，本附录仅供人工比对。
+- 凭证：`.secrets.json`（gitignore）或 `DINGTALK_APP_KEY` / `DINGTALK_APP_SECRET`
+- 应用 ja_hr_poc 权限点：`Notable.Base.Read.All`、`Notable.Base.Write.All`、`Storage.File.Read`
+- operatorId = 操作人 unionId，所有 notable 接口 query 必传（config.operator_id）
