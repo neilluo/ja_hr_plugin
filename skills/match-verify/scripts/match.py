@@ -19,6 +19,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "shared"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "shared", "preflight"))
 from notable import Notable, NotableError  # noqa: E402
 from preflight import run_preflight  # noqa: E402
 

@@ -23,6 +23,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "shared"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "shared", "preflight"))
 from extract import extract                      # noqa: E402
 from notable import Notable, NotableError       # noqa: E402
 from parse_resume import parse                  # noqa: E402

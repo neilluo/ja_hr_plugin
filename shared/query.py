@@ -16,6 +16,7 @@ import sys
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "preflight"))
 from notable import Notable  # noqa: E402
 from preflight import run_preflight  # noqa: E402
 

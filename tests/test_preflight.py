@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "shared"))
+sys.path.insert(0, os.path.join(ROOT, "shared", "preflight"))
 
 from preflight import run_preflight  # noqa: E402
 

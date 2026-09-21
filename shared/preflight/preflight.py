@@ -23,7 +23,7 @@ import os
 import sys
 import time as _time
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 _CREDS_MSG = ("凭证缺失：请创建 .secrets.json (gitignored) "
               "或设置 DINGTALK_APP_KEY / DINGTALK_APP_SECRET 环境变量")

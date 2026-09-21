@@ -15,7 +15,7 @@
   `skills/resume-intake/scripts/upload_resumes.py`、`skills/job-intake/scripts/upload_jobs.py`、
   `skills/match-verify/scripts/match.py`（匹配打分）、`skills/replicate/scripts/replicate_base.py`（建表）。
   agent 直接 Bash 跑脚本，读 JSON 报告即可，不需要中间回合。
-- 命令一律以仓库根为 CWD 执行：跨 skill 公共入口 python3 shared/query.py、bash shared/preflight.sh（Windows 用 shared/preflight.ps1）；单 skill 私有入口 python3 skills/<skill>/scripts/<entry>.py；shared/ 只放跨 skill 公共库与公共入口，skills/<skill>/scripts/ 只放该 skill 私有入口，scripts/ 下入口为执行而非阅读。
+- 命令一律以仓库根为 CWD 执行：跨 skill 公共入口 python3 shared/query.py、bash shared/preflight/preflight.sh（Windows 用 shared/preflight/preflight.ps1）；预检三件套（py/sh/ps1）同居 shared/preflight/；单 skill 私有入口 python3 skills/<skill>/scripts/<entry>.py；shared/ 只放跨 skill 公共库与公共入口，skills/<skill>/scripts/ 只放该 skill 私有入口，scripts/ 下入口为执行而非阅读。
 
 ## 不变量
 
@@ -62,4 +62,4 @@ python3 shared/query.py resume --fields name,phone  # 只读，需真实凭证
 - 扫描件 PDF 的 pdftotext 输出是乱码但非空 → 用"抽不出手机号/邮箱"判扫描件，不用文本长度。
 - 解析器返回 list 而表字段是 text（certificates）→ 由入口脚本 join，_cast 不做 str(list)。
 - mock HTTP 测试：handler 必须先读 Content-Length body，否则连接 RST；测试模块别漏 import。
-- 曾在 OpenAPI 重写时连带删掉 shared/preflight.* → preflight 是 stage 0 强制门禁，重写业务脚本时必须同步迁移，不得丢弃。
+- 曾在 OpenAPI 重写时连带删掉 shared/preflight.* → preflight 是 stage 0 强制门禁，重写业务脚本时必须同步迁移，不得丢弃。（现位于 shared/preflight/ 目录）
