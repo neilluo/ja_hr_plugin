@@ -23,7 +23,17 @@ python3 shared/query.py match --stats
 # 4. 匹配打分（写 match 表 + 刷新岗位统计，幂等）
 python3 skills/match-verify/scripts/match.py
 
-# 5. 跨组织复制表结构（可选）
+# 5. 简历 AI 三列精析（技能标签 / AI结构化提取 / AI深度解析）
+python3 skills/skills-analyze/scripts/skills_analyze.py prepare   # 切批
+python3 skills/skills-analyze/scripts/skills_apply.py             # 写回三列
+
+# 6. 岗位 JD 语义回写 + AI 匹配分析（可选增强）
+python3 skills/job-intake/scripts/jobs_analyze.py prepare         # JD 精析切批
+python3 skills/job-intake/scripts/sync_job_columns.py             # 回写门槛/必备/加分三列
+python3 skills/match-verify/scripts/match_analyze.py             # 逐岗 subagent 并发 AI 分析
+python3 skills/match-verify/scripts/sync_match_analysis.py       # AI匹配分析回写
+
+# 7. 跨组织复制表结构（可选）
 python3 skills/replicate/scripts/replicate_base.py <新baseId>
 ```
 
@@ -31,20 +41,34 @@ python3 skills/replicate/scripts/replicate_base.py <新baseId>
 created / readback_missing`。`readback_missing` 非空或 `failed` 非空时 exit 1。
 `--dry-run` 只解析不触网写表。
 
-## 代码地图（全部 Python 约 860 行）
+## 代码地图（全部 Python 约 2900 行）
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
-| `shared/notable.py` | ~230 | 唯一传输层：token 缓存、重试、记录 CRUD、类型转换、附件三步上传 |
+| `shared/notable.py` | ~355 | 唯一传输层：token 缓存、重试、记录 CRUD、类型转换、richText 归一、附件三步上传 |
 | `shared/extract.py` | ~105 | 文本提取：pdf(pdftotext→pypdf) / docx(zip→textutil) / doc(textutil→olefile) / 图片标记 OCR |
+| `shared/waves.py` | ~40 | 跨 skill 公共 subagent 并发调度：MAX_AGENTS 硬上限 20、自动均衡 batch=ceil(条数/20)、一次性并发 |
 | `skills/resume-intake/scripts/parse_resume.py` | ~160 | 简历字段抽取（正则+词表），resume-intake 私有 |
 | `skills/job-intake/scripts/parse_job.py` | ~120 | JD 字段抽取（文件名拆部门+正文切段），job-intake 私有 |
-| `skills/resume-intake/scripts/upload_resumes.py` | ~105 | 简历入库入口 |
-| `skills/job-intake/scripts/upload_jobs.py` | ~90 | 岗位入库入口 |
-| `shared/query.py` | ~60 | 只读查询/统计入口 |
-| `skills/match-verify/scripts/match.py` | ~130 | 匹配打分：简历×岗位 → match 表 + 岗位统计 |
-| `skills/replicate/scripts/replicate_base.py` | ~110 | 新 Base 重建四表结构 |
+| `skills/resume-intake/scripts/upload_resumes.py` | ~245 | 简历入库入口 |
+| `skills/job-intake/scripts/upload_jobs.py` | ~125 | 岗位入库入口 |
+| `shared/query.py` | ~65 | 只读查询/统计入口 |
+| `skills/match-verify/scripts/match.py` | ~145 | 匹配打分：简历×岗位 → match 表 + 岗位统计（确定性打分入口） |
+| `skills/replicate/scripts/replicate_base.py` | ~120 | 新 Base 重建四表结构 |
 | `shared/vendor/` | — | 内置 pypdf / olefile（零 pip 依赖） |
+| **skills-analyze（简历 AI 三列精析）** | | |
+| `skills/skills-analyze/scripts/skills_analyze.py` | ~120 | prepare/merge 切批合并，规划 subagent 并发精析 |
+| `skills/skills-analyze/scripts/skills_apply.py` | ~105 | 写回三列：技能标签 / AI结构化提取 / AI深度解析 |
+| `skills/skills-analyze/scripts/sync_ai_columns.py` | ~85 | 零散手工修正通道 |
+| **match-verify 增强（智能匹配）** | | |
+| `skills/match-verify/scripts/match_gated.py` | ~220 | 门槛前置匹配（硬性门槛过滤后再打分） |
+| `skills/match-verify/scripts/match_analyze.py` | ~190 | 逐岗 subagent 并发 AI 匹配分析 |
+| `skills/match-verify/scripts/sync_match_analysis.py` | ~125 | AI匹配分析回写 match 表 ai_analysis 列 |
+| `skills/match-verify/scripts/semantic_score.py` | ~160 | 私有库：语义词典 + 同义命中判定 |
+| **job-intake 增强（JD 语义回写）** | | |
+| `skills/job-intake/scripts/jobs_analyze.py` | ~100 | JD 精析 prepare/merge |
+| `skills/job-intake/scripts/sync_job_columns.py` | ~60 | 回写硬性门槛/必备技能/加分项三列 |
+| `skills/job-intake/scripts/check_skill_coverage.py` | ~60 | 岗位技能词表 vs 简历标签命中率自检，低覆盖 exit 2 |
 
 ## 表结构（config.json）
 
@@ -55,6 +79,15 @@ config.json 只存 `base_id`、`operator_id`、每表的 `table_id` 与 业务�
 简历业务键：name phone email education school school_rank years_experience major
 certificates expected_position expected_location expected_salary skills attachment
 upload_time category comm_status org full_text attach_md5
+ai_extract（AI结构化提取,text） ai_deep（AI深度解析,text）
+
+匹配业务键（match）：name phone job_name job_id org source cand_skills must_skills
+bonus_skills hard_gates expected_position years_experience skill_score bonus_score
+total_score recommend update_time evidence ai_analysis（AI匹配分析,text）
+
+AI 语义分析三列（ai_extract / ai_deep / ai_analysis）为 schema 净增量，与组织无关：
+`skills/skills-analyze` 产出简历技能标签 + AI结构化提取 + AI深度解析，
+`skills/match-verify` 产出 AI匹配分析，均为 text 富文本列。
 
 岗位业务键：job_id job_name department org status work_location responsibilities
 requirements hard_gates must_skills bonus_skills must_weight bonus_weight submit_time
