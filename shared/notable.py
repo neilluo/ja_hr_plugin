@@ -330,6 +330,11 @@ class Notable:
                 return None
         if t == "multipleSelect":
             return val if isinstance(val, list) else [str(val)]
+        if t == "richText":
+            # AI表格富文本字段要求结构化值，传纯文本会被服务端 400 拒绝
+            if isinstance(val, dict):
+                return val
+            return {"markdown": str(val).replace("\r\n", "\n")}
         if t == "attachment":
             return val if isinstance(val, list) else [val]
         return str(val)

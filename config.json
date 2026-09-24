@@ -41,7 +41,9 @@
       "comm_status": "沟通状态",
       "org": "简历库所属组织",
       "full_text": "简历全文",
-      "attach_md5": "附件内容MD5"
+      "attach_md5": "附件内容MD5",
+      "ai_extract": "AI结构化提取",
+      "ai_deep": "AI深度解析"
     },
     "job": {
       "job_id": "岗位ID",
@@ -82,7 +84,8 @@
       "total_score": "匹配总分",
       "recommend": "推荐状态",
       "update_time": "更新时间",
-      "evidence": "匹配依据"
+      "evidence": "匹配依据",
+      "ai_analysis": "AI匹配分析"
     },
     "perm": {
       "user": "用户",
@@ -110,7 +113,9 @@
       "comm_status": "singleSelect",
       "org": "singleSelect",
       "full_text": "text",
-      "attach_md5": "text"
+      "attach_md5": "text",
+      "ai_extract": "text",
+      "ai_deep": "text"
     },
     "job": {
       "job_id": "text",
@@ -151,7 +156,8 @@
       "total_score": "number",
       "recommend": "singleSelect",
       "update_time": "date",
-      "evidence": "text"
+      "evidence": "text",
+      "ai_analysis": "text"
     },
     "perm": {
       "user": "user",
