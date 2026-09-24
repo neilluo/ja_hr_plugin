@@ -1,0 +1,26 @@
+{
+  "name": "recruit-match-suite-fast",
+  "displayName": "Recruit Match Suite (Fast)",
+  "displayNameEn": "Recruit Match Suite (Fast)",
+  "displayNameCn": "晶澳智能招聘套件",
+  "version": "1.0.0",
+  "description": "End-to-end recruitment matching toolkit on DingTalk Notable OpenAPI: resume intake (with OCR backfill), job intake with JD semantic write-back, threshold-gated matching with per-job AI analysis, AI three-column resume deep parsing, candidate query, recruit dashboard, cross-org table replication, and the recruit data model knowledge base.",
+  "descriptionEn": "End-to-end recruitment matching toolkit on DingTalk Notable OpenAPI: resume intake (with OCR backfill), job intake with JD semantic write-back, threshold-gated matching with per-job AI analysis, AI three-column resume deep parsing, candidate query, recruit dashboard, cross-org table replication, and the recruit data model knowledge base.",
+  "descriptionZh": "基于钉钉 AI 表格 OpenAPI 直连的招聘智能匹配套件：简历入库（含 OCR 补录）、岗位 JD 入库与语义回写、门槛前置匹配与逐岗 AI 分析、简历 AI 三列精析、候选人查询、招聘看板、跨组织表结构复制，以及招聘数据模型知识库。",
+  "author": {
+    "name": "QwenWork",
+    "url": "https://qwenwork.cn"
+  },
+  "category": "hr",
+  "tags": ["hr", "recruitment", "resume", "matching", "dingtalk", "notable"],
+  "skills": [
+    "skills/candidate-query",
+    "skills/job-intake",
+    "skills/match-verify",
+    "skills/recruit-dashboard",
+    "skills/recruit-model",
+    "skills/replicate",
+    "skills/resume-intake",
+    "skills/skills-analyze"
+  ]
+}

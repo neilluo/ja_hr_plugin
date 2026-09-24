@@ -4,7 +4,8 @@ __pycache__/
 .idea/
 *.bak
 .trash/
-.qoder-plugin/
+.qoder-plugin/*
+!.qoder-plugin/plugin.json
 .secrets.json
 .dingtalk_token_cache.json
 outputs/
