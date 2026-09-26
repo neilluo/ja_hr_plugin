@@ -20,7 +20,7 @@ from notable import Notable  # noqa: E402
 OUTDIR = os.path.join(ROOT, "outputs")
 FULL_TEXT_MAX = 6000
 sys.path.insert(0, os.path.join(ROOT, "shared"))
-from waves import plan, summary, MAX_AGENTS, DEFAULT_BATCH  # noqa: E402  agent数封顶调度
+from waves import plan, MAX_AGENTS  # noqa: E402  agent数封顶调度
 BIZ = ["name", "phone", "skills", "full_text", "upload_time"]
 
 

@@ -1,17 +1,12 @@
 # -*- coding: utf-8 -*-
 """semantic_score.py — 语义等价打分（严格版）
-    python3 skills/match-verify/scripts/semantic_score.py            # 只算不写
-    python3 skills/match-verify/scripts/semantic_score.py --write    # 回写
 
 两类关系，避免过度归并：
   SYNONYM 双向等价：只收真正同义/同一事物的不同写法（成本管控=成本控制；良率管控=良率提升）
   HYPERS  单向上下位：候选人写的具体项可满足岗位的宽泛项（单晶炉 ⊨ 光伏设备），反向不算
                   （岗位要"切片机"，候选人只有"单晶炉"不算命中）
 """
-import sys, os, re, json
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "shared"))
-from notable import Notable  # noqa: E402
+import re
 
 SEP = r"[、,，;；/]\s*"
 
@@ -109,51 +104,3 @@ def hit(cands, need):
         if c in HYPERS.get(need, []):
             return True
     return False
-
-
-def main():
-    write = "--write" in sys.argv
-    nt = Notable()
-    jobs = {j["fields"].get("job_id"): j for j in
-            nt.list_records("job", biz_fields=["job_id", "must_skills", "bonus_skills",
-                                               "must_weight", "bonus_weight"])}
-    rows = nt.list_records("match", biz_fields=["name", "job_id", "job_name", "cand_skills",
-                                                "total_score", "recommend"])
-    upd = []
-    for r in rows:
-        f = r["fields"]
-        j = jobs.get(f.get("job_id"))
-        if not j:
-            continue
-        jf = j["fields"]
-        cand = toks(f.get("cand_skills"))
-        must, bonus = toks(jf.get("must_skills")), toks(jf.get("bonus_skills"))
-        mw, bw = float(jf.get("must_weight") or 0.7), float(jf.get("bonus_weight") or 0.3)
-        hm = [n for n in must if hit(cand, n)]
-        hb = [n for n in bonus if hit(cand, n)]
-        sk = int(round(100 * mw * (len(hm) / len(must)))) if must else 0
-        bo = int(round(100 * bw * (len(hb) / len(bonus)))) if bonus else 0
-        tot = sk + bo
-        rec = "推荐" if tot >= 80 else ("待定" if tot >= 60 else "不推荐")
-        if rec != f.get("recommend") or abs(tot - (f.get("total_score") or 0)) >= 1:
-            miss = [n for n in must if n not in hm]
-            ev = "语义匹配：必备%d/%d（%s）；加分%d/%d" % (len(hm), len(must),
-                "、".join(hm[:8]) or "无", len(hb), len(bonus))
-            if miss:
-                ev += "；未命中：" + "、".join(miss[:6])
-            upd.append({"id": r["id"], "skill_score": sk, "bonus_score": bo,
-                        "total_score": tot, "recommend": rec, "evidence": ev})
-            if rec != f.get("recommend"):
-                print("  %-5s %-22s %s→%s  %s→%s" % (f.get("name"), f.get("job_name"),
-                      f.get("recommend"), rec, f.get("total_score"), tot))
-    print("重算=%d 更新=%d" % (len(rows), len(upd)))
-    if not write:
-        print("（未写入；--write 生效）")
-        return
-    for i in range(0, len(upd), 10):
-        nt.update_records("match", upd[i:i + 10])
-    print("已回写", len(upd))
-
-
-if __name__ == "__main__":
-    main()

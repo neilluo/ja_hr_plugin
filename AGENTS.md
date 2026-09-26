@@ -1,7 +1,7 @@
 # AGENTS.md — 招聘智能匹配（OpenAPI 直连版）工程约束
 
 > 代码是唯一事实来源。CLI 参数以 `python3 <入口脚本> --help` 为准。
-> 旧 emit/replay + agent 调 dws 的链路已整体废弃，代码在 `.trash/` 仅供考古，禁止参考、禁止复活。
+> 旧 emit/replay + agent 调 dws 的链路已整体废弃并删除，禁止参考、禁止复活。
 
 ## 架构
 
@@ -9,10 +9,15 @@
   不使用 dws、不经过 agent 中转、没有状态机/checkpoint 文件。
 - 凭证：`.secrets.json`（已 gitignore）或环境变量 `DINGTALK_APP_KEY` / `DINGTALK_APP_SECRET`。
   仓库是 public 的，**任何凭证不得写入会被提交的文件**。
-- 表结构映射在 `config.json`：业务键 → 中文字段名。OpenAPI 记录接口以中文字段名为 key，
-  不需要字段 ID；新增字段只需在 Base 里建列并往 config.json 加一行。
+- **表结构唯一事实源是 `config.json`**（fields 业务键→中文名、types、options 单选/多选选项清单；
+  字段书写顺序 = 建表顺序）。建表（replicate_base.py）与补列（sync_schema.py）一律从 config 派生，
+  仓内不得维护第二份字段清单。新增/改字段 = 改 config（fields/types/options）+ 跑 `sync_schema.py`
+  对目标 Base 补列，两步同一提交；脚本禁止运行时回写 config.json，config 缺映射即报错人工修。
+  字段 ID 是 Base 私有的：记录接口用中文名，结构接口（扩选项）按中文名运行时解析 ID，
+  禁止硬编码 ID 或把 ID 写进 config。
   AI 语义分析三列为 schema 净增量（与组织无关）：resume 表 `ai_extract`→AI结构化提取、
   `ai_deep`→AI深度解析；match 表 `ai_analysis`→AI匹配分析，类型均为 text。
+  README/recruit-model 中的字段描述仅作文档，以 config 为准。
 - 入口脚本：跨 skill 公共入口 `shared/query.py`；单 skill 私有入口
   `skills/resume-intake/scripts/upload_resumes.py`、
   `skills/job-intake/scripts/upload_jobs.py`、`skills/job-intake/scripts/jobs_analyze.py`（JD 精析 prepare/merge）、
@@ -24,7 +29,9 @@
   `skills/skills-analyze/scripts/skills_analyze.py`（简历三列精析 prepare/merge）、
   `skills/skills-analyze/scripts/skills_apply.py`（写回三列）、
   `skills/skills-analyze/scripts/sync_ai_columns.py`（零散手工修正通道）、
-  `skills/replicate/scripts/replicate_base.py`（建表）。
+  `skills/replicate/scripts/replicate_base.py`（建表，从 config 派生）、
+  `skills/replicate/scripts/sync_schema.py`（结构自检/补列：`--check` 只读报 config 与真实 Base 漂移，
+  缺列 exit 2；默认模式补建缺失列，只补不删不改）。
   agent 直接 Bash 跑脚本，读 JSON 报告即可，不需要中间回合。
 - 跨 skill 公共库 `shared/waves.py`：subagent 并发调度规划。agent 数硬上限 20（`MAX_AGENTS`
   只能下调不能上调），自动负载均衡 batch=ceil(条数/20)，一次性并发发出、不分波不串行；
@@ -53,6 +60,8 @@
 8. subagent 并发调度一律经 `shared/waves.py` 规划：agent 数硬上限 `MAX_AGENTS=20`，
    只能下调不能上调（环境变量可压小、代码内 `min(cap, MAX_AGENTS)` 硬顶），
    批大小 batch=ceil(条数/agent数) 自动负载均衡，一次性并发发出，不分波、不串行。
+9. 死代码零容忍：每次改动必须在同一提交内删除因此不再被使用的逻辑、函数、入口与孤儿 import，
+   禁止留僵尸代码；删除后全仓 grep 确认被删名字零引用，且 unittest 全绿。
 
 ## 验证命令
 
@@ -61,6 +70,7 @@ python3 -m unittest discover -s tests          # 本地无副作用（含 mock H
 python3 -m py_compile shared/*.py skills/*/scripts/*.py
 python3 skills/resume-intake/scripts/upload_resumes.py <目录> --dry-run   # 只解析不触网写表
 python3 shared/query.py resume --fields name,phone  # 只读，需真实凭证
+python3 skills/replicate/scripts/sync_schema.py --check  # 只读：报 config 与真实 Base 漂移，缺列 exit 2
 ```
 
 真实端到端：对 data 目录跑 upload_jobs → upload_resumes → query 核对计数。
@@ -87,3 +97,6 @@ python3 shared/query.py resume --fields name,phone  # 只读，需真实凭证
 - 解析器返回 list 而表字段是 text（certificates）→ 由入口脚本 join，_cast 不做 str(list)。
 - mock HTTP 测试：handler 必须先读 Content-Length body，否则连接 RST；测试模块别漏 import。
 - 曾在 OpenAPI 重写时连带删掉 shared/preflight.* → preflight 是 stage 0 强制门禁，重写业务脚本时必须同步迁移，不得丢弃。（现位于 shared/preflight/ 目录）
+- 曾双份维护表结构（config.json + replicate 本地 SCHEMA「手工对齐」）→ AI 三列漏建、richText/user 类型漂移；现 config 为唯一真源，建表/补列一律派生。
+- 曾把字段 ID（ldMkQqp）硬编码进脚本 → 换 Base 即失效；现按中文名运行时解析 ID，ID 永不进代码与 config。
+- 曾让脚本运行时回写 config.json（自动补缺映射）→ 真源失控；现 config 缺映射即报错，人工修。

@@ -14,13 +14,12 @@ sys.path.insert(0, os.path.join(ROOT, "shared"))
 os.chdir(ROOT)
 from notable import Notable, NotableError  # noqa: E402
 
-SKILL_FIELD = "ldMkQqp"
-
 
 def top_up_options(nt, want):
     sheet = nt.sheet("resume")
     flds = nt.call("GET", "/v1.0/notable/bases/%s/sheets/%s/fields" % (nt.base, sheet)).get("value", [])
-    f = next((x for x in flds if x.get("id") == SKILL_FIELD), None)
+    skill_cn = nt.cn("resume", "skills")
+    f = next((x for x in flds if x.get("name") == skill_cn), None)
     if not f:
         raise NotableError("找不到技能标签字段")
     choices = (f.get("property") or {}).get("choices") or []
@@ -29,7 +28,7 @@ def top_up_options(nt, want):
     if new:
         full = [{"id": c["id"], "name": c["name"]} for c in choices if c.get("id")] \
             + [{"name": n} for n in new]
-        nt.call("PUT", "/v1.0/notable/bases/%s/sheets/%s/fields/%s" % (nt.base, sheet, SKILL_FIELD),
+        nt.call("PUT", "/v1.0/notable/bases/%s/sheets/%s/fields/%s" % (nt.base, sheet, f["id"]),
                 {"name": f.get("name", "技能标签"), "type": "multipleSelect",
                  "property": {"choices": full}})
     return new

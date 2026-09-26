@@ -23,8 +23,23 @@ python3 skills/replicate/scripts/replicate_base.py <新baseId> [--operator <unio
 
 以上命令以仓库根为 CWD；scripts/ 下入口为执行（run）而非阅读。
 
-脚本按 `SCHEMA`（与 config.json 口径一致）逐表建 sheet + 逐字段建列（单选/多选带选项），
+脚本从 `config.json`（唯一事实源：fields/types/options，字段书写顺序=建表顺序）派生，
+逐表建 sheet + 逐字段建列（单选/多选带选项），
 stdout 输出可合并进 config.json 的片段：`{base_id, tables, fields, types}`。
+
+## 已有表补列/结构自检
+
+```bash
+python3 skills/replicate/scripts/sync_schema.py --check   # 只读：报 config 与真实 Base 的漂移，缺列 exit 2
+python3 skills/replicate/scripts/sync_schema.py           # 补建缺失列（只补不删不改）
+python3 skills/replicate/scripts/sync_schema.py --rename "表名:旧列名=新列名"  # config 改名后把物理列跟上
+python3 skills/replicate/scripts/sync_schema.py --drop "表名:列名"            # 删 config 未声明的物理列
+```
+
+rename/drop 是显式对齐操作（不做自动猜测）：drop 拒绝删 config 已声明的列；平台主键列（首列）不计入漂移报告。
+
+新增字段的标准动作：改 config.json（fields/types/options）→ 跑 sync_schema.py 对目标 Base 补列，
+两步同一提交；禁止手工在 Base 里建列后只改 config 半边。
 
 ## 收尾三步
 
@@ -38,5 +53,5 @@ stdout 输出可合并进 config.json 的片段：`{base_id, tables, fields, typ
 
 - 只建结构不搬数据；数据迁移用 upload_jobs/upload_resumes 对源目录重跑（幂等）。
 - 权限：应用需 Notable.Base.Write.All；operator 对新 Base 有编辑权限。
-- 字段类型口径见 `../recruit-model/references/system-config.md`；改 SCHEMA 前先改那份文档。
+- 字段口径以 `config.json` 为唯一真源（含 options 选项清单）；改字段先改 config，再跑 sync_schema.py 补列。
 - 建字段间隔 0.2s 是限流余量，别去掉。

@@ -12,7 +12,6 @@ import os
 import math
 
 MAX_AGENTS = int(os.environ.get("MAX_AGENTS", "20"))   # agent 数硬上限 20，不可超过
-DEFAULT_BATCH = int(os.environ.get("DEFAULT_BATCH", "7"))
 
 
 def plan(n, batch=None, cap=None):
@@ -31,9 +30,3 @@ def plan(n, batch=None, cap=None):
         batch = math.ceil(n / cap)
     groups = [list(range(i, min(i + batch - 1, n) + 1)) for i in range(1, n + 1, batch)]
     return batch, groups
-
-
-def summary(n, batch=None, cap=None):
-    b, groups = plan(n, batch, cap)
-    return {"items": n, "batch_size": b, "agents": len(groups),
-            "agent_sizes": [len(g) for g in groups], "max_agents": cap or MAX_AGENTS}

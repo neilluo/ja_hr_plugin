@@ -19,15 +19,14 @@ import sys, os, json
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "shared"))
 from notable import Notable, NotableError  # noqa: E402
 
-SKILL_FIELD = "ldMkQqp"
-
 
 def top_up_options(nt, sheet, want):
     """把 payload 里新增的技能标签追加进选项池，原有选项带 id 全量回传。"""
     flds = nt.call("GET", "/v1.0/notable/bases/%s/sheets/%s/fields" % (nt.base, sheet)).get("value", [])
-    fld = next((f for f in flds if f.get("id") == SKILL_FIELD), None)
+    skill_cn = nt.cn("resume", "skills")
+    fld = next((f for f in flds if f.get("name") == skill_cn), None)
     if not fld:
-        raise NotableError("找不到技能标签字段 %s" % SKILL_FIELD)
+        raise NotableError("找不到技能标签字段 %s" % skill_cn)
     choices = ((fld.get("property") or {}).get("choices")) or []
     have = {c.get("name") for c in choices}
     new = sorted(want - have)
@@ -35,7 +34,7 @@ def top_up_options(nt, sheet, want):
         return 0
     full = [{"id": c["id"], "name": c["name"]} for c in choices if c.get("id")] \
         + [{"name": n} for n in new]
-    nt.call("PUT", "/v1.0/notable/bases/%s/sheets/%s/fields/%s" % (nt.base, sheet, SKILL_FIELD),
+    nt.call("PUT", "/v1.0/notable/bases/%s/sheets/%s/fields/%s" % (nt.base, sheet, fld["id"]),
             {"name": fld.get("name", "技能标签"), "type": "multipleSelect",
              "property": {"choices": full}})
     return len(new)

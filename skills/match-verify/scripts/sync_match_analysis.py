@@ -85,14 +85,12 @@ def build(row, cand, job):
 
 
 def main():
-    cfgp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "config.json")
-    cfg = json.load(open(cfgp, encoding="utf-8"))
-    if "ai_analysis" not in cfg["fields"]["match"]:
-        cfg["fields"]["match"]["ai_analysis"] = "AI匹配分析"
-        cfg["types"]["match"]["ai_analysis"] = "text"
-        json.dump(cfg, open(cfgp, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     nt = Notable()
-    nt.cfg = cfg  # 复用刚写入的映射，避免新建实例时才加载
+    if "ai_analysis" not in nt.cfg["fields"].get("match", {}):
+        print(json.dumps({"error": "config.json 的 fields.match 缺 ai_analysis 映射，"
+                                   "请在 config.json 的 fields.match 补 ai_analysis 映射"},
+                         ensure_ascii=False))
+        sys.exit(1)
 
     cands = {}
     for r in nt.list_records("resume", biz_fields=["name", "skills", "years_experience", "education"]):

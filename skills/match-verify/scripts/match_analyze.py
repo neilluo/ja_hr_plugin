@@ -11,7 +11,7 @@
 子任务负责：判「专业/工序是否实质对口」+ 给部分覆盖计分 + 产出推荐状态/匹配依据/AI匹配分析。
 提示词：skills/match-verify/references/match-subagent-prompt.md
 """
-import sys, os, re, json, time, collections
+import sys, os, json, time, collections
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
 sys.path.insert(0, os.path.join(ROOT, "shared"))
@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 from notable import Notable  # noqa: E402
 from waves import plan, MAX_AGENTS  # noqa: E402  agent数封顶8，超限自动加大每 agent 岗位数
-from semantic_score import hit, toks  # noqa: E402
+from semantic_score import toks  # noqa: E402
 
 OUTDIR = os.path.join(ROOT, "outputs")
 DEFAULT_BATCH = 2        # 每个 agent 负责几个岗位（13岗→7个agent，落在4-8最优区间）
