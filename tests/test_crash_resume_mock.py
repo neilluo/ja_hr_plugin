@@ -48,6 +48,8 @@ BACKFILL_N = 3               # 内联 backfill 夹具条数
 PHONE_CN = "手机号"
 MD5_CN = "附件内容MD5"
 ATT_CN = "简历附件"
+SRC_CN = "原件本地路径"        # config.fields.resume.source_file
+REFINED_CN = "AI精析时间"      # config.fields.resume.ai_refined_at
 
 # 内联 backfill 夹具（原外部 ocr.json 的等价内容；_filename 指向 setUp 生成的临时真实文件）
 OCR_FIXTURE = [
@@ -321,16 +323,20 @@ class CrashTestBase(unittest.TestCase):
         self.srv.server_close()
 
     # ── 驱动器 ──────────────────────────────────────────
-    def run_main(self, argv, notable_cls=None):
-        """在进程内跑 upload_resumes.main()，返回 (exit_code, report_dict|None, exc)。"""
+    def run_main(self, argv, notable_cls=None, stdin_text=None):
+        """在进程内跑 upload_resumes.main()，返回 (exit_code, report_dict|None, exc)。
+        stdin_text 非空时替换 sys.stdin（供 --backfill - 走管道读 payload 的用例）。"""
         old_notable = ur.Notable
         if notable_cls is not None:
             ur.Notable = notable_cls
         buf = io.StringIO()
         old_argv = sys.argv
         old_stderr = sys.stderr
+        old_stdin = sys.stdin
         sys.argv = argv
         sys.stderr = io.StringIO()     # 吃掉 preflight 摘要，保持测试输出干净
+        if stdin_text is not None:
+            sys.stdin = io.StringIO(stdin_text)
         code, exc = 0, None
         try:
             with contextlib.redirect_stdout(buf):
@@ -343,6 +349,7 @@ class CrashTestBase(unittest.TestCase):
         finally:
             sys.argv = old_argv
             sys.stderr = old_stderr
+            sys.stdin = old_stdin
             ur.Notable = old_notable
         out = buf.getvalue().strip()
         report = None
@@ -369,8 +376,8 @@ class CrashTestBase(unittest.TestCase):
                           % (EXPECTED_TOTAL, n))
         return self.run_main(["upload_resumes.py", DATA_DIR], notable_cls)
 
-    def run_backfill(self, notable_cls=None):
-        """backfill 夹具内联生成：临时目录放 3 个真实小文件 + records.json。"""
+    def _ocr_records(self):
+        """backfill 夹具内联生成：临时目录放 3 个真实小文件，返回 records 列表。"""
         d = tempfile.mkdtemp(prefix="crash_mock_ocr_")
         self._tmpdirs.append(d)
         records = []
@@ -381,10 +388,20 @@ class CrashTestBase(unittest.TestCase):
                 f.write(("ocr-scan-fixture-%d\n" % i).encode())
             row["_file"] = path
             records.append(row)
-        ocr_json = os.path.join(d, "ocr.json")
+        return records
+
+    def run_backfill(self, notable_cls=None):
+        records = self._ocr_records()
+        ocr_json = os.path.join(self._tmpdirs[-1], "ocr.json")
         with open(ocr_json, "w", encoding="utf-8") as f:
             json.dump(records, f, ensure_ascii=False)
         return self.run_main(["upload_resumes.py", "--backfill", ocr_json], notable_cls)
+
+    def run_backfill_stdin(self, notable_cls=None):
+        """同一 payload 经 stdin 喂入（--backfill -），验证与文件路径等价。"""
+        payload = json.dumps(self._ocr_records(), ensure_ascii=False)
+        return self.run_main(["upload_resumes.py", "--backfill", "-"],
+                             notable_cls, stdin_text=payload)
 
 
 # ─────────────────────────── 场景 ───────────────────────────
@@ -657,6 +674,70 @@ class TestR9SelfHeal(CrashTestBase):
         # EXPECTED_CREATED + 保留 1 条种子
         self.assertEqual(self.state.count(self.SHEET), EXPECTED_CREATED + 1)
         self.assertEqual(self.state.phone_dupes(self.SHEET), {})
+
+
+class TestR10RoundTripFields(CrashTestBase):
+    """回合瘦身配套：报告新增 refine_fire_at / table_total 两字段 + --backfill - 走 stdin。
+
+    这两个字段的目的是消灭 agent 的两次验证往返（date 算偏移、query.py 复核总数），
+    故必须锁死其语义：fire_at 由唯一常量 REFINE_DELAY_S 派生、补录模式不输出（手析不入队）、
+    table_total 恒等于表内真实条数。"""
+
+    def test_fire_at_derives_from_single_source_constant(self):
+        """refine_fire_at = 当前 + REFINE_DELAY_S（UTC ISO8601）。延迟秒数不许有第二份副本。"""
+        import datetime
+        before = _real_time.time()
+        iso = ur._fire_at()
+        after = _real_time.time()
+        self.assertRegex(iso, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        fire = datetime.datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+        lo = before + ur.REFINE_DELAY_S - 2      # strftime 截断到秒，留 2 秒容差
+        hi = after + ur.REFINE_DELAY_S + 2
+        self.assertTrue(lo <= fire <= hi, "fire_at=%s 不在 [%s, %s]" % (iso, lo, hi))
+
+    def test_backfill_queues_via_source_file(self):
+        """补录口径（扫描件交后台读图）：写 source_file、不打 ai_refined_at → 照常入队，
+        故 table_total 有值且输出 refine_fire_at（补录后同样要注册消费任务）。"""
+        code, rep, _ = self.run_backfill()
+        self.assertEqual(code, 0)
+        self.assertEqual(rep["created"], BACKFILL_N)
+        self.assertEqual(rep["table_total"], BACKFILL_N)
+        self.assertEqual(rep["refine_queued"], BACKFILL_N)   # 原件在盘 → 入队读图
+        self.assertIn("refine_fire_at", rep)
+        for r in self.state.all_records(self.SHEET):
+            self.assertTrue(r["fields"].get(SRC_CN), r["id"])   # 原件绝对路径已入列
+            self.assertFalse(r["fields"].get(REFINED_CN), r["id"])  # 未打出队标记
+
+    def test_backfill_stdin_equivalent_to_file(self):
+        """--backfill - 从 stdin 读：与文件路径走同一套校验/去重/回读，产物完全一致。"""
+        code, rep, exc = self.run_backfill_stdin()
+        self.assertIsNone(exc)
+        self.assertEqual(code, 0)
+        self.assertEqual(rep["created"], BACKFILL_N)
+        self.assertEqual(rep["failed"], [])
+        self.assertEqual(rep["table_total"], BACKFILL_N)
+        recs = self.state.all_records(self.SHEET)
+        self.assertEqual(len(recs), BACKFILL_N)
+        for r in recs:
+            self.assertTrue(r["fields"].get(ATT_CN), r["id"])
+            self.assertTrue(r["fields"].get(MD5_CN), r["id"])
+        # 幂等：stdin 重跑仍 0 新增
+        code2, rep2, _ = self.run_backfill_stdin()
+        self.assertEqual(code2, 0)
+        self.assertEqual(rep2["created"], 0)
+        self.assertEqual(rep2["table_total"], BACKFILL_N)
+
+    def test_batch_emits_fire_at_when_queue_nonempty(self):
+        """批量入库后队列非空 → 输出 refine_fire_at；table_total 与表内条数一致。"""
+        if not DATA_DIR or not os.path.isdir(DATA_DIR):
+            self.skipTest("需设置 JA_TEST_RESUME_DIR 指向简历夹具目录（31 份简历）")
+        code, rep, _ = self.run_batch()
+        self.assertEqual(code, 0)
+        self.assertEqual(rep["created"], EXPECTED_CREATED)
+        self.assertGreater(rep["refine_queued"], 0)
+        self.assertIn("refine_fire_at", rep)
+        self.assertEqual(rep["table_total"], EXPECTED_CREATED)
 
 
 if __name__ == "__main__":

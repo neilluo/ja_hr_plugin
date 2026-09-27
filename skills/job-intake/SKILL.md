@@ -55,6 +55,8 @@ responsibilities 非空）。手动触发或补跑用以下命令（一律以仓
 
 ```bash
 python3 skills/job-intake/scripts/jobs_analyze.py prepare            # 只取队列中的岗；--all = 连已精析的一起重析
+#   周期租约 outputs/refine_job.lock：prepare 获取（活租约期内第二个周期 refused exit 2，
+#   勿抢跑），sync_job_columns 写回时释放；同周期重切批加 --force
 # → 按 meta.batches 的数量，在同一条消息里一次性并发发 agent（≤20，不分波、不串行）
 #   每个只给：提示词 skills/job-intake/references/job-subagent-prompt.md + 批次号 + part 路径
 #   part 路径必须是盘上真实存在的 pending 文件（禁止凭记忆写前缀/序号）；

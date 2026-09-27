@@ -91,7 +91,11 @@ AI 语义分析三列（`resume.ai_extract` AI结构化提取 / `resume.ai_deep`
 ## 业务规则
 
 - **查重**：简历 附件MD5 → 手机号（含批内）；岗位 md5(部门|岗位名)。重跑幂等。
-- **扫描件**：抽不出手机号且抽不出邮箱 → `needs_ocr`，不入库，交 agent 视觉补录。
+- **扫描件**：抽不出手机号且抽不出邮箱 → `needs_ocr`，不入库，交 agent 视觉补录基础字段。
+  补录时 `--backfill` 会把原件绝对路径写入 `resume.source_file`（表内附件 url 是 OSS 签名链、
+  约 2 小时过期且无换签接口，不能当精析依据），扫描件据此照常进精析队列、由 subagent 读图出三列；
+  agent 补录时不再手析三列。原件已被移动/删除的记录判为不可精析、不入队（防永久卡队列并阻塞
+  匹配门禁），由 `skills_analyze prepare` 的 `unrefinable` 报出。谓词与判据唯一真源 `shared/refine_loop.py`。
 - **附件**：uploadInfos 取 uploadUrl/resourceId → 裸 PUT OSS → 记录里写
   `[{filename,size,type,url:resourceUrl,resourceId}]`。附件失败则该条不写表。简历与 JD 同纪律。
 - **回读**：写后按手机号/job_id 全量回读比对，缺失即失败。

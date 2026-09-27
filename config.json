@@ -42,6 +42,7 @@
       "org": "简历库所属组织",
       "full_text": "简历全文",
       "attach_md5": "附件内容MD5",
+      "source_file": "原件本地路径",
       "ai_extract": "AI结构化提取",
       "ai_deep": "AI深度解析",
       "ai_refined_at": "AI精析时间"
@@ -116,6 +117,7 @@
       "org": "singleSelect",
       "full_text": "text",
       "attach_md5": "text",
+      "source_file": "text",
       "ai_extract": "text",
       "ai_deep": "text",
       "ai_refined_at": "date"

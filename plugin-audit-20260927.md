@@ -129,15 +129,17 @@ SKILL.md:55-56 明说二者不要混跑——但没有任何代码强制。
 
 用户拍板要点：① 上传链路不变，三列精析改异步队列；② 岗位链同构改造；③ 精析窗口期内
 匹配必须等待（拒绝粗值打分，--force 逃生）；④ ai_deep/ai_analysis 保留（人读列）；
-⑤ OCR 手析记录打标记、agent 永不再碰扫描件三列。
+⑤ ~~OCR 手析记录打标记、agent 永不再碰扫描件三列~~（**同日稍后被 §10 推翻**：手析改后台读图）。
 
 ### 8.1 队列设计
 
 - 标记列 `ai_refined_at`（config.fields 两表新增，type date 毫秒）：空 = 在队列。
   不靠"三列是否为空"推断（岗位三列入库即有正则粗值，推断必失效）。
 - 队列谓词唯一真源 `shared/refine_loop.py`：resume = 标记空且 full_text 非空
-  （扫描件不入队，防覆盖 OCR 手写字段）；job = 标记空且 responsibilities 非空。
-- 打标记责任方：skills_apply / sync_job_columns（与三列同一次 update）、OCR backfill（手析视同精析）。
+  ~~（扫描件不入队，防覆盖 OCR 手写字段）~~（**已改为扫描件凭 `source_file` 入队读图，见 §10**）；
+  job = 标记空且 responsibilities 非空。
+- 打标记责任方：skills_apply / sync_job_columns（与三列同一次 update）；
+  ~~OCR backfill（手析视同精析）~~（**已删，见 §10**）。
 - 消费形态：事件驱动（上传报告 refine_queued>0 → 2 分钟后一次性任务）+ 每日兜底巡检；
   每周期先拿 outputs/refine.lock 周期锁，两异构队列各一波 subagent（峰值≤20），
   解析完一条回写一条（apply 本就逐条 update），未做完留下周期续跑。
@@ -184,3 +186,51 @@ SKILL.md:55-56 明说二者不要混跑——但没有任何代码强制。
   与 check_skill_coverage exit 2 同源——简历池无安全/EHS 背景候选人，安全两岗 must 命中 3/10；
   分数普遍 <80 是数据事实，需业务侧补简历池或调岗。
 - 后台周期：事件驱动（上传报告 refine_queued>0）+ 每日 03:00 兜底巡检（cron 2141bf7e，空队列秒退）。
+
+## 10. 上传回合瘦身 + 扫描件读图异步化（2026-09-27 用户拍板，已实施）
+
+### 10.1 耗时取证（推翻"脚本是瓶颈"的直觉）
+
+一次 31 份简历上传 = 157.1s（与 UI 显示 2m37s 吻合）。按 transcript 逐次时间戳拆分：
+**模型思考 137.0s（87%）｜工具执行 20.0s（13%）｜脚本机器时间仅 9.0s**。
+13 个回合里 6 个不产生业务价值。历史三轮 upload_resumes 机器时间 6s/6s/6.008s 完全持平——
+脚本侧已无优化空间，瓶颈全在 agent 回合往返。
+
+### 10.2 改动一：能下沉的纪律下沉到脚本（消灭 3 轮，可靠）
+
+原则：AGENTS.md 已定"前置检查不能靠文档让 agent 自觉"，回合纪律同理——脚本能给的，别写进文档赌 agent 遵守。
+
+- 报告新增 `table_total`（回读那趟全表扫描顺带得出，零额外请求）→ 消灭「再跑 query.py 复核总数」。
+- 报告新增 `refine_fire_at`（UTC ISO8601，= 当前 + `REFINE_DELAY_S`）→ 消灭「单独跑 date 算 +45s」。
+  45 秒原散在 AGENTS.md + 3 处 SKILL（不变量 10 违例），现收敛为唯一具名常量，文档只引用字段名。
+- `--backfill -` 支持 stdin heredoc → 消灭「先写临时文件再跑」的第二回合；
+  SKILL 原「临时文件用唯一名」纪律（为躲 /tmp/ocr.json 撞名而生）随之删除。
+
+### 10.3 改动二：扫描件三列交后台读图（消灭 51.4s 单项最大开销）
+
+旧口径「agent 补录时当场手析三列」占 51.4s（占整回合 1/3），且与后台精析重复劳动。
+
+- 新列 `resume.source_file`（原件本地绝对路径）：`--backfill` 写它、**不再写三列、不再打 ai_refined_at**。
+- 谓词扩展为「标记空 且（full_text 非空 或 source_file 在盘）」→ 扫描件照常入队，subagent 用 Read 读图出三列。
+- **为何存本地路径而非用表内附件 url**：实测 url 是 OSS 签名链、约 2 小时过期，且 `downloadInfos/query`
+  返回 404（无换签接口）——异步周期（含 03:00 兜底）拿到即失效链接，必须走本地原件。
+- 防"永久卡队列"：原件被移动/删除 → 谓词为假不入队（否则一条坏记录天天重吃并**永久阻塞 match_gated 门禁**），
+  由 prepare 的 `unrefinable` 报出（带姓名，光有 id 人工无从处理）。
+- 防"覆盖已有好数据"：新增 `refinable()` 作入队与 --all/--ids 的共用判据。旧一代手析扫描件
+  （full_text 与 source_file 皆空、三列已有值）若被 --all 捞进批次，subagent 只能填"未提及"，
+  apply 一写即覆盖。真表已验证这 3 条被正确挡下。
+
+### 10.4 验证
+
+- unittest 197 → **203 全绿**（新增 6 条：stdin 补录、source_file 入队、unrefinable 补集、
+  job 链忽略 source_file、--all/--ids 无信息源过滤、fire_at 由唯一常量派生）。
+- 真表 e2e：sync_schema 补列 → 探针补录（created=1、refine_queued=1、fire_at 偏移实测准确）→
+  prepare 带出 source_file → **subagent 真读 PNG 出 10 个技能标签**（质量不低于当场手析）→
+  apply 写回 → ai_refined_at 打标 → 队列归零。探针已删，表回 31。
+- e2e 全程 OUTDIR 重定向临时目录，真实 outputs 未被污染。
+
+### 10.5 遗留
+
+- 回合合并纪律（TodoWrite 不独占回合、不预探扫描件页数）仍属"文档约束 agent"，可靠性低于代码保障；
+  实测收益需清表重跑 3 次取中位数，单次不作数。
+- `upload_jobs.py` 的写后查重自愈是内联实现，与 `upload_resumes._dedupe_selfheal` 构成既存双源（非本轮引入）。

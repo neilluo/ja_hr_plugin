@@ -6,7 +6,8 @@
 
 字段名映射（本机表结构）：skills→技能标签，ai_structured→AI结构化提取，ai_deep→AI深度解析。
 每条记录在三列的同一次 update 里打 ai_refined_at 标记（毫秒时间戳）——它是精析队列出队的
-唯一凭证（谓词真源 shared/refine_loop.py：ai_refined_at 为空 且 full_text 非空 = 在队列）。
+唯一凭证（谓词真源 shared/refine_loop.py，此处不复述条件）。
+写回（非 --verify）完成后释放 resume 链周期租约（prepare 获取，见 shared/refine_loop.py）。
 回读校验必须单独一次调用：AI表格刚写完立刻读会拿到索引前的旧值。
 """
 import sys, os, re, json, time
@@ -15,6 +16,7 @@ ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 sys.path.insert(0, os.path.join(ROOT, "shared"))
 os.chdir(ROOT)
 from notable import Notable, NotableError  # noqa: E402
+import refine_loop  # noqa: E402  周期锁释放方（prepare 获取、apply 释放，见 shared/refine_loop.py）
 
 
 def top_up_options(nt, want):
@@ -129,7 +131,14 @@ def main():
         print(__doc__)
         sys.exit(1)
     nt = Notable()
-    (verify if "--verify" in sys.argv else apply_)(nt, args[0])
+    if "--verify" in sys.argv:
+        verify(nt, args[0])
+        return
+    try:
+        apply_(nt, args[0])
+    finally:
+        # 写回即周期终点：释放 prepare 获取的租约（verify 只读不释，防半途误释放）
+        refine_loop.release_lock(refine_loop.lock_path(os.path.join(ROOT, "outputs"), "resume"))
 
 
 if __name__ == "__main__":

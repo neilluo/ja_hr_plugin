@@ -77,6 +77,21 @@
     - 例外：写入值字面量（如 source="系统匹配"、status="招聘中"）、解析私有规则（_DEPT_ALIAS 别名、
       分类→关键词映射）、安全白名单（sync_job_columns.KEYS）属单一出现，不算双源，但须注释指向 config 真源。
     - 每次新增枚举/阈值：先落唯一真源，再让消费方派生；同一提交内 grep 确认无第二份副本，unittest 全绿。
+11. 精析异步队列三层闭环（触发/出队/并发防护），禁止加第四层：
+    - 触发 = 上传后 agent 注册一次性消费任务，**时刻直接取报告字段 `refine_fire_at`**
+      （延迟秒数唯一真源 = `upload_resumes.REFINE_DELAY_S`，文档与 prompt 只引用字段名、禁止复述数值，
+      也不许再跑 `date` 现算；纪律在 resume-intake SKILL.md，`refine_queued` 供触发信号；
+      注册只能由 agent 做，脚本无本地调度 API）。
+    - 出队唯一凭证 = `ai_refined_at` 与三列同一次 update 落表（空即在队，崩溃无中间态要清）。
+      队列谓词与它的补集（`unrefinable`：原件已删的扫描件）必须同处 `refine_loop.py` 一源，
+      消费方禁止各抄一半。扫描件靠 `source_file`（原件本地绝对路径）入队、由 subagent 读图精析——
+      表内附件 url 是 OSS 签名链（约 2 小时过期、无换签接口），不得作为精析依据。
+    - 并发防护 = `shared/refine_loop.py` 周期租约：prepare 获取 `outputs/refine_{resume,job}.lock`、
+      写回端释放，30 分钟 mtime 判活，撞活租约 refused exit 2（消费方见 refused 即退、禁止抢跑），
+      同周期重切批 --force 夺回；锁路径走 OUTDIR 供测试隔离。
+    - 每日 03:00 兜底 cron 是**唯一崩溃恢复层**；看门狗/补跑任务层已裁撤（它既与兜底重叠、
+      又无法凭新鲜度区分"已崩"与"在跑"，判活窗口>看门狗延迟时必然误判），禁止复活。
+      已接受的边界：消费任务崩溃且 30 分钟内又有新上传时，新任务被僵尸租约拒绝、延至兜底重吃。
 
 ## 验证命令
 
@@ -137,3 +152,19 @@ python3 skills/replicate/scripts/sync_schema.py --check  # 只读：报 config �
   字段齐全即视为成功进 merge），仅产物缺失/不完整才补发。
 - 曾让 subagent 自写校验 assert 口径（把英文术语按字符数判"2-6 字"超长）→ 多轮试探性 Edit 返工、拉长暴露
   stall 窗口的时间；现校验脚本固化在 references/subagent-prompt.md（字数只数中文字符），agent 只许原样运行。
+- 曾给精析队列加 +15 分钟看门狗补跑任务 → 与 03:00 兜底功能重叠，且判活窗口（30 分钟租约）> 看门狗延迟，
+  崩溃场景必然被误判成"还在跑"而静默退出——三层恢复互相矛盾的空转层，已整体裁撤（不变量 11）。
+  教训：每加一层恢复/兜底，必须先回答"它覆盖了哪一层覆盖不到的真实场景"，答不出就不加。
+- 曾把周期租约路径硬编码 ROOT/outputs → 测试直调 prepare 后把活锁漏进真实目录、30 分钟拒绝后续周期；
+  现锁路径走 OUTDIR（与 pending/done 同目录），测试重定向 OUTDIR 即天然隔离。
+- 曾把"回合合并纪律"只写进 SKILL.md 就以为优化到位 → 同一份文档明写"耗时大头是 agent 回合往返"，
+  我照样空转 6 个回合（TodoWrite 独占 3 轮、预探 PDF 页数 1 轮、重复回读 1 轮）；
+  教训：文档约束的可靠性远低于代码保障，凡脚本能直接产出的（table_total、refine_fire_at、stdin payload）
+  一律下沉到脚本，别写一条"你必须记得"赌 agent 自觉。
+- 曾让扫描件在补录当场手析三列（"手析视同精析、永不再碰"）→ 单项占 51.4s 是整回合最大开销，
+  且与后台精析重复劳动；现扫描件凭 source_file 入队、subagent 读图出三列（实测质量不低于手析）。
+  改此口径时必须同步处理两个衍生风险：① 原件被删的记录若仍入队会永久卡队列并阻塞 match_gated 门禁
+  （故谓词要判"文件真实存在"，坏记录走 unrefinable 报出）；② 旧一代手析记录无 source_file，
+  --all 重析会把它们捞进批次、用"未提及"覆盖已有好数据（故入队与 --all/--ids 共用 refinable() 判据）。
+- 曾只测到"prepare 带出了 source_file"就宣称读图链路打通 → 能力核心是 subagent 能否真读图出三列，
+  必须端到端跑到 apply 写回与出队标记才算验证；现 e2e 用真 PNG 派真 subagent 全链跑通后才落文档。

@@ -14,10 +14,11 @@ author:
 
 # 简历 AI 精析（后台周期流水线）
 
-精析**不由上传同步触发**：上传写完表即结束，本流水线由后台周期任务消费精析队列
-（周期入口 = 定时调度触发本 Skill；提示词唯一源 = `references/subagent-prompt.md`）。
-队列谓词唯一真源 `shared/refine_loop.py`：resume 队列 = `ai_refined_at` 为空 且 `full_text` 非空
-（扫描件不入队，防覆盖 OCR 手写字段）。被触发后**全自动执行，不分步等用户确认**：
+精析**不由上传同步触发**：上传写完表即结束，本流水线由后台任务消费精析队列
+（消费入口 = 上传后 agent 注册的一次性消费任务，注册时刻取上传报告字段 `refine_fire_at`
+（延迟秒数唯一真源 = `upload_resumes.REFINE_DELAY_S`）+ 每日 03:00 兜底巡检，触发纪律见
+`skills/resume-intake/SKILL.md`；提示词唯一源 = `references/subagent-prompt.md`）。
+队列谓词唯一真源 `shared/refine_loop.py`（此处不复述条件）。被触发后**全自动执行，不分步等用户确认**：
 查队列 → 切分 → 同一消息内并发 subagent → 合并 → 写回（含出队标记）→ 回读校验。
 三列（技能标签 / AI结构化提取 / AI深度解析）**必须由 subagent 读简历全文推理得出**，
 脚本的正则词表命中不算结果；表内这两列是普通文本列，平台不会自动算。
@@ -44,6 +45,9 @@ python3 skills/skills-analyze/scripts/skills_analyze.py prepare
 候选来源 = 精析队列（`refine_loop.queue(nt, "resume")`），不再按"三列是否为空"推断。
 `--all` = 连已精析的一起重析（用户说"全部重跑"时用）；`--since N` 在队列内只看最近 N 分钟上传的；
 `--ids file.json` 指定记录 id（不受队列限制）。
+**周期租约**：prepare 获取 `outputs/refine_resume.lock`（30 分钟新鲜期内拒绝第二个周期，
+exit 2 秒退——看到 refused 说明已有周期在跑，直接结束本轮、不要抢跑）；apply 写回时释放。
+同周期内重新切批（改 --batch/--since）加 `--force` 夺回自有租约。
 
 **不传 `--batch` 时自动负载均衡**（batch = ceil(条数/20)），**agent 数硬上限 20、不可超过**：
 26条→batch 2→**13个agent**；≤20条→一条一个agent；200条→batch 10→20个agent（封顶）。
@@ -121,7 +125,10 @@ python3 skills/skills-analyze/scripts/skills_apply.py outputs/skills_done.json -
   JSON 可解析、id 集合与对应 pending 一致、三字段齐全；齐全即视为该批成功、直接进 merge——失败常只发生
   在产物已落盘后的收尾回合（批次 13 即此例：08:32 产物已完整，08:36 收尾回合模型流被 TLS 掐断报 failed，
   产物其实可用，补发白费一轮还覆盖了好产物）。仅当产物缺失或不完整时，才补发该批。
-- 扫描件（`full_text` 为空）不入队：OCR 补录时 agent 已手析三列并打 `ai_refined_at`，本流水线永不触碰。
+- 扫描件（`full_text` 为空、`source_file` 指向本地原件）**照常入队精析**：subagent 用 Read 直接读原件
+  （PDF/图片，多页逐页、同一条消息并发发出），读图规则见 `references/subagent-prompt.md`。
+  原件已被移动/删除的记录判为不可精析、不入队（防永久卡队列并阻塞匹配门禁），
+  prepare 的 meta 会以 `unrefinable` 字段报出，需人工把原件放回原位后重跑。
 - 技能标签是 multipleSelect：`skills_apply.py` 写回前自动扩选项，**已有选项必须带 id 回传**。
 - 三列无条件逐人精析：**不按硬门槛筛人**——简历库是人才池，不达标者照样分析、照样保留，
   是否进匹配表由「智能匹配」的门槛判定决定。

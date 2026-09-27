@@ -17,11 +17,15 @@ payload.json 格式（键可用 岗位ID 或 "部门|岗位名"）：
   - 不要塞 Excel/Word/办公软件 这类无区分度词，除非 JD 把它写成核心要求。
 
 用法:  python3 skills/job-intake/scripts/sync_job_columns.py payload.json
+
+写回完成后释放 job 链周期租约（jobs_analyze prepare 获取，见 shared/refine_loop.py）。
 """
 import sys, os, json, time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "shared"))
+_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+sys.path.insert(0, os.path.join(_ROOT, "shared"))
 from notable import Notable  # noqa: E402
+import refine_loop  # noqa: E402  周期租约释放方（jobs_analyze prepare 获取，见 shared/refine_loop.py）
 
 # 回写字段白名单(安全用途)，非字段清单；字段全集见 config.json fields.job
 KEYS = ("hard_gates", "must_skills", "bonus_skills", "work_location", "org", "status")
@@ -58,6 +62,8 @@ def main():
 
     if upd:
         nt.update_records("job", upd)
+    # 写回即 job 链周期终点：释放 jobs_analyze prepare 获取的租约
+    refine_loop.release_lock(refine_loop.lock_path(os.path.join(_ROOT, "outputs"), "job"))
     report = {"total": len(payload), "synced": len(upd), "unmatched": miss}
     print(json.dumps(report, ensure_ascii=False))
     sys.exit(2 if miss else 0)

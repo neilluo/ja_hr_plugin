@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """jobs_analyze.py — 岗位JD精析（subagent 并发，一人一岗，agent 数硬上限见 shared/waves.MAX_AGENTS(=20)）
 
-    python3 skills/job-intake/scripts/jobs_analyze.py prepare [--all|--batch N]
+    python3 skills/job-intake/scripts/jobs_analyze.py prepare [--all|--batch N|--force]
     python3 skills/job-intake/scripts/jobs_analyze.py merge
     python3 skills/job-intake/scripts/jobs_analyze.py queue   # 双表精析队列计数
 
 prepare：从精析队列取岗（谓词唯一真源 shared/refine_loop.py：ai_refined_at 空且 responsibilities 非空），
         按岗位切批，写 outputs/jobs_pending_part<N>.json 与 meta（骨架 = shared/analyze_parts.py）；
-        --all = 连已精析的一起重析
+        --all = 连已精析的一起重析；--force = 夺回自有租约（同周期重切批）；
+        租约被活周期占用时拒绝切批 exit 2（shared/refine_loop.acquire_lock，job 链）
 merge ：合并子任务产出为 outputs/jobs_done.json，供 skills/job-intake/scripts/sync_job_columns.py 写回
 子任务提示词：skills/job-intake/references/job-subagent-prompt.md
 
@@ -37,6 +38,15 @@ def txt(v):
 
 
 def prepare(args):
+    # 周期租约（job 链独立于 resume 链，两链可并行、同链防并发双写），
+    # sync_job_columns 写回时释放。同周期重切批 --force 夺回自有租约。
+    force = "--force" in args
+    args = [a for a in args if a != "--force"]
+    if refine_loop.acquire_lock(OUTDIR, "job", stale_after=1800, force=force) is None:
+        print(json.dumps({"refused": True,
+                          "reason": "另一精析周期持锁中（outputs/refine_job.lock 租约未过期）：本轮跳过避免并发双写；"
+                                    "确属本周期重切批则加 --force"}))
+        sys.exit(2)
     nt = Notable()
     rows = nt.list_records("job", biz_fields=BIZ)
     # 队列谓词唯一真源 refine_loop（ai_refined_at 空且 responsibilities 非空）；
@@ -59,6 +69,9 @@ def prepare(args):
     ap.write_parts(OUTDIR, PREFIX, items,
                    {"total": len(items), "queued": sum(1 for r in rows if r["id"] in queued_ids)},
                    batch)
+    if not items:
+        # 切出 0 条 = 队列已被并发周期吃空，sync_job_columns 永远不会来释放，此处即时释放租约
+        refine_loop.release_lock(refine_loop.lock_path(OUTDIR, "job"))
 
 
 def merge(args):
