@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""精析异步队列回归测试（mock，不触真网）。
+
+覆盖：
+  1. 队列谓词（refine_loop.queue 经 mock nt）：有标记不入队 / 无标记有全文入队 /
+     无标记无全文（扫描件）不入队；job 表按 responsibilities 判定。
+  2. skills_analyze：prepare 候选来源 = 队列（meta 含 queued）；queue 子命令输出
+     queue_counts JSON；merge 与 prepare/queue 签名一致（历史教训：分派签名不一致 TypeError）。
+  3. skills_apply：写三列的同一次 update 里打 ai_refined_at（毫秒时间戳，每条都打）；
+     三字段皆空的记录进 bad、不写不打标。
+  4. upload_resumes：--backfill 写回带 ai_refined_at（手析视同精析，扫描件不再入队）；
+     报告含 refine_queued（经 mock 全链路）。
+  5. 谓词唯一真源：消费方脚本无本地谓词副本（不变量 10）。
+"""
+
+import contextlib
+import io
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "shared"))
+sys.path.insert(0, os.path.join(ROOT, "skills", "skills-analyze", "scripts"))
+sys.path.insert(0, os.path.join(ROOT, "skills", "resume-intake", "scripts"))
+
+import refine_loop                       # noqa: E402
+import skills_analyze as sa              # noqa: E402
+import skills_apply as sapi              # noqa: E402
+import upload_resumes as ur              # noqa: E402
+from notable import Notable              # noqa: E402
+
+RESUME_ROWS = [
+    {"id": "r1", "fields": {"ai_refined_at": 1789924509618, "full_text": "已精析",
+                            "name": "甲", "skills": ["CAD"], "upload_time": 1}},
+    {"id": "r2", "fields": {"ai_refined_at": None, "full_text": "待精析全文",
+                            "name": "乙", "skills": [], "upload_time": 2}},
+    {"id": "r3", "fields": {"ai_refined_at": None, "full_text": "",
+                            "name": "丙", "skills": [], "upload_time": 3}},   # 扫描件
+]
+JOB_ROWS = [
+    {"id": "j1", "fields": {"ai_refined_at": 5, "responsibilities": "有标记"}},
+    {"id": "j2", "fields": {"ai_refined_at": None, "responsibilities": "无标记有职责"}},
+    {"id": "j3", "fields": {"ai_refined_at": None, "responsibilities": ""}},
+]
+
+
+class FakeNT:
+    """按表返回预置行；biz_fields 不过滤（真 Notable 会过滤，谓词只依赖字段存在性）。"""
+
+    def __init__(self, resume=None, job=None):
+        self.rows = {"resume": resume or [], "job": job or []}
+        self.calls = []
+
+    def list_records(self, table, flt=None, biz_fields=None, limit=0):
+        self.calls.append((table, tuple(biz_fields or ())))
+        return [dict(r, fields=dict(r["fields"])) for r in self.rows.get(table, [])]
+
+
+class TestQueuePredicate(unittest.TestCase):
+    def test_resume_predicate(self):
+        ids = [r["id"] for r in refine_loop.queue(FakeNT(resume=RESUME_ROWS), "resume")]
+        self.assertEqual(ids, ["r2"])        # 有标记不入队、扫描件不入队
+
+    def test_job_predicate(self):
+        ids = [r["id"] for r in refine_loop.queue(FakeNT(job=JOB_ROWS), "job")]
+        self.assertEqual(ids, ["j2"])
+
+    def test_queue_counts(self):
+        nt = FakeNT(resume=RESUME_ROWS, job=JOB_ROWS)
+        self.assertEqual(refine_loop.queue_counts(nt), {"resume": 1, "job": 1})
+
+    def test_unknown_table_raises(self):
+        with self.assertRaises(ValueError):
+            refine_loop.queue(FakeNT(), "match")
+
+    def test_is_queued_truthy_mark_excluded(self):
+        # 标记为任意真值（毫秒时间戳）即出队；空白全文不入队
+        self.assertFalse(refine_loop._is_queued({"ai_refined_at": 1, "full_text": "x"}, "resume"))
+        self.assertTrue(refine_loop._is_queued({"ai_refined_at": None, "full_text": " x "}, "resume"))
+        self.assertFalse(refine_loop._is_queued({"ai_refined_at": None, "full_text": "  "}, "resume"))
+
+
+class TestSkillsAnalyzeQueueCmd(unittest.TestCase):
+    def _run(self, argv):
+        buf = io.StringIO()
+        old_argv, old_nt = sys.argv, sa.Notable
+        sys.argv = argv
+        sa.Notable = lambda *a, **k: FakeNT(resume=RESUME_ROWS, job=JOB_ROWS)
+        try:
+            with contextlib.redirect_stdout(buf):
+                sa.main()
+        finally:
+            sys.argv, sa.Notable = old_argv, old_nt
+        return json.loads(buf.getvalue().strip().splitlines()[-1])
+
+    def test_queue_subcommand_prints_counts(self):
+        out = self._run(["skills_analyze.py", "queue"])
+        self.assertEqual(out, {"resume": 1, "job": 1})
+
+    def test_handler_signatures_consistent(self):
+        # 历史教训：prepare(nt,args)/merge(nt) 签名不一致 → merge 必崩 TypeError。
+        # 现在所有子命令 handler 统一 handler(args)，nt 由 handler 内部按需构造。
+        import inspect
+        for name, fn in sa.HANDLERS.items():
+            params = inspect.signature(fn).parameters
+            self.assertEqual(len(params), 1, "%s 签名应为 handler(args)" % name)
+
+    def test_merge_subcommand_smoke(self):
+        tmp = tempfile.mkdtemp(prefix="sa_merge_")
+        old_outdir, old_nt = sa.OUTDIR, sa.Notable
+        sa.OUTDIR = tmp
+        sa.Notable = lambda *a, **k: FakeNT()      # merge 不应触网：FakeNT 无 call 等方法
+        try:
+            json.dump([{"id": "r2", "skills": ["PLC"], "ai_extract": "e", "ai_deep": "d"}],
+                      open(os.path.join(tmp, "skills_pending_part1.json"), "w"))
+            json.dump([{"id": "r2", "skills": ["PLC"], "ai_extract": "e", "ai_deep": "d"}],
+                      open(os.path.join(tmp, "skills_done_part1.json"), "w"))
+            buf = io.StringIO()
+            old_argv = sys.argv
+            sys.argv = ["skills_analyze.py", "merge"]
+            try:
+                with contextlib.redirect_stdout(buf):
+                    sa.main()
+            finally:
+                sys.argv = old_argv
+            out = json.loads(buf.getvalue().strip().splitlines()[-1])
+            self.assertEqual(out, {"merged": 1, "batches": 1, "missing_batches": []})
+        finally:
+            sa.OUTDIR, sa.Notable = old_outdir, old_nt
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestSkillsAnalyzePrepareFromQueue(unittest.TestCase):
+    def test_prepare_candidates_come_from_queue(self):
+        tmp = tempfile.mkdtemp(prefix="sa_prepare_")
+        old_outdir, old_nt = sa.OUTDIR, sa.Notable
+        nt = FakeNT(resume=RESUME_ROWS, job=JOB_ROWS)
+        sa.OUTDIR = tmp
+        sa.Notable = lambda *a, **k: nt
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                sa.prepare([])
+            meta = json.loads(buf.getvalue().strip())
+            self.assertEqual(meta["total"], 1)
+            self.assertEqual(meta["queued"], 1)     # meta 必含 queued
+            part = json.load(open(os.path.join(tmp, "skills_pending_part1.json"),
+                                  encoding="utf-8"))
+            self.assertEqual([p["id"] for p in part], ["r2"])   # 只有队列内记录
+            self.assertEqual(part[0]["full_text"], "待精析全文")
+            self.assertEqual(part[0]["name"], "乙")
+        finally:
+            sa.OUTDIR, sa.Notable = old_outdir, old_nt
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class _ApplyNT(FakeNT):
+    """skills_apply 所需的最小 nt：字段 GET / 选项 PUT / update 捕获。"""
+
+    def __init__(self, resume=None):
+        super().__init__(resume=resume or [])
+        self.cfg = json.load(open(os.path.join(ROOT, "config.json"), encoding="utf-8"))
+        self.base = "baseX"
+        self.updated, self.puts = [], []
+
+    def sheet(self, table):
+        return "sheetX"
+
+    def cn(self, table, biz):
+        return Notable.cn(self, table, biz)
+
+    def call(self, method, path, body=None, **kw):
+        self.calls.append((method, path))
+        if method == "GET":
+            return {"value": [{"id": "f1", "name": self.cn("resume", "skills"),
+                               "type": "multipleSelect",
+                               "property": {"choices": [{"id": "c1", "name": "CAD"}]}}]}
+        self.puts.append(body)
+        return {}
+
+    def update_records(self, table, rows):
+        self.updated.extend(rows)
+
+
+class TestSkillsApplyStamp(unittest.TestCase):
+    def _apply(self, records):
+        d = tempfile.mkdtemp(prefix="sa_apply_")
+        p = os.path.join(d, "done.json")
+        json.dump(records, open(p, "w", encoding="utf-8"), ensure_ascii=False)
+        nt = _ApplyNT()
+        before = int(time.time() * 1000)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                sapi.apply_(nt, p)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        return nt, json.loads(buf.getvalue().strip()), before
+
+    def test_stamp_written_with_three_columns(self):
+        nt, rep, before = self._apply([
+            {"id": "r2", "skills": ["PLC"], "ai_extract": "工作经验｜5年", "ai_deep": "d"},
+            {"id": "r9", "skills": [], "ai_extract": "e", "ai_deep": ""},
+        ])
+        self.assertEqual(rep["updated"], 2)
+        self.assertEqual(len(nt.updated), 2)
+        for row in nt.updated:
+            self.assertIn("ai_refined_at", row)      # 每条都打，与三列同一次 update
+            self.assertIsInstance(row["ai_refined_at"], int)
+            self.assertGreaterEqual(row["ai_refined_at"], before)
+            self.assertLessEqual(row["ai_refined_at"], int(time.time() * 1000))
+        # 标记是毫秒时间戳（config types: ai_refined_at=date，_cast 毫秒直传）
+        self.assertEqual(Notable._cast(nt.updated[0]["ai_refined_at"], "date"),
+                         nt.updated[0]["ai_refined_at"])
+
+    def test_empty_record_not_stamped(self):
+        nt, rep, _ = self._apply([{"id": "r5", "skills": [], "ai_extract": "", "ai_deep": ""}])
+        self.assertEqual(nt.updated, [])
+        self.assertEqual(rep["updated"], 0)
+        self.assertEqual([b["id"] for b in rep["bad"]], ["r5"])
+
+    def test_years_backfill_untouched(self):
+        # 年限回填正则保留：ai_extract「工作经验｜N年」回填 years_experience
+        nt, _, _ = self._apply([{"id": "r2", "skills": [], "ai_extract": "工作经验｜7年",
+                                 "ai_deep": "d"}])
+        self.assertEqual(nt.updated[0].get("years_experience"), 7)
+
+
+class _UploadNT(FakeNT):
+    """upload_resumes --backfill 全链路 mock：附件/create/回读/查重自愈。"""
+
+    def __init__(self):
+        super().__init__(resume=[])
+        self.cfg = json.load(open(os.path.join(ROOT, "config.json"), encoding="utf-8"))
+        self.store = []          # [{"id","fields":业务键行}]
+        self.created_rows = []
+
+    def list_records(self, table, flt=None, biz_fields=None, limit=0):
+        return [dict(r, fields=dict(r["fields"])) for r in self.store]
+
+    def map_parallel(self, fn, items, workers=5):
+        return [fn(i) for i in items], []
+
+    def upload_attachment(self, path):
+        return {"filename": os.path.basename(path), "size": 1, "type": "application/pdf",
+                "url": "/res/x", "resourceId": "x"}
+
+    def create_records(self, table, rows):
+        ids = []
+        for row in rows:
+            self.created_rows.append(dict(row))
+            rid = "rec%d" % (len(self.store) + 1)
+            self.store.append({"id": rid, "fields": dict(row)})
+            ids.append(rid)
+        return ids
+
+    def delete_records(self, table, ids):
+        self.store = [r for r in self.store if r["id"] not in ids]
+
+
+class TestBackfillStampAndQueueReport(unittest.TestCase):
+    def test_backfill_stamps_and_report_has_refine_queued(self):
+        d = tempfile.mkdtemp(prefix="ur_backfill_")
+        try:
+            fpath = os.path.join(d, "scan.pdf")
+            with open(fpath, "wb") as f:
+                f.write(b"ocr-fixture")
+            payload = [{"name": "张三", "phone": "13800000000", "email": "z@x.com",
+                        "skills": ["暖通空调"], "ai_extract": "e", "ai_deep": "d",
+                        "_file": fpath}]
+            pj = os.path.join(d, "ocr.json")
+            json.dump(payload, open(pj, "w", encoding="utf-8"), ensure_ascii=False)
+            nt = _UploadNT()
+            before = int(time.time() * 1000)
+            buf = io.StringIO()
+            args = type("A", (), {"backfill": pj})()
+            with self.assertRaises(SystemExit) as ctx:
+                with contextlib.redirect_stdout(buf):
+                    ur.run_backfill(nt, args)
+            self.assertEqual(ctx.exception.code, 0)
+            rep = json.loads(buf.getvalue())
+            self.assertEqual(rep["created"], 1)
+            self.assertIn("refine_queued", rep)
+            # 手析视同精析：backfill 打了标记 → 不入队
+            self.assertEqual(rep["refine_queued"], 0)
+            row = nt.created_rows[0]
+            self.assertIn("ai_refined_at", row)
+            self.assertGreaterEqual(row["ai_refined_at"], before)
+            self.assertLessEqual(row["ai_refined_at"], int(time.time() * 1000))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_finalize_report_counts_unmarked_as_queued(self):
+        # 批量入库（不打标记）→ refine_queued = 有全文未标记条数
+        nt = _UploadNT()
+        nt.store = [{"id": "a", "fields": {"phone": "1", "full_text": "t"}},
+                    {"id": "b", "fields": {"phone": "2", "full_text": ""}}]
+        report = {"failed": []}
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stdout(buf):
+                ur._finalize(nt, "resume", [], report)
+        rep = json.loads(buf.getvalue())
+        self.assertEqual(rep["refine_queued"], 1)
+
+
+class TestQueuePredicateSingleSource(unittest.TestCase):
+    """不变量 10：队列谓词只在 refine_loop，消费方禁止本地副本。"""
+
+    def _src(self, *parts):
+        with open(os.path.join(ROOT, *parts), encoding="utf-8") as f:
+            return f.read()
+
+    def test_consumers_import_refine_loop(self):
+        self.assertIn("import refine_loop",
+                      self._src("skills", "skills-analyze", "scripts", "skills_analyze.py"))
+        self.assertIn("import refine_loop",
+                      self._src("skills", "resume-intake", "scripts", "upload_resumes.py"))
+
+    def test_no_local_predicate_copy(self):
+        for parts in (("skills", "skills-analyze", "scripts", "skills_analyze.py"),
+                      ("skills", "resume-intake", "scripts", "upload_resumes.py"),
+                      ("skills", "skills-analyze", "scripts", "skills_apply.py")):
+            src = self._src(*parts)
+            self.assertNotIn('fields.get("ai_refined_at")', src, "%s 出现谓词副本" % (parts,))
+            self.assertNotIn("_is_queued", src.replace("refine_loop._is_queued", ""))
+
+    def test_old_inference_filter_removed(self):
+        # 旧推断式过滤（三列非空即跳过）已删干净（不变量 9）
+        src = self._src("skills", "skills-analyze", "scripts", "skills_analyze.py")
+        self.assertNotIn('r["fields"].get("ai_extract")', src)
+        self.assertNotIn('r["fields"].get("ai_deep")', src)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

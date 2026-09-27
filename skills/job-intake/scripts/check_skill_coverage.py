@@ -4,19 +4,18 @@
 用途：必备/加分技能若与简历库标签不同源，匹配分数会恒低或全0。每次 JD 入库、每次简历入库
 （或标签池调整）后跑一次，把「可命中」比例低于 50% 的岗位列出来修词。
 
+前置门禁：岗位精析队列非空（真源 shared/refine_loop.py）→ exit 2：三列还是入库正则粗值，
+覆盖率结论无意义，先跑 JD 精析流水线（jobs_analyze → sync_job_columns）再来自检。
+
 用法:  python3 skills/job-intake/scripts/check_skill_coverage.py [--min 0.5]
 输出:  每岗一行命中比例 + 汇总；存在低覆盖岗位时 exit 2。
 """
-import sys, os, re, argparse
+import sys, os, json, argparse
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "shared"))
 from notable import Notable  # noqa: E402
-
-SEP = r"[、,，;；/]\s*"
-
-
-def toks(s):
-    return [t.strip() for t in re.split(SEP, s or "") if t.strip()]
+from vocab import toks  # noqa: E402  统一分词（唯一真源 shared/vocab.py，禁止本地再抄 SEP）
+import refine_loop  # noqa: E402  队列谓词唯一真源，禁止本地抄副本
 
 
 def hit(cand, need):
@@ -34,6 +33,12 @@ def main():
     args = ap.parse_args()
 
     nt = Notable()
+    # 前置门禁（与 match_gated 同纪律）：岗位精析未完成时，三列是入库正则粗值，覆盖率无意义
+    if refine_loop.queue(nt, "job"):
+        print(json.dumps({"refused": True,
+                          "reason": "岗位未精析（队列非空），粗词表覆盖率无意义；先跑 jobs_analyze → sync_job_columns"},
+                         ensure_ascii=False))
+        sys.exit(2)
     jobs = nt.list_records("job", biz_fields=["job_id", "job_name", "department", "must_skills", "bonus_skills"])
     pool = set()
     for c in nt.list_records("resume", biz_fields=["skills"]):

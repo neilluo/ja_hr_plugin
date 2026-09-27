@@ -18,15 +18,19 @@ payload.json 格式（键可用 岗位ID 或 "部门|岗位名"）：
 
 用法:  python3 skills/job-intake/scripts/sync_job_columns.py payload.json
 """
-import sys, os, json
+import sys, os, json, time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "shared"))
 from notable import Notable  # noqa: E402
 
+# 回写字段白名单(安全用途)，非字段清单；字段全集见 config.json fields.job
 KEYS = ("hard_gates", "must_skills", "bonus_skills", "work_location", "org", "status")
 
 
 def main():
+    if "-h" in sys.argv or "--help" in sys.argv:   # --help 早退：不构造 Notable、不触网
+        print(__doc__)
+        sys.exit(0)
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
@@ -46,6 +50,10 @@ def main():
         for biz in KEYS:
             if p.get(biz):
                 row[biz] = p[biz]
+        # 精析完成打标记（队列谓词真源 shared/refine_loop.py：ai_refined_at 非空即出队）：
+        # 仅当本次真写了三列之一才算精析完成，与三列同一次 update 落库
+        if any(k in row for k in ("hard_gates", "must_skills", "bonus_skills")):
+            row["ai_refined_at"] = int(time.time() * 1000)
         upd.append(row)
 
     if upd:

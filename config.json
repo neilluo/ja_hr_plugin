@@ -43,7 +43,8 @@
       "full_text": "简历全文",
       "attach_md5": "附件内容MD5",
       "ai_extract": "AI结构化提取",
-      "ai_deep": "AI深度解析"
+      "ai_deep": "AI深度解析",
+      "ai_refined_at": "AI精析时间"
     },
     "job": {
       "job_id": "岗位ID",
@@ -57,6 +58,7 @@
       "hard_gates": "硬性门槛",
       "must_skills": "必备技能",
       "bonus_skills": "加分项",
+      "ai_refined_at": "AI精析时间",
       "must_weight": "必备技能权重",
       "bonus_weight": "加分项权重",
       "submit_time": "提交时间",
@@ -95,8 +97,8 @@
   "types": {
     "resume": {
       "name": "text",
-      "phone": "telephone",
-      "email": "email",
+      "phone": "text",
+      "email": "text",
       "education": "singleSelect",
       "school": "text",
       "school_rank": "singleSelect",
@@ -115,7 +117,8 @@
       "full_text": "text",
       "attach_md5": "text",
       "ai_extract": "text",
-      "ai_deep": "text"
+      "ai_deep": "text",
+      "ai_refined_at": "date"
     },
     "job": {
       "job_id": "text",
@@ -124,11 +127,12 @@
       "org": "singleSelect",
       "status": "singleSelect",
       "work_location": "multipleSelect",
-      "responsibilities": "richText",
-      "requirements": "richText",
+      "responsibilities": "text",
+      "requirements": "text",
       "hard_gates": "text",
       "must_skills": "text",
       "bonus_skills": "text",
+      "ai_refined_at": "date",
       "must_weight": "number",
       "bonus_weight": "number",
       "submit_time": "date",
@@ -140,7 +144,7 @@
     },
     "match": {
       "name": "text",
-      "phone": "telephone",
+      "phone": "text",
       "job_name": "text",
       "job_id": "text",
       "org": "singleSelect",
@@ -160,7 +164,7 @@
       "ai_analysis": "text"
     },
     "perm": {
-      "user": "user",
+      "user": "text",
       "org": "singleSelect"
     }
   },
@@ -179,9 +183,9 @@
         "技术部", "产品部", "市场部", "运营部", "厂务管理部", "EHS管理部",
         "单晶制造部-生产部", "单晶制造部-设备部", "数据信息部-系统组", "财经管理部",
         "硅片制造部-工艺部", "硅片制造部-设备部", "组件制造部-工艺部", "组件制造部-设备部",
-        "电池制造部-工艺部", "电池制造部-设备部"
+        "电池制造部-工艺部", "电池制造部-设备部", "厂务管理部-暖通组", "厂务管理部-电力能源组"
       ],
-      "org": ["职能中心", "制造中心"],
+      "org": ["职能中心", "制造中心", "营销中心", "研发中心"],
       "status": ["招聘中", "草稿", "已关闭"],
       "work_location": ["北京", "上海", "深圳", "杭州", "成都", "广州", "南京", "武汉", "曲靖", "不限"]
     },
@@ -194,5 +198,21 @@
       "org": ["职能中心", "制造中心"]
     }
   },
-  "note": "业务键→中文字段名映射；OpenAPI 记录接口以中文字段名为 key，无需字段 ID。凭证在 .secrets.json 或环境变量 DINGTALK_APP_KEY/DINGTALK_APP_SECRET。字段顺序以 fields 书写顺序为建表顺序；options 为 select 字段选项真源。"
+  "refs": {
+    "resume": {
+      "school_985": [
+        "清华大学", "北京大学", "复旦大学", "上海交通大学", "浙江大学",
+        "南京大学", "中国科学技术大学", "哈尔滨工业大学", "西安交通大学", "武汉大学",
+        "华中科技大学", "中山大学", "同济大学", "天津大学", "东南大学",
+        "北京航空航天大学", "北京理工大学", "大连理工大学", "吉林大学", "山东大学"
+      ],
+      "school_211": [
+        "北京邮电大学", "华北电力大学", "河海大学", "江南大学", "苏州大学",
+        "南京理工大学", "南京航空航天大学", "西安电子科技大学", "合肥工业大学", "郑州大学",
+        "南昌大学", "太原理工大学", "云南大学", "贵州大学", "广西大学",
+        "西南交通大学", "电子科技大学", "中南大学", "湖南师范大学", "长安大学"
+      ]
+    }
+  },
+  "note": "业务键→中文字段名映射；OpenAPI 记录接口以中文字段名为 key，无需字段 ID。凭证在 .secrets.json 或环境变量 DINGTALK_APP_KEY/DINGTALK_APP_SECRET。字段顺序以 fields 书写顺序为建表顺序；options 为 select 字段选项真源。refs 是派生参考数据真源（如简历院校 985/211 名单，供解析器运行时读取），非 select 选项，消费方禁止本地留副本。"
 }

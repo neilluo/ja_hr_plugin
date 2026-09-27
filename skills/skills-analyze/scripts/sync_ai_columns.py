@@ -1,57 +1,38 @@
 # -*- coding: utf-8 -*-
-"""sync_ai_columns.py — 招聘智能体语义三列回写（技能标签 / AI结构化提取 / AI深度解析）
+"""sync_ai_columns.py — 手工修正薄通道（实现委托 skills_apply）
 
-标准流程（每次简历入库后必须执行）：
-  1) 智能体读简历原文（脚本解析摘要 + 必要时视觉补录），逐人语义产出 payload.json：
+零散手工修正（不经精析队列）语义三列与档案字段回写：
+  1) 智能体读简历原文，逐人产出 payload.json：
      { "手机号": {"skills": ["暖通","空调系统",...],
                   "extract": "**联系方式**\\n...",     # 写入「AI结构化提取」文本列
                   "deep": "**优势分析**\\n...",        # 写入「AI深度解析」文本列
                   "name": "...", "school": "...", ...} }   # 其余键为需要修正的档案字段
-  2) 自动扩池：payload 里出现但选项池没有的技能标签，先按 choices 结构全量回写
-     （原选项必须带 id 回传，否则会丢单元格）
-  3) 按手机号匹配记录并批量 update；缺手机号的记录用 name 兜底匹配
+  2) 按手机号匹配记录（缺手机号用 name 兜底），转换成 skills_apply 行格式
+  3) 写入委托 skills_apply.apply_rows（stamp=False：扩选项/剔词重试/逐条写唯一实现，
+     本脚本不复制；手工修正不打 ai_refined_at 出队标记，队列状态不受影响）
 
 用法:
     python3 skills/skills-analyze/scripts/sync_ai_columns.py payload.json
 """
 import sys, os, json
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "shared"))
-from notable import Notable, NotableError  # noqa: E402
-
-
-def top_up_options(nt, sheet, want):
-    """把 payload 里新增的技能标签追加进选项池，原有选项带 id 全量回传。"""
-    flds = nt.call("GET", "/v1.0/notable/bases/%s/sheets/%s/fields" % (nt.base, sheet)).get("value", [])
-    skill_cn = nt.cn("resume", "skills")
-    fld = next((f for f in flds if f.get("name") == skill_cn), None)
-    if not fld:
-        raise NotableError("找不到技能标签字段 %s" % skill_cn)
-    choices = ((fld.get("property") or {}).get("choices")) or []
-    have = {c.get("name") for c in choices}
-    new = sorted(want - have)
-    if not new:
-        return 0
-    full = [{"id": c["id"], "name": c["name"]} for c in choices if c.get("id")] \
-        + [{"name": n} for n in new]
-    nt.call("PUT", "/v1.0/notable/bases/%s/sheets/%s/fields/%s" % (nt.base, sheet, fld["id"]),
-            {"name": fld.get("name", "技能标签"), "type": "multipleSelect",
-             "property": {"choices": full}})
-    return len(new)
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "shared"))
+sys.path.insert(0, HERE)
+os.chdir(os.path.normpath(os.path.join(HERE, "..", "..", "..")))
+from notable import Notable  # noqa: E402
+from skills_apply import apply_rows  # noqa: E402  写入唯一实现，禁止本地再抄扩选项/剔词重试
 
 
 def main():
+    if "-h" in sys.argv or "--help" in sys.argv:   # --help 早退：不构造 Notable、不触网
+        print(__doc__)
+        sys.exit(0)
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
     payload = json.load(open(sys.argv[1], encoding="utf-8"))
     nt = Notable()
-    sheet = nt.sheet("resume")
-
-    want = set()
-    for v in payload.values():
-        want.update(v.get("skills", []))
-    added = top_up_options(nt, sheet, want)
 
     rows = nt.list_records("resume", biz_fields=["name", "phone"])
     by_phone = {str(r["fields"].get("phone")): r["id"] for r in rows if r["fields"].get("phone")}
@@ -63,22 +44,17 @@ def main():
         if not rid:
             unmatched.append(key)
             continue
-        row = {"id": rid}
-        for k, v in p.items():
-            if k == "extract":
-                row["ai_extract"] = v
-            elif k == "deep":
-                row["ai_deep"] = v
-            elif k == "phone" and str(key).isdigit():
-                row["phone"] = str(key)
-            else:
-                row[k] = v
-        row.setdefault("phone", str(key))
+        row = dict(p)
+        row["id"] = rid
+        # payload 键是手机号：本人档案缺手机号时顺手补上（非手机号键不写 phone）
+        if str(key).isdigit() and not row.get("phone"):
+            row["phone"] = str(key)
         upd.append(row)
 
-    nt.update_records("resume", upd)
-    print(json.dumps({"total": len(payload), "synced": len(upd),
-                      "options_added": added, "unmatched": unmatched}, ensure_ascii=False))
+    rep = apply_rows(nt, upd, stamp=False, require_three=False)
+    print(json.dumps({"total": len(payload), "synced": rep["updated"],
+                      "options_added": rep["options_added"], "unmatched": unmatched,
+                      "bad": rep["bad"], "failed": rep["failed"]}, ensure_ascii=False))
     sys.exit(2 if unmatched else 0)
 
 

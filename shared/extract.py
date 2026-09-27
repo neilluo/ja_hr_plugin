@@ -13,7 +13,12 @@ import zipfile
 _SHARED_DIR = os.path.dirname(os.path.abspath(__file__))
 _VENDOR_DIR = os.path.join(_SHARED_DIR, "vendor")
 _TIMEOUT = 30
-_IMG_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
+
+# 简历链路支持的文件类型（唯一源）：入口脚本扫描目录、preflight 校验均从此处引用，
+# 禁止各自再抄一份扩展名清单（AGENTS.md 双源零容忍）。
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
+DOC_EXTS = {".pdf", ".doc", ".docx", ".txt", ".md"}
+SUPPORTED_EXTS = DOC_EXTS | IMG_EXTS   # IMG_EXTS 一律标 needs_ocr，不进文本提取
 
 
 def _run(argv):
@@ -87,7 +92,7 @@ def extract(path):
     """统一入口：返回 {"text", "needs_ocr", "error"}。图片只标记 needs_ocr。"""
     result = {"text": "", "needs_ocr": False, "error": None}
     ext = os.path.splitext(path)[1].lower()
-    if ext in _IMG_EXT:
+    if ext in IMG_EXTS:
         result["needs_ocr"] = True
         return result
     try:

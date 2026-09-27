@@ -11,7 +11,9 @@
 import os
 import math
 
-MAX_AGENTS = int(os.environ.get("MAX_AGENTS", "20"))   # agent 数硬上限 20，不可超过
+# agent 数硬上限 20，只能下调不能上调：环境变量可压小，但 min(...,20) 硬顶不可被 env 突破。
+_MAX_AGENTS_CEIL = 20
+MAX_AGENTS = min(int(os.environ.get("MAX_AGENTS", _MAX_AGENTS_CEIL)), _MAX_AGENTS_CEIL)
 
 
 def plan(n, batch=None, cap=None):

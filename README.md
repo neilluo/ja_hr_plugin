@@ -20,78 +20,73 @@ python3 skills/resume-intake/scripts/upload_resumes.py /path/to/AI简历
 python3 shared/query.py resume --fields name,phone,education
 python3 shared/query.py match --stats
 
-# 4. 匹配打分（写 match 表 + 刷新岗位统计，幂等）
-python3 skills/match-verify/scripts/match.py
+# 4. 智能匹配（唯一主链路：机械门槛 → 逐岗 subagent 语义判定 → 落库 → 统计）
+python3 skills/match-verify/scripts/match_gated.py                    # 门槛判定 → outputs/gate_pairs.json
+python3 skills/match-verify/scripts/match_analyze.py prepare          # 一岗一批切批（agent ≤ 20）
+#   → 按 outputs/match_analyze_meta.json 一次性并发发 subagent（提示词见 match-verify/references）
+python3 skills/match-verify/scripts/match_analyze.py merge            # 合并判定 → outputs/match_final.json
+python3 skills/match-verify/scripts/match_analyze.py apply            # 只建 keep=true 配对（幂等：先删该岗位旧配对）
+python3 skills/match-verify/scripts/match_analyze.py stats            # 另起一次读取，刷新岗位四项统计
+#   兜底：match_gated.py --commit（无 subagent 直连打分落库，与 apply 不要混跑）
 
 # 5. 简历 AI 三列精析（技能标签 / AI结构化提取 / AI深度解析）
 python3 skills/skills-analyze/scripts/skills_analyze.py prepare   # 切批
 python3 skills/skills-analyze/scripts/skills_apply.py             # 写回三列
 
-# 6. 岗位 JD 语义回写 + AI 匹配分析（可选增强）
+# 6. 岗位 JD 语义回写（可选增强，建议在跑匹配前完成）
 python3 skills/job-intake/scripts/jobs_analyze.py prepare         # JD 精析切批
 python3 skills/job-intake/scripts/sync_job_columns.py             # 回写门槛/必备/加分三列
-python3 skills/match-verify/scripts/match_analyze.py             # 逐岗 subagent 并发 AI 分析
-python3 skills/match-verify/scripts/sync_match_analysis.py       # AI匹配分析回写
+python3 skills/job-intake/scripts/check_skill_coverage.py         # 岗位词表 vs 简历标签命中率自检
 
 # 7. 跨组织复制表结构（可选）
 python3 skills/replicate/scripts/replicate_base.py <新baseId>
+python3 skills/replicate/scripts/sync_schema.py --check           # 只读：报 config 与真实 Base 漂移，缺列 exit 2
 ```
 
-每条命令输出 JSON 报告：`total / parsed / skipped_dup / needs_ocr / failed /
+入库类命令输出 JSON 报告：`total / parsed / skipped_dup / needs_ocr / failed /
 created / readback_missing`。`readback_missing` 非空或 `failed` 非空时 exit 1。
-`--dry-run` 只解析不触网写表。
+`--dry-run` 只解析不触网写表。匹配链路的报告字段见各脚本 stdout。
+所有入口 stage 0 会跑环境预检（`shared/preflight/`），缺凭证/缺依赖直接失败。
 
-## 代码地图（全部 Python 约 2900 行）
+## 代码地图（约 2800 行 Python，不含 vendor；以实际为准）
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
-| `shared/notable.py` | ~355 | 唯一传输层：token 缓存、重试、记录 CRUD、类型转换、richText 归一、附件三步上传 |
-| `shared/extract.py` | ~105 | 文本提取：pdf(pdftotext→pypdf) / docx(zip→textutil) / doc(textutil→olefile) / 图片标记 OCR |
-| `shared/waves.py` | ~40 | 跨 skill 公共 subagent 并发调度：MAX_AGENTS 硬上限 20、自动均衡 batch=ceil(条数/20)、一次性并发 |
-| `skills/resume-intake/scripts/parse_resume.py` | ~160 | 简历字段抽取（正则+词表），resume-intake 私有 |
-| `skills/job-intake/scripts/parse_job.py` | ~120 | JD 字段抽取（文件名拆部门+正文切段），job-intake 私有 |
-| `skills/resume-intake/scripts/upload_resumes.py` | ~245 | 简历入库入口 |
-| `skills/job-intake/scripts/upload_jobs.py` | ~125 | 岗位入库入口 |
-| `shared/query.py` | ~65 | 只读查询/统计入口 |
-| `skills/match-verify/scripts/match.py` | ~145 | 匹配打分：简历×岗位 → match 表 + 岗位统计（确定性打分入口） |
-| `skills/replicate/scripts/replicate_base.py` | ~120 | 新 Base 重建四表结构 |
-| `shared/vendor/` | — | 内置 pypdf / olefile（零 pip 依赖） |
-| **skills-analyze（简历 AI 三列精析）** | | |
-| `skills/skills-analyze/scripts/skills_analyze.py` | ~120 | prepare/merge 切批合并，规划 subagent 并发精析 |
-| `skills/skills-analyze/scripts/skills_apply.py` | ~105 | 写回三列：技能标签 / AI结构化提取 / AI深度解析 |
-| `skills/skills-analyze/scripts/sync_ai_columns.py` | ~85 | 零散手工修正通道 |
-| **match-verify 增强（智能匹配）** | | |
-| `skills/match-verify/scripts/match_gated.py` | ~220 | 门槛前置匹配（硬性门槛过滤后再打分） |
-| `skills/match-verify/scripts/match_analyze.py` | ~190 | 逐岗 subagent 并发 AI 匹配分析 |
-| `skills/match-verify/scripts/sync_match_analysis.py` | ~125 | AI匹配分析回写 match 表 ai_analysis 列 |
-| `skills/match-verify/scripts/semantic_score.py` | ~160 | 私有库：语义词典 + 同义命中判定 |
-| **job-intake 增强（JD 语义回写）** | | |
-| `skills/job-intake/scripts/jobs_analyze.py` | ~100 | JD 精析 prepare/merge |
+| `shared/notable.py` | ~355 | 唯一传输层：token 缓存、重试与 pacing、记录 CRUD、类型转换、附件三步上传 |
+| `shared/extract.py` | ~110 | 文本提取：pdf(pdftotext→pypdf) / docx(zip→textutil) / doc(textutil→olefile) / txt,md 直读 / 图片标记 OCR；`SUPPORTED_EXTS` 唯一源 |
+| `shared/vocab.py` | ~35 | 技能词表 `SKILL_WORDS` 与统一分词 `toks`/`SEP` 唯一源 |
+| `shared/waves.py` | ~35 | 跨 skill 公共 subagent 并发调度：MAX_AGENTS 硬上限 20、自动均衡 batch=ceil(条数/20)、一次性并发 |
+| `shared/query.py` | ~70 | 只读查询/统计入口 |
+| `shared/preflight/preflight.py` | ~260 | stage 0 预检：凭证/依赖/目标目录/整点峰值规避（同目录 .sh/.ps1 为外壳） |
+| `skills/resume-intake/scripts/parse_resume.py` | ~180 | 简历字段抽取（正则+词表），resume-intake 私有 |
+| `skills/resume-intake/scripts/upload_resumes.py` | ~245 | 简历入库入口（查重→附件→写表→回读） |
+| `skills/job-intake/scripts/parse_job.py` | ~115 | JD 字段抽取（文件名拆部门+正文切段），job-intake 私有 |
+| `skills/job-intake/scripts/upload_jobs.py` | ~125 | 岗位入库入口（job_id=J+md5(部门\|岗位名)[:10]） |
+| `skills/job-intake/scripts/jobs_analyze.py` | ~100 | JD 精析 prepare/merge 切批合并 |
 | `skills/job-intake/scripts/sync_job_columns.py` | ~60 | 回写硬性门槛/必备技能/加分项三列 |
 | `skills/job-intake/scripts/check_skill_coverage.py` | ~60 | 岗位技能词表 vs 简历标签命中率自检，低覆盖 exit 2 |
+| `skills/match-verify/scripts/match_gated.py` | ~230 | 匹配主链路第一段：机械门槛一票否决 + 语义打分（阈值 REC_MIN/PEND_MIN、MIN_SCORE） |
+| `skills/match-verify/scripts/match_analyze.py` | ~175 | 匹配主链路第二段：prepare/merge/apply/stats，逐岗 subagent 并发 AI 判定并落库 |
+| `skills/match-verify/scripts/semantic_score.py` | ~110 | 私有库：SYNONYM 同义 + HYPERS 单向上下位词典与 `hit()` 判定 |
+| `skills/skills-analyze/scripts/skills_analyze.py` | ~115 | 简历三列精析 prepare/merge |
+| `skills/skills-analyze/scripts/skills_apply.py` | ~100 | 写回三列：技能标签 / AI结构化提取 / AI深度解析 |
+| `skills/skills-analyze/scripts/sync_ai_columns.py` | ~60 | 手工修正薄通道（实现委托 skills_apply） |
+| `skills/replicate/scripts/replicate_base.py` | ~70 | 新 Base 重建四表结构（从 config 派生） |
+| `skills/replicate/scripts/sync_schema.py` | ~160 | 结构自检/补列（`--check` 只读报漂移 exit 2；`--rename`/`--drop` 显式对齐） |
+| `shared/vendor/` | — | 内置 pypdf / olefile / typing_extensions（零 pip 依赖） |
 
-## 表结构（config.json）
+## 表结构（config.json 是唯一事实源）
 
-四张表：`resume` 简历库管理 / `job` 岗位JD表 / `match` 智能匹配 / `perm` 权限配置。
-config.json 只存 `base_id`、`operator_id`、每表的 `table_id` 与 业务键→中文字段名 映射、
-字段类型表。OpenAPI 记录接口以中文字段名为 key，无需字段 ID。
+四张表业务键：`resume` 简历库管理 / `job` 岗位JD表 / `match` 智能匹配 / `perm` 权限配置。
+**base_id、table_id、字段全集、字段类型、单选/多选选项清单一律见 `config.json`
+（`tables` / `fields.<表>` / `types.<表>` / `options.<表>`），本文件与文档都不手抄**，
+抄进文档的 id 与清单会随改表漂移成谎报。OpenAPI 记录接口以中文字段名为 key，无需字段 ID。
 
-简历业务键：name phone email education school school_rank years_experience major
-certificates expected_position expected_location expected_salary skills attachment
-upload_time category comm_status org full_text attach_md5
-ai_extract（AI结构化提取,text） ai_deep（AI深度解析,text）
+新增/改字段 = 改 config（fields/types/options）+ 跑 `sync_schema.py` 对目标 Base 补列，两步同一提交。
 
-匹配业务键（match）：name phone job_name job_id org source cand_skills must_skills
-bonus_skills hard_gates expected_position years_experience skill_score bonus_score
-total_score recommend update_time evidence ai_analysis（AI匹配分析,text）
-
-AI 语义分析三列（ai_extract / ai_deep / ai_analysis）为 schema 净增量，与组织无关：
-`skills/skills-analyze` 产出简历技能标签 + AI结构化提取 + AI深度解析，
-`skills/match-verify` 产出 AI匹配分析，均为 text 富文本列。
-
-岗位业务键：job_id job_name department org status work_location responsibilities
-requirements hard_gates must_skills bonus_skills must_weight bonus_weight submit_time
-attachment stat_total stat_recommend stat_pending stat_reject
+AI 语义分析三列（`resume.ai_extract` AI结构化提取 / `resume.ai_deep` AI深度解析 /
+`match.ai_analysis` AI匹配分析）为 schema 净增量、与组织无关，类型均 text：
+`skills/skills-analyze` 产出前两列 + 简历技能标签，`skills/match-verify` 产出 AI匹配分析。
 
 ## 业务规则
 
@@ -100,19 +95,32 @@ attachment stat_total stat_recommend stat_pending stat_reject
 - **附件**：uploadInfos 取 uploadUrl/resourceId → 裸 PUT OSS → 记录里写
   `[{filename,size,type,url:resourceUrl,resourceId}]`。附件失败则该条不写表。简历与 JD 同纪律。
 - **回读**：写后按手机号/job_id 全量回读比对，缺失即失败。
-- **限流**：429/5xx/文档初始化中 指数退避重试 3 次；401 自动刷 token 重试一次。
-- **并发**：附件上传经 `Notable.map_parallel` 5 线程并发（I/O 密集）；解析与记录写串行。
-  实测 28 简历+附件全链路 27s（串行附件版 42s）。
-- **留空字段**：`org`（简历库所属组织）与岗位统计四字段由人工/匹配流程维护，脚本不写。
+- **匹配**：机械门槛（组织/学历/年限/证书/年龄）一票否决 → subagent 逐岗判 keep 与语义计分 →
+  推荐阈值 total≥80 推荐 / 60–79 待定 / <60 不推荐；落库门槛 `MIN_SCORE` 环境变量默认 20。
+  口径细节见 `skills/recruit-model/references/ai-analysis-spec.md`。
+- **限流**：429/5xx/文档初始化中 指数退避重试；401 自动刷 token 重试一次；QPS 403 属网关级拒绝可重试。
+- **并发**：附件上传经 `Notable.map_parallel` 5 线程并发（I/O 密集）；解析与记录写串行
+  （记录每批 10 条，`Notable.call()` 全局 pacing 20 req/s）。subagent 并发一律经 `shared/waves.py`，
+  agent 数硬上限 20、一次性并发发出、不分波不串行。
+- **留空字段**：`resume.org`（简历库所属组织）为人工/预留列：全链路脚本均不赋值，由 HR
+  手工维护或留空预留，匹配不用它做写入源（机械门槛里简历侧 org 为空即自动跳过组织比对，
+  组织口径以岗位侧 org 为准）；岗位统计四字段（`job.stat_*`）由匹配流程 stats 维护，入库脚本不写。
+- **match.org 写入方**：`match_gated.py --commit` 与 `match_analyze.py apply` 落库匹配记录时，
+  `org` 一律取所匹配岗位（job 表）的 org，即 match.org = 岗位侧组织分类，不取简历侧。
+- **死代码零容忍**：改动同提交内删掉不再使用的逻辑/入口/孤儿 import。
 
 ## 依赖
 
-- Python ≥ 3.9，stdlib only（+ vendor 内 pypdf/olefile）。
+- Python ≥ 3.9，stdlib only（+ vendor 内 pypdf/olefile/typing_extensions）。
 - 外部二进制（可选回退）：`pdftotext`、`textutil`(macOS)。
-- 钉钉应用权限点：`Notable.Base.Read.All`、`Notable.Base.Write.All`、`Storage.File.Read`。
+- 钉钉应用权限点：`Notable.Base.Read.All`、`Notable.Base.Write.All`、`Storage.File.Read`；
+  目标 Base 还需把应用机器人加为协作者。
 
 ## 测试
 
 ```bash
-python3 -m unittest discover -s tests
+python3 -m unittest discover -s tests                        # 无副作用（含 mock HTTP 传输），用例数以实跑为准
+python3 -m py_compile shared/*.py skills/*/scripts/*.py
+bash shared/preflight/preflight.sh                           # Windows: shared/preflight/preflight.ps1
+python3 skills/replicate/scripts/sync_schema.py --check      # 只读：config 与真实 Base 漂移，缺列 exit 2
 ```

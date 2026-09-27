@@ -6,7 +6,7 @@ argument-hint-en: (knowledge base, read references/)
 argument-hint-zh: (知识库，直接读 references/)
 name_en: Recruit Model
 name_zh: 招聘匹配知识库
-description_en: Shared knowledge base for the recruitment suite: table schema, field semantics, scoring rules, parsing methods, execution discipline.
+description_en: "Shared knowledge base for the recruitment suite: table schema, field semantics, scoring rules, parsing methods, execution discipline."
 description_zh: 招聘套件共享知识库：表结构、字段口径、打分规则、解析方法、执行纪律。
 user-invocable: false
 author:

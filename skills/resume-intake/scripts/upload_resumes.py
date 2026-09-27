@@ -12,7 +12,10 @@
 两种模式共用同一套尾部流程：字段校验 → 附件先传（失败则该条不写表）→ 写表 → 按手机号回读。
 补录与批量走完全一致的不变量，扫描件的原件也会进表、MD5 也写入，重跑幂等。
 
-输出 JSON 报告：created / skipped_dup / needs_ocr / failed / readback_missing。
+输出 JSON 报告：created / skipped_dup / needs_ocr / failed / readback_missing / refine_queued。
+精析是异步队列：上传写完表即结束，refine_queued = 当前待精析队列长度
+（谓词唯一真源 shared/refine_loop.py），由后台周期消费，上传环节不衔接精析。
+补录（--backfill）写回时同批打 ai_refined_at 标记：手析视同精析，扫描件三列永不再被 agent 碰。
 """
 
 import argparse
@@ -24,15 +27,18 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "shared"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "shared", "preflight"))
-from extract import extract                      # noqa: E402
+from extract import extract, SUPPORTED_EXTS     # noqa: E402  扩展名清单唯一源在 shared/extract.py
 from notable import Notable, NotableError       # noqa: E402
 from parse_resume import parse                  # noqa: E402
 from preflight import run_preflight             # noqa: E402
+import refine_loop                              # noqa: E402  队列谓词唯一真源，禁止本地抄副本
 
 _CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "config.json")
 
-EXTS = (".pdf", ".doc", ".docx", ".png", ".jpg", ".jpeg")
-FULL_TEXT_MAX = 20000  # 全文参考字段截断上限（打分用 skills，不依赖此字段）
+FULL_TEXT_MAX = 20000  # 全文参考字段截断上限（打分用 skills，不依赖此字段），唯一源
+# 新入库默认沟通状态；合法枚举清单见 config.options.resume.comm_status
+COMM_STATUS_DEFAULT = "待筛选"
+UPLOAD_WORKERS = 10  # 附件上传/文本解析并发；notable.map_parallel 默认 5 对 30+ 文件偏保守
 
 
 def _md5(path):
@@ -63,11 +69,13 @@ def _dedupe_selfheal(nt, table, key_of):
 
 
 def _finalize(nt, table, rows, report):
-    """批量与补录共用尾部：附件先传 → 写表 → 写后查重自愈 → 按手机号回读。rows 含 _file/attach_md5。"""
+    """批量与补录共用尾部：附件先传 → 写表 → 写后查重自愈 → 按手机号回读 → 队列计数。
+    rows 含 _file/attach_md5。"""
     if not rows:
         try:
             report["duplicates_removed"] = _dedupe_selfheal(
                 nt, table, lambda f: f.get("phone") or f.get("attach_md5"))
+            report["refine_queued"] = len(refine_loop.queue(nt, "resume"))
         except NotableError as e:
             print(json.dumps({**report, "error": "查重失败: %s" % e}, ensure_ascii=False))
             sys.exit(1)
@@ -76,9 +84,9 @@ def _finalize(nt, table, rows, report):
         print(json.dumps(report, ensure_ascii=False, indent=2))
         sys.exit(0)
 
-    # 附件先行（5 并发）：任一附件上传失败则该条不写表（不留无附件记录）
+    # 附件先行（UPLOAD_WORKERS 并发）：任一附件上传失败则该条不写表（不留无附件记录）
     paths = [row.pop("_file") for row in rows]
-    cells, errs = nt.map_parallel(nt.upload_attachment, paths)
+    cells, errs = nt.map_parallel(nt.upload_attachment, paths, workers=UPLOAD_WORKERS)
     write_rows = []
     for row, cell in zip(rows, cells):
         if cell is not None:
@@ -97,6 +105,8 @@ def _finalize(nt, table, rows, report):
         report["duplicates_removed"] = _dedupe_selfheal(
             nt, table, lambda f: f.get("phone") or f.get("attach_md5"))
         back = {r["fields"].get("phone") for r in nt.list_records(table, biz_fields=["phone"])}
+        # 写表回读完成后计队列（谓词真源 refine_loop；dry-run 不走 _finalize 天然不含）
+        report["refine_queued"] = len(refine_loop.queue(nt, "resume"))
     except NotableError as e:
         print(json.dumps({**report, "created": len(ids),
                           "error": "回读/查重失败: %s" % e}, ensure_ascii=False))
@@ -109,7 +119,8 @@ def _finalize(nt, table, rows, report):
 
 
 def run_batch(nt, args):
-    files = sorted(f for f in os.listdir(args.dir) if f.lower().endswith(EXTS))
+    files = sorted(f for f in os.listdir(args.dir)
+                   if os.path.splitext(f)[1].lower() in SUPPORTED_EXTS)
     if args.dry_run:
         phones, md5s = set(), set()
     else:
@@ -119,16 +130,14 @@ def run_batch(nt, args):
 
     # 阶段1：并行提取文本（extract 走 subprocess pdftotext，I/O 密集，线程可提速）
     paths = [os.path.join(args.dir, fn) for fn in files]
-    extracts, _errs = nt.map_parallel(extract, paths)
+    extracts, _errs = nt.map_parallel(extract, paths, workers=UPLOAD_WORKERS)
 
     rows = []
     report = {"total": len(files), "parsed": 0, "skipped_dup": [],
               "needs_ocr": [], "failed": []}
     for fn, path, ex in zip(files, paths, extracts):
         try:
-            if ex is None or ex.get("error"):
-                # 提取失败但可能有部分文本：仍按下方逻辑判扫描件
-                pass
+            # 提取失败(ex=None/带error)不特殊处理：text 为空自然落入下方 needs_ocr 判定
             ex = ex or {"text": "", "needs_ocr": False}
             digest = _md5(path)
             if digest in md5s:
@@ -144,11 +153,11 @@ def run_batch(nt, args):
             if c["phone"] and c["phone"] in phones:
                 report["skipped_dup"].append({"file": fn, "reason": "phone", "phone": c["phone"]})
                 continue
-            row = {k: v for k, v in c.items() if k not in ("full_text", "certificates")}
+            row = {k: v for k, v in c.items() if k != "certificates"}
             row["certificates"] = "、".join(c["certificates"])
             row["full_text"] = ex["text"][:FULL_TEXT_MAX]
             row["upload_time"] = int(time.time() * 1000)
-            row["comm_status"] = "待筛选"
+            row["comm_status"] = COMM_STATUS_DEFAULT
             row["attach_md5"] = digest
             row["_file"] = path
             rows.append(row)
@@ -207,8 +216,11 @@ def run_backfill(nt, args):
             if isinstance(row.get("certificates"), list):
                 row["certificates"] = "、".join(row["certificates"])
             row["upload_time"] = int(time.time() * 1000)
-            row.setdefault("comm_status", "待筛选")
+            row.setdefault("comm_status", COMM_STATUS_DEFAULT)
             row["attach_md5"] = digest
+            # OCR 补录由 agent 视觉手析并随 payload 带三列：手析视同精析，
+            # 同批打 ai_refined_at 出队标记，防止精析队列拿空 full_text 覆盖手写字段
+            row["ai_refined_at"] = int(time.time() * 1000)
             row["_file"] = path
             rows.append(row)
             if rec.get("phone"):

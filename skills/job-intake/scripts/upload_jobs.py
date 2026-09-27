@@ -20,6 +20,7 @@ from extract import extract                      # noqa: E402
 from notable import Notable, NotableError       # noqa: E402
 from parse_job import parse                     # noqa: E402
 from preflight import run_preflight             # noqa: E402
+import refine_loop                              # noqa: E402  队列谓词唯一真源
 
 _CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "config.json")
 
@@ -117,6 +118,8 @@ def main():
         sys.exit(1)
     report["created"] = len(ids)
     report["readback_missing"] = [r["job_id"] for r in write_rows if r["job_id"] not in back]
+    # 精析队列计数（谓词真源 refine_loop）：>0 即事件驱动触发后台精析周期的信号
+    report["refine_queued"] = len(refine_loop.queue(nt, "job"))
     print(json.dumps(report, ensure_ascii=False, indent=2))
     sys.exit(1 if report["readback_missing"] else 0)
 

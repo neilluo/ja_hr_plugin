@@ -7,48 +7,59 @@ monkeypatch notable.API / notable.CACHE 到临时路径，然后进程内 patch
 sys.argv 调用 upload_jobs.main()，捕获 SystemExit，检查内存表状态，
 再跑一次验证恢复。
 
-覆盖场景 J1-J8（见 report）。运行：
-    python3 tests/test_crash_job.py
+覆盖场景 J1-J8（含 J3a-d / J4a-b 共 12 个用例），unittest discover 可直接收集：
+    python3 -m unittest discover -s tests
+    python3 -m unittest discover -s tests -p "test_crash_job.py" -v
+
+真实 JD 夹具目录经环境变量注入（不写死本机路径）：
+    JA_TEST_DATA_DIR=/path/to/岗位说明书 python3 -m unittest discover -s tests
+未设置或目录不存在时优雅 skip（夹具目录需含 19 份 .doc/.docx/.pdf JD 文件）。
 
 设计纪律：本文件只读生产代码，绝不修改 shared/*.py / skills/*/scripts/*.py / config.json。
 所有 monkeypatch 都在测试进程内、运行期完成（与 tests/test_notable_local.py 同手法）。
 """
+import io
 import json
 import os
+import re
 import shutil
 import sys
+import tempfile
 import threading
 import time as _real_time
-import traceback
+import unittest
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "shared"))
+sys.path.insert(0, os.path.join(ROOT, "shared", "preflight"))
 sys.path.insert(0, os.path.join(ROOT, "skills", "job-intake", "scripts"))
 
-DATA_DIR = "/Users/neil/Desktop/qwenworklearn/jahrplugin/data/岗位说明书"
+# 真实 JD 夹具目录：仅经环境变量注入，缺失则 skip（禁止硬编码本机绝对路径）
+DATA_DIR = os.environ.get("JA_TEST_DATA_DIR", "")
+EXPECTED_FILES = 19          # 标准夹具：19 份 JD -> 19 created（块1=10 / 块2=9）
 
 import notable as notable_mod            # noqa: E402
-from notable import Notable, NotableError  # noqa: E402
+from notable import Notable               # noqa: E402
+import preflight as preflight_mod        # noqa: E402
 import upload_jobs                        # noqa: E402
 
-JOB_SHEET = "5Y4JylL"          # config.json tables.job.table_id
 CN_JOB_ID = "岗位ID"
 CN_ATTACH = "JD附件"
+JD_EXTS = (".doc", ".docx", ".pdf")
 
 
 # --------------------------------------------------------------------------- #
-# 快速 time 垫片：把指数退避 sleep 变 no-op，其余委托真实 time
+# 快速 time 垫片：sleep 变 no-op，其余（time/monotonic/mktime/...）委托真实 time。
+# 必须是「实例 + __getattr__」：notable._pace 会取 time.monotonic。
 # --------------------------------------------------------------------------- #
 class _FastTime:
-    mktime = staticmethod(_real_time.mktime)
-    strptime = staticmethod(_real_time.strptime)
-    time = staticmethod(_real_time.time)
-
-    @staticmethod
-    def sleep(*a, **k):
+    def sleep(self, *a, **k):
         return None
+
+    def __getattr__(self, n):
+        return getattr(_real_time, n)
 
 
 # --------------------------------------------------------------------------- #
@@ -224,15 +235,17 @@ def _make_handler(db, port_holder):
                 chunk = body.get("records", [])
                 db.log.append("create#%d:%s(n=%d)" % (idx, action, len(chunk)))
 
-                committed = False
                 if action in ("ok", "drop_after_commit", "500_after_commit", "503_after_commit"):
                     ids = []
                     for rec in chunk:
                         ids.append(db.add(rec.get("fields", {})))
-                    committed = True
                 else:  # *_before_commit
                     ids = []
 
+                if action == "drop_before_commit":
+                    # 服务端未提交就断连：客户端 RemoteDisconnected（写结果未知）
+                    self._drop()
+                    return
                 if action == "drop_after_commit":
                     # 已提交内存表，然后丢弃响应
                     self._drop()
@@ -274,7 +287,7 @@ def _make_handler(db, port_holder):
 
 
 # --------------------------------------------------------------------------- #
-# Harness：起 mock server + patch notable + 跑 upload_jobs.main()
+# Harness：起 mock server + patch notable/preflight + 跑 upload_jobs.main()
 # --------------------------------------------------------------------------- #
 class Harness:
     def __init__(self):
@@ -289,29 +302,33 @@ class Harness:
         self._old_api = notable_mod.API
         self._old_cache = notable_mod.CACHE
         self._old_time = notable_mod.time
+        self._old_sleep = notable_mod._sleep
+        self._old_pf_sleep = preflight_mod._sleep
         self._old_create = Notable.create_records
         notable_mod.API = "http://127.0.0.1:%d" % self.port_holder["port"]
-        self._cache_path = os.path.join(ROOT, "tests", ".crash_job_token_cache.json")
+        self._cache_dir = tempfile.mkdtemp(prefix="crash_job_cache_")
+        self._cache_path = os.path.join(self._cache_dir, "token_cache.json")
         notable_mod.CACHE = self._cache_path
-        notable_mod.time = _FastTime  # 加速退避
+        notable_mod.time = _FastTime()       # 加速退避（含 monotonic 委托）
+        notable_mod._sleep = lambda *a, **k: None    # call() 退避走模块级 _sleep
+        preflight_mod._sleep = lambda *a, **k: None  # 整点峰值规避不真等
 
     def close(self):
         notable_mod.API = self._old_api
         notable_mod.CACHE = self._old_cache
         notable_mod.time = self._old_time
+        notable_mod._sleep = self._old_sleep
+        preflight_mod._sleep = self._old_pf_sleep
         Notable.create_records = self._old_create
         try:
             self.srv.shutdown()
             self.srv.server_close()
         except Exception:
             pass
-        if os.path.exists(self._cache_path):
-            os.remove(self._cache_path)
+        shutil.rmtree(self._cache_dir, ignore_errors=True)
 
     # 让下一次 main() 在 create_records 之前抛 BaseException（模拟进程死亡）
     def inject_death_before_create(self):
-        orig = self._old_create
-
         def boom(self_nt, table, rows):
             raise BaseException("injected death before create_records")
         Notable.create_records = boom
@@ -323,11 +340,10 @@ class Harness:
         """进程内调用 upload_jobs.main()。返回 (exit_code_or_None, stdout, exc)。"""
         argv = ["upload_jobs.py", data_dir] + (extra_argv or [])
         old_argv = sys.argv
-        old_stdout = sys.stdout
-        import io
-        buf = io.StringIO()
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        buf, errbuf = io.StringIO(), io.StringIO()
         sys.argv = argv
-        sys.stdout = buf
+        sys.stdout, sys.stderr = buf, errbuf
         exc = None
         code = None
         try:
@@ -337,355 +353,306 @@ class Harness:
         except BaseException as e:  # noqa: BLE001 捕获注入的死亡 / 未处理异常
             exc = e
         finally:
-            sys.stdout = old_stdout
+            sys.stdout, sys.stderr = old_stdout, old_stderr
             sys.argv = old_argv
         return code, buf.getvalue(), exc
 
 
-# --------------------------------------------------------------------------- #
-# 场景
-# --------------------------------------------------------------------------- #
-def _fresh_data_dir(with_dup=False):
-    d = "/tmp/crash_job_data"
-    if os.path.exists(d):
-        shutil.rmtree(d)
-    shutil.copytree(DATA_DIR, d)
-    if with_dup:
-        files = sorted(os.listdir(d))
-        src = os.path.join(d, files[0])
-        # 同内容 + 仅在扩展名前追加尾号 -> parse_job 里 re.sub(r"\d+$") 会把尾号去掉，
-        # department(来自文件名前缀 token) 与 job_name(来自正文) 完全一致 -> 同 job_id。
-        base, ext = os.path.splitext(files[0])
-        shutil.copy(src, os.path.join(d, base + "2" + ext))
-    return d
-
-
-def scenario(name):
-    def deco(fn):
-        fn._scenario_name = name
-        return fn
-    return deco
-
-
-RESULTS = []
-
-
-def record(name, status, evidence):
-    RESULTS.append({"scenario": name, "status": status, "evidence": evidence})
-    print("\n[%s] %s" % (status, name))
-    for k, v in evidence.items():
-        print("    %s: %s" % (k, v))
-
-
-# --- J1 基线 -------------------------------------------------------------- #
-def j1_baseline():
-    h = Harness()
+def _report(out):
+    """从 stdout 提取 JSON 报告（报告均整段输出；兜底 regex 截取）。"""
+    out = (out or "").strip()
+    if not out:
+        return {}
     try:
-        d = _fresh_data_dir()
-        code, out, exc = h.run_main(d)
-        rep = json.loads(out)
-        jids = h.db.all_job_ids()
-        ok = (code == 0 and exc is None and rep.get("created") == 19
-              and h.db.count() == 19 and not h.db.dup_job_ids()
-              and not rep.get("readback_missing")
-              and not h.db.records_without_attachment())
-        record("J1 基线：19 created / 无重复 / 全带附件",
-               "PASS" if ok else "FAIL",
-               {"exit_code": code, "created": rep.get("created"),
-                "table_count": h.db.count(), "unique_job_id": len(set(jids)),
-                "dup": h.db.dup_job_ids(), "no_attachment": h.db.records_without_attachment(),
-                "readback_missing": rep.get("readback_missing")})
-    finally:
-        h.close()
+        return json.loads(out)
+    except ValueError:
+        m = re.search(r"\{.*\}", out, re.S)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except ValueError:
+                pass
+    return {}
 
 
-# --- J2 create 块1 提交、块2 连接断开（服务端未提交块2） ------------------ #
-def j2_block2_drop_before_commit():
-    h = Harness()
-    try:
-        d = _fresh_data_dir()
+# --------------------------------------------------------------------------- #
+# TestCase：J1-J8（12 场景）
+# --------------------------------------------------------------------------- #
+class TestCrashJob(unittest.TestCase):
+    """岗位入库崩溃注入。需要真实 JD 夹具目录（环境变量 JA_TEST_DATA_DIR），缺失则 skip。"""
+
+    def setUp(self):
+        if not DATA_DIR or not os.path.isdir(DATA_DIR):
+            self.skipTest("需设置 JA_TEST_DATA_DIR 指向岗位说明书目录（19 份 JD 夹具）")
+        n = len([f for f in os.listdir(DATA_DIR) if f.lower().endswith(JD_EXTS)])
+        if n != EXPECTED_FILES:
+            self.skipTest("JA_TEST_DATA_DIR 需含 %d 份 JD 夹具（实际 %d 份），场景计数不成立"
+                          % (EXPECTED_FILES, n))
+        # 假凭证走环境变量，避免依赖本机 .secrets.json（mock server 无条件发 token）
+        self._old_env = {k: os.environ.get(k)
+                         for k in ("DINGTALK_APP_KEY", "DINGTALK_APP_SECRET")}
+        os.environ["DINGTALK_APP_KEY"] = "crash-job-test-key"
+        os.environ["DINGTALK_APP_SECRET"] = "crash-job-test-secret"
+        self.h = Harness()
+        self._tmpdirs = []
+
+    def tearDown(self):
+        for k, v in self._old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        for d in self._tmpdirs:
+            shutil.rmtree(d, ignore_errors=True)
+        self.h.close()
+
+    def _fresh_data_dir(self, with_dup=False):
+        d = tempfile.mkdtemp(prefix="crash_job_data_")
+        self._tmpdirs.append(d)
+        dst = os.path.join(d, "jd")
+        shutil.copytree(DATA_DIR, dst)
+        if with_dup:
+            files = sorted(f for f in os.listdir(dst) if f.lower().endswith(JD_EXTS))
+            src = os.path.join(dst, files[0])
+            # 同内容 + 仅在扩展名前追加尾号 -> parse_job 里 re.sub(r"\d+$") 会把尾号去掉，
+            # department(来自文件名前缀 token) 与 job_name(来自正文) 完全一致 -> 同 job_id。
+            base, ext = os.path.splitext(files[0])
+            shutil.copy(src, os.path.join(dst, base + "2" + ext))
+        return dst
+
+    # --- J1 基线 ---------------------------------------------------------- #
+    def test_j1_baseline(self):
+        d = self._fresh_data_dir()
+        code, out, exc = self.h.run_main(d)
+        rep = _report(out)
+        self.assertIsNone(exc)
+        self.assertEqual(code, 0)
+        self.assertEqual(rep.get("created"), EXPECTED_FILES)
+        self.assertEqual(self.h.db.count(), EXPECTED_FILES)
+        self.assertEqual(self.h.db.dup_job_ids(), {})
+        self.assertEqual(rep.get("readback_missing"), [])
+        self.assertEqual(self.h.db.records_without_attachment(), [])
+
+    # --- J2 create 块1 提交、块2 提交前断连 -------------------------------- #
+    def test_j2_block2_drop_before_commit(self):
+        d = self._fresh_data_dir()
         # 第 2 个 create POST（块2）在服务端提交前断连 -> 客户端未提交块2
-        h.db.create_rules = {2: "drop_before_commit"}
-        code, out, exc = h.run_main(d)
-        first = {"exit_code": code, "exc": type(exc).__name__ if exc else None,
-                 "table_count": h.db.count(), "dup": h.db.dup_job_ids()}
-        # 重跑恢复
-        code2, out2, exc2 = h.run_main(d)
-        rep2 = json.loads(out2) if out2.strip().startswith("{") else {}
-        jids = h.db.all_job_ids()
-        ok = (h.db.count() == 19 and not h.db.dup_job_ids()
-              and not h.db.records_without_attachment())
-        record("J2 块2 提交前断连 -> 报错退出；重跑补齐 19 无重复",
-               "PASS" if ok else "FAIL",
-               {"first_run": first,
-                "rerun_exit": code2, "rerun_exc": type(exc2).__name__ if exc2 else None,
-                "rerun_created": rep2.get("created"),
-                "final_count": h.db.count(), "dup": h.db.dup_job_ids(),
-                "note": "块1(10)已提交；断连块2 客户端未提交，重跑 dedup 跳过块1 只补块2"})
-    finally:
-        h.close()
+        self.h.db.create_rules = {2: "drop_before_commit"}
+        code, out, exc = self.h.run_main(d)
+        rep = _report(out)
+        # 块1(10)已提交；断连块2 客户端未提交 -> NotableError -> exit 1 + error JSON
+        self.assertIsNone(exc, "裸异常应被 NotableError 包裹进 error JSON")
+        self.assertEqual(code, 1)
+        self.assertIn("error", rep)
+        self.assertEqual(self.h.db.count(), 10)
+        self.assertEqual(self.h.db.dup_job_ids(), {})
+        # 重跑恢复：dedup 跳过块1 只补块2
+        code2, out2, exc2 = self.h.run_main(d)
+        rep2 = _report(out2)
+        self.assertIsNone(exc2)
+        self.assertEqual(code2, 0)
+        self.assertEqual(rep2.get("created"), EXPECTED_FILES - 10)
+        self.assertEqual(self.h.db.count(), EXPECTED_FILES)
+        self.assertEqual(self.h.db.dup_job_ids(), {})
+        self.assertEqual(self.h.db.records_without_attachment(), [])
 
+    # --- J3a 提交后响应丢失（RemoteDisconnected） --------------------------- #
+    def test_j3a_drop_after_commit(self):
+        d = self._fresh_data_dir()
+        self.h.db.create_rules = {1: "drop_after_commit"}
+        code, out, exc = self.h.run_main(d)
+        rep = _report(out)
+        # 非幂等写：连接层故障不重试 -> NotableError -> exit 1；块1 只提交 1 次
+        self.assertIsNone(exc)
+        self.assertEqual(code, 1)
+        self.assertIn("error", rep)
+        self.assertEqual(self.h.db.create_calls, 1, "非幂等写不得重试")
+        self.assertEqual(self.h.db.count(), 10)
+        self.assertEqual(self.h.db.dup_job_ids(), {})
+        # 重跑：补齐且无重复
+        code2, out2, exc2 = self.h.run_main(d)
+        rep2 = _report(out2)
+        self.assertIsNone(exc2)
+        self.assertEqual(code2, 0)
+        self.assertEqual(rep2.get("created"), EXPECTED_FILES - 10)
+        self.assertEqual(self.h.db.count(), EXPECTED_FILES)
+        self.assertEqual(self.h.db.dup_job_ids(), {})
 
-# --- J3 重点：提交后响应丢失 / 500-after-commit -> 客户端重试 -------------- #
-def j3a_drop_after_commit():
-    """块1 服务端已提交但响应丢失（RemoteDisconnected）。"""
-    h = Harness()
-    try:
-        d = _fresh_data_dir()
-        h.db.create_rules = {1: "drop_after_commit"}
-        code, out, exc = h.run_main(d)
-        first = {"exit_code": code, "exc": type(exc).__name__ if exc else None,
-                 "exc_is_urlerror": isinstance(exc, __import__("urllib.error", fromlist=["URLError"]).URLError) if exc else None,
-                 "table_count": h.db.count(), "dup": h.db.dup_job_ids(),
-                 "create_calls": h.db.create_calls}
-        # 重跑
-        code2, out2, exc2 = h.run_main(d)
-        jids = h.db.all_job_ids()
-        record("J3a 块1 提交后响应丢失(RemoteDisconnected) -> 是否重复?",
-               "PASS" if not h.db.dup_job_ids() else "FAIL",
-               {"first_run": first,
-                "rerun_exit": code2, "rerun_exc": type(exc2).__name__ if exc2 else None,
-                "final_count": h.db.count(), "dup": h.db.dup_job_ids(),
-                "note": "RemoteDisconnected 非 URLError -> call() 不重试；块1 只提交 1 次"})
-    finally:
-        h.close()
+    # --- J3b 提交后返回 500 ------------------------------------------------ #
+    def test_j3b_500_after_commit(self):
+        d = self._fresh_data_dir()
+        self.h.db.create_rules = {1: "500_after_commit"}
+        code, out, exc = self.h.run_main(d)
+        rep = _report(out)
+        # 修复后语义：create idempotent=False -> 500 不盲重试 -> 块只提交一次，无重复
+        self.assertIsNone(exc)
+        self.assertEqual(code, 1)
+        self.assertIn("error", rep)
+        self.assertEqual(self.h.db.create_calls, 1, "500-after-commit 不得重投同一 POST")
+        self.assertEqual(self.h.db.dup_job_ids(), {})
+        # 重跑：dedup 跳过已存在，补齐 19，无重复
+        code2, out2, exc2 = self.h.run_main(d)
+        rep2 = _report(out2)
+        self.assertIsNone(exc2)
+        self.assertEqual(code2, 0)
+        self.assertEqual(rep2.get("created"), EXPECTED_FILES - 10)
+        self.assertEqual(self.h.db.count(), EXPECTED_FILES)
+        self.assertEqual(self.h.db.dup_job_ids(), {})
 
+    # --- J3c 持续 500-after-commit（原「重试耗尽写4遍」最坏放大场景） -------- #
+    def test_j3c_500_after_commit_all_retries(self):
+        d = self._fresh_data_dir()
+        # 前 4 次 create 全部 after-commit-500：修复后非幂等写不重试，第 1 次即抛错，
+        # 后续规则不再触发；表内只有块1 的一份，无重复放大。
+        self.h.db.create_rules = {1: "500_after_commit", 2: "500_after_commit",
+                                  3: "500_after_commit", 4: "500_after_commit"}
+        code, out, exc = self.h.run_main(d)
+        rep = _report(out)
+        self.assertIsNone(exc)
+        self.assertEqual(code, 1)
+        self.assertIn("error", rep)
+        self.assertEqual(self.h.db.create_calls, 1, "禁盲重试 -> 只有 1 次 POST")
+        self.assertEqual(self.h.db.count(), 10)
+        self.assertEqual(self.h.db.dup_job_ids(), {}, "重试耗尽不得产生重复放大")
 
-def j3b_500_after_commit():
-    """块1 服务端已提交，然后返回 500 -> call() 认为可重试 -> 重复 POST 同块。"""
-    h = Harness()
-    try:
-        d = _fresh_data_dir()
-        # 第 1 次 create：提交后返回 500；重试(第2次)正常
-        h.db.create_rules = {1: "500_after_commit"}
-        code, out, exc = h.run_main(d)
-        first = {"exit_code": code, "exc": type(exc).__name__ if exc else None,
-                 "table_count": h.db.count(), "dup": h.db.dup_job_ids(),
-                 "create_calls": h.db.create_calls}
-        # 重跑（dedup 应跳过已存在，但重复项已在表里）
-        code2, out2, exc2 = h.run_main(d)
-        dup_after = h.db.dup_job_ids()
-        record("J3b 块1 提交后返回500 -> 客户端重试 -> 重复写入?",
-               "FAIL" if dup_after else "PASS",
-               {"first_run": first,
-                "rerun_exit": code2, "rerun_created": (json.loads(out2).get("created") if out2.strip().startswith("{") else None),
-                "final_count": h.db.count(), "dup_after_rerun": dup_after,
-                "dup_records_sample": [r for r in h.db.records if r["fields"].get(CN_JOB_ID) in dup_after][:4],
-                "note": "500 属 RETRY_STATUS -> call() 重投同一 POST；POST 非幂等 -> 块1 写两遍"})
-    finally:
-        h.close()
+    # --- J3d 块2 提交后返回 503 -------------------------------------------- #
+    def test_j3d_503_after_commit(self):
+        d = self._fresh_data_dir()
+        self.h.db.create_rules = {2: "503_after_commit"}
+        code, out, exc = self.h.run_main(d)
+        rep = _report(out)
+        # 503 与 500 同属 RETRY_STATUS，但 idempotent=False 一律不重投
+        self.assertIsNone(exc)
+        self.assertEqual(code, 1)
+        self.assertIn("error", rep)
+        self.assertEqual(self.h.db.create_calls, 2)
+        self.assertEqual(self.h.db.dup_job_ids(), {})
+        self.assertEqual(self.h.db.count(), EXPECTED_FILES, "块1+块2 各提交一次")
+        # 重跑：全部 dedup，created=0，表完好
+        code2, out2, exc2 = self.h.run_main(d)
+        rep2 = _report(out2)
+        self.assertIsNone(exc2)
+        self.assertEqual(code2, 0)
+        self.assertEqual(rep2.get("created"), 0)
+        self.assertEqual(self.h.db.count(), EXPECTED_FILES)
+        self.assertEqual(self.h.db.dup_job_ids(), {})
 
-
-# --- J4 附件阶段第 k 个失败 -> 该岗位不写表 ------------------------------ #
-def j4a_uploadinfo_fail_by_name():
-    h = Harness()
-    try:
-        d = _fresh_data_dir()
-        files = sorted(f for f in os.listdir(d) if f.lower().endswith((".doc", ".docx", ".pdf")))
+    # --- J4a 附件 uploadInfos 按文件名失败 -> 该岗位不写表 ------------------- #
+    def test_j4a_uploadinfo_fail_by_name(self):
+        d = self._fresh_data_dir()
+        files = sorted(f for f in os.listdir(d) if f.lower().endswith(JD_EXTS))
         target = files[3]
-        h.db.attach_fail_names = {target}
-        code, out, exc = h.run_main(d)
-        rep = json.loads(out) if out.strip().startswith("{") else {}
-        first = {"exit_code": code, "created": rep.get("created"),
-                 "table_count": h.db.count(),
-                 "failed": [f.get("file") for f in rep.get("failed", [])],
-                 "no_attachment": h.db.records_without_attachment()}
+        self.h.db.attach_fail_names = {target}
+        code, out, exc = self.h.run_main(d)
+        rep = _report(out)
+        self.assertIsNone(exc)
+        self.assertEqual(rep.get("created"), EXPECTED_FILES - 1)
+        self.assertEqual([f.get("file") for f in rep.get("failed", [])], [target])
+        self.assertEqual(self.h.db.count(), EXPECTED_FILES - 1)
+        self.assertEqual(self.h.db.records_without_attachment(), [],
+                         "附件失败条绝不写表（不变量③）")
         # 重跑补齐
-        h.db.attach_fail_names = set()
-        code2, out2, exc2 = h.run_main(d)
-        rep2 = json.loads(out2) if out2.strip().startswith("{") else {}
-        ok = (first["created"] == 18 and first["no_attachment"] == []
-              and h.db.count() == 19 and not h.db.dup_job_ids()
-              and not h.db.records_without_attachment())
-        record("J4a 附件 uploadInfos 第k个失败 -> 该岗位不写表；重跑补齐19；无空附件岗位",
-               "PASS" if ok else "FAIL",
-               {"target_file": target, "first_run": first,
-                "rerun_exit": code2, "rerun_created": rep2.get("created"),
-                "final_count": h.db.count(), "dup": h.db.dup_job_ids(),
-                "final_no_attachment": h.db.records_without_attachment()})
-    finally:
-        h.close()
+        self.h.db.attach_fail_names = set()
+        code2, out2, exc2 = self.h.run_main(d)
+        rep2 = _report(out2)
+        self.assertIsNone(exc2)
+        self.assertEqual(code2, 0)
+        self.assertEqual(rep2.get("created"), 1)
+        self.assertEqual(self.h.db.count(), EXPECTED_FILES)
+        self.assertEqual(self.h.db.dup_job_ids(), {})
+        self.assertEqual(self.h.db.records_without_attachment(), [])
 
+    # --- J4b OSS PUT 第 N 次失败 -> 该岗位不写表 ---------------------------- #
+    def test_j4b_oss_put_fail_by_index(self):
+        d = self._fresh_data_dir()
+        self.h.db.put_fail_index = 5   # 第 5 次 OSS PUT 失败（并发下哪个岗位不确定，恰 1 个失败）
+        code, out, exc = self.h.run_main(d)
+        rep = _report(out)
+        self.assertIsNone(exc)
+        self.assertEqual(rep.get("created"), EXPECTED_FILES - 1)
+        self.assertEqual(len(rep.get("failed", [])), 1)
+        self.assertEqual(self.h.db.count(), EXPECTED_FILES - 1)
+        self.assertEqual(self.h.db.records_without_attachment(), [])
+        # 重跑补齐
+        self.h.db.put_fail_index = None
+        code2, out2, exc2 = self.h.run_main(d)
+        self.assertIsNone(exc2)
+        self.assertEqual(code2, 0)
+        self.assertEqual(self.h.db.count(), EXPECTED_FILES)
+        self.assertEqual(self.h.db.dup_job_ids(), {})
+        self.assertEqual(self.h.db.records_without_attachment(), [])
 
-def j4b_oss_put_fail_by_index():
-    h = Harness()
-    try:
-        d = _fresh_data_dir()
-        h.db.put_fail_index = 5     # 第 5 次 OSS PUT 失败（并发下哪个岗位不确定，但恰好 1 个失败）
-        code, out, exc = h.run_main(d)
-        rep = json.loads(out) if out.strip().startswith("{") else {}
-        first = {"exit_code": code, "created": rep.get("created"),
-                 "table_count": h.db.count(),
-                 "no_attachment": h.db.records_without_attachment()}
-        h.db.put_fail_index = None
-        code2, out2, exc2 = h.run_main(d)
-        ok = (first["created"] == 18 and first["no_attachment"] == []
-              and h.db.count() == 19 and not h.db.records_without_attachment())
-        record("J4b OSS PUT 第5次失败 -> 该岗位不写表；重跑补齐19；无空附件岗位",
-               "PASS" if ok else "FAIL",
-               {"first_run": first, "rerun_exit": code2,
-                "final_count": h.db.count(), "dup": h.db.dup_job_ids(),
-                "final_no_attachment": h.db.records_without_attachment()})
-    finally:
-        h.close()
+    # --- J5 附件全传完、create 之前进程死亡 --------------------------------- #
+    def test_j5_death_before_create(self):
+        d = self._fresh_data_dir()
+        self.h.inject_death_before_create()
+        code, out, exc = self.h.run_main(d)
+        self.assertIsNotNone(exc, "注入的 BaseException 应穿透 main()")
+        self.assertEqual(self.h.db.count(), 0, "create 前死亡 -> 表 0 条（无孤儿记录）")
+        self.assertGreater(self.h.db.put_calls, 0, "附件已上传但未写表")
+        # 重跑完整恢复
+        self.h.clear_death_injection()
+        code2, out2, exc2 = self.h.run_main(d)
+        rep2 = _report(out2)
+        self.assertIsNone(exc2)
+        self.assertEqual(code2, 0)
+        self.assertEqual(rep2.get("created"), EXPECTED_FILES)
+        self.assertEqual(self.h.db.count(), EXPECTED_FILES)
+        self.assertEqual(self.h.db.dup_job_ids(), {})
+        self.assertEqual(self.h.db.records_without_attachment(), [])
 
-
-# --- J5 附件全成功、create 之前进程死亡 --------------------------------- #
-def j5_death_before_create():
-    h = Harness()
-    try:
-        d = _fresh_data_dir()
-        h.inject_death_before_create()
-        code, out, exc = h.run_main(d)
-        first = {"exit_code": code, "exc": type(exc).__name__ if exc else None,
-                 "table_count": h.db.count(), "put_calls": h.db.put_calls}
-        h.clear_death_injection()
-        code2, out2, exc2 = h.run_main(d)
-        rep2 = json.loads(out2) if out2.strip().startswith("{") else {}
-        ok = (first["table_count"] == 0 and h.db.count() == 19
-              and not h.db.dup_job_ids() and not h.db.records_without_attachment())
-        record("J5 附件全传完、create 前进程死亡 -> 表 0 条；重跑完整 19",
-               "PASS" if ok else "FAIL",
-               {"first_run": first, "rerun_exit": code2, "rerun_created": rep2.get("created"),
-                "final_count": h.db.count(), "dup": h.db.dup_job_ids(),
-                "note": "附件已上传(put_calls)但无写表 -> 无孤儿记录；重跑重新上传附件"})
-    finally:
-        h.close()
-
-
-# --- J6 回读阶段 list 失败 ---------------------------------------------- #
-def j6_readback_list_fail():
-    h = Harness()
-    try:
-        d = _fresh_data_dir()
+    # --- J6 回读阶段 list 失败 --------------------------------------------- #
+    def test_j6_readback_list_fail(self):
+        d = self._fresh_data_dir()
         # list 调用序列：#1 = 起始 dedup，#2 = 回读。让 #2 失败（非重试 400）
-        h.db.list_fail_on = 2
-        h.db.list_fail_code = 400
-        code, out, exc = h.run_main(d)
-        first = {"exit_code": code, "exc": type(exc).__name__ if exc else None,
-                 "exc_is_notableerror": isinstance(exc, NotableError) if exc else None,
-                 "uncaught": exc is not None,
-                 "stdout_is_report": out.strip().startswith("{"),
-                 "table_count": h.db.count()}
+        self.h.db.list_fail_on = 2
+        self.h.db.list_fail_code = 400
+        code, out, exc = self.h.run_main(d)
+        rep = _report(out)
+        # 修复后语义：回读/查重 list 失败被捕获 -> exit 1 + JSON 报告，不得裸 traceback
+        self.assertIsNone(exc, "回读失败不得裸抛异常")
+        self.assertEqual(code, 1)
+        self.assertTrue(out.strip().startswith("{"), "stdout 必须是 JSON 报告")
+        self.assertIn("error", rep)
+        self.assertEqual(self.h.db.count(), EXPECTED_FILES, "数据已提交")
         # 重跑：list 正常 -> created=0（全被 dedup 跳过），表完好
-        h.db.list_fail_on = None
-        code2, out2, exc2 = h.run_main(d)
-        rep2 = json.loads(out2) if out2.strip().startswith("{") else {}
-        ok_table = (h.db.count() == 19 and not h.db.dup_job_ids()
-                    and not h.db.records_without_attachment())
-        # 修复后语义：回读/查重 list 失败应被捕获 → exit 1 + JSON 报告，不得裸 traceback
-        ok_shape = (first["exit_code"] == 1 and first["stdout_is_report"]
-                    and not first["uncaught"])
-        record("J6 回读阶段 list 失败 -> exit 1 + JSON 报告（不得裸 traceback）；重跑 created=0 表完好",
-               "PASS" if (ok_table and ok_shape) else "FAIL",
-               {"first_run": first, "rerun_exit": code2, "rerun_created": rep2.get("created"),
-                "final_count": h.db.count(), "dup": h.db.dup_job_ids(),
-                "note": "修复后：_finalize/回读段包 try/except NotableError，失败输出 error JSON + exit 1"})
-    finally:
-        h.close()
+        self.h.db.list_fail_on = None
+        code2, out2, exc2 = self.h.run_main(d)
+        rep2 = _report(out2)
+        self.assertIsNone(exc2)
+        self.assertEqual(code2, 0)
+        self.assertEqual(rep2.get("created"), 0)
+        self.assertEqual(self.h.db.count(), EXPECTED_FILES)
+        self.assertEqual(self.h.db.dup_job_ids(), {})
+        self.assertEqual(self.h.db.records_without_attachment(), [])
 
+    # --- J7 批内重复 -------------------------------------------------------- #
+    def test_j7_batch_dup(self):
+        d = self._fresh_data_dir(with_dup=True)
+        code, out, exc = self.h.run_main(d)
+        rep = _report(out)
+        self.assertIsNone(exc)
+        self.assertEqual(code, 0)
+        self.assertEqual(rep.get("total"), EXPECTED_FILES + 1)
+        self.assertEqual(len(rep.get("skipped_dup", [])), 1,
+                         "同部门同岗位名批内只建 1 条（不变量②）")
+        self.assertEqual(rep.get("created"), EXPECTED_FILES)
+        self.assertEqual(self.h.db.count(), EXPECTED_FILES)
+        self.assertEqual(self.h.db.dup_job_ids(), {})
 
-# --- J7 批内重复 --------------------------------------------------------- #
-def j7_batch_dup():
-    h = Harness()
-    try:
-        d = _fresh_data_dir(with_dup=True)
-        code, out, exc = h.run_main(d)
-        rep = json.loads(out) if out.strip().startswith("{") else {}
-        jids = h.db.all_job_ids()
-        ok = (h.db.count() == 19 and not h.db.dup_job_ids()
-              and len(rep.get("skipped_dup", [])) == 1 and rep.get("total") == 20)
-        record("J7 批内重复(复制1个JD改名) -> 同部门同岗位名只建1条",
-               "PASS" if ok else "FAIL",
-               {"exit_code": code, "total": rep.get("total"), "parsed": rep.get("parsed"),
-                "created": rep.get("created"), "skipped_dup": rep.get("skipped_dup"),
-                "table_count": h.db.count(), "unique_job_id": len(set(jids)),
-                "dup": h.db.dup_job_ids()})
-    finally:
-        h.close()
-
-
-# --- J8 401 中途触发 ---------------------------------------------------- #
-def j8_401_refresh():
-    h = Harness()
-    try:
-        d = _fresh_data_dir()
-        h.db.token_401_once = True
-        code, out, exc = h.run_main(d)
-        rep = json.loads(out) if out.strip().startswith("{") else {}
-        ok = (code == 0 and exc is None and h.db.count() == 19
-              and not h.db.dup_job_ids() and h.db.token_calls >= 2)
-        record("J8 401 中途触发 -> 刷新 token 后成功 19",
-               "PASS" if ok else "FAIL",
-               {"exit_code": code, "exc": type(exc).__name__ if exc else None,
-                "created": rep.get("created"), "token_calls": h.db.token_calls,
-                "table_count": h.db.count(), "dup": h.db.dup_job_ids()})
-    finally:
-        h.close()
-
-
-def j3c_500_after_commit_all_retries():
-    """块1 每次都『提交后返回500』-> 重试耗尽(retries=3 共4次)-> 块1 被写 4 遍。
-    演示最坏放大倍数：单个块重复 = 1 + retries 次。"""
-    h = Harness()
-    try:
-        d = _fresh_data_dir()
-        # 前 4 次 create 全部 after-commit-500（初始+3 重试），第 5 次(块2)正常
-        h.db.create_rules = {1: "500_after_commit", 2: "500_after_commit",
-                             3: "500_after_commit", 4: "500_after_commit"}
-        code, out, exc = h.run_main(d)
-        jids = h.db.all_job_ids()
-        dups = h.db.dup_job_ids()
-        maxmult = max(dups.values()) if dups else 0
-        record("J3c 块1 持续500-after-commit -> 重试耗尽 -> 块1 写4遍(最坏放大)",
-               "FAIL" if dups else "PASS",
-               {"exit_code": code, "exc": type(exc).__name__ if exc else None,
-                "create_calls": h.db.create_calls,
-                "table_count": h.db.count(), "dup_job_ids_count": len(dups),
-                "max_dup_multiplicity": maxmult,
-                "note": "retries=3 -> 同一 POST 最多发 4 次；每次都 after-commit -> 块1 10 条各写 4 遍"})
-    finally:
-        h.close()
-
-
-def j3d_503_after_commit():
-    """块2 提交后返回 503（同属 RETRY_STATUS）-> 块2 被重投 -> 重复。"""
-    h = Harness()
-    try:
-        d = _fresh_data_dir()
-        h.db.create_rules = {2: "503_after_commit"}
-        code, out, exc = h.run_main(d)
-        dups = h.db.dup_job_ids()
-        record("J3d 块2 提交后返回503 -> 客户端重试 -> 重复写入?",
-               "FAIL" if dups else "PASS",
-               {"exit_code": code, "create_calls": h.db.create_calls,
-                "table_count": h.db.count(), "dup_job_ids_count": len(dups),
-                "dup_sample_ids": list(dups.keys())[:5],
-                "note": "503 与 500 同在 RETRY_STATUS 集合，触发同样的非幂等重投"})
-    finally:
-        h.close()
-
-
-SCENARIOS = [j1_baseline, j2_block2_drop_before_commit, j3a_drop_after_commit,
-             j3b_500_after_commit, j3c_500_after_commit_all_retries, j3d_503_after_commit,
-             j4a_uploadinfo_fail_by_name, j4b_oss_put_fail_by_index,
-             j5_death_before_create, j6_readback_list_fail, j7_batch_dup, j8_401_refresh]
-
-
-def main():
-    for fn in SCENARIOS:
-        try:
-            fn()
-        except Exception:
-            record(fn.__name__, "ERROR", {"traceback": traceback.format_exc()})
-    print("\n" + "=" * 72)
-    print("汇总：")
-    for r in RESULTS:
-        print("  %-6s %s" % (r["status"], r["scenario"]))
-    json.dump(RESULTS, open("/tmp/crash_job_results.json", "w"),
-              ensure_ascii=False, indent=2, default=str)
-    print("\n结果 JSON: /tmp/crash_job_results.json")
+    # --- J8 401 中途触发 ---------------------------------------------------- #
+    def test_j8_401_refresh(self):
+        d = self._fresh_data_dir()
+        self.h.db.token_401_once = True
+        code, out, exc = self.h.run_main(d)
+        rep = _report(out)
+        self.assertIsNone(exc)
+        self.assertEqual(code, 0)
+        self.assertEqual(rep.get("created"), EXPECTED_FILES)
+        self.assertGreaterEqual(self.h.db.token_calls, 2, "401 后必须刷新 token")
+        self.assertEqual(self.h.db.count(), EXPECTED_FILES)
+        self.assertEqual(self.h.db.dup_job_ids(), {})
 
 
 if __name__ == "__main__":
-    main()
+    unittest.main(verbosity=2)

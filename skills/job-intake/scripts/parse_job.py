@@ -1,19 +1,26 @@
 # -*- coding: utf-8 -*-
-"""岗位说明书文本/文件名 -> 业务字段。parse(text, filename) -> dict。零第三方依赖。"""
+"""岗位说明书文本/文件名 -> 业务字段。parse(text, filename) -> dict。零第三方依赖。
+
+枚举唯一真源：部门/组织/城市取自 config.json options.job，技能词表取自 shared/vocab.py，
+本文件不维护任何清单副本（AGENTS.md 双源零容忍）。
+"""
+import json
 import os
 import re
+import sys
 
-_DEPT_ENUM = (
-    "技术部", "产品部", "市场部", "运营部", "厂务管理部", "EHS管理部", "财经管理部",
-    "单晶制造部-生产部", "单晶制造部-设备部", "数据信息部-系统组",
-    "硅片制造部-工艺部", "硅片制造部-设备部", "组件制造部-工艺部", "组件制造部-设备部",
-    "电池制造部-工艺部", "电池制造部-设备部", "厂务管理部-暖通组", "厂务管理部-电力能源组",
-)
+_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+sys.path.insert(0, os.path.join(_ROOT, "shared"))
+from vocab import SKILL_WORDS_SORTED  # noqa: E402
+
+CONFIG = json.load(open(os.path.join(_ROOT, "config.json"), encoding="utf-8"))
+
+_DEPT_ENUM = tuple(CONFIG["options"]["job"]["department"])
 _DEPT_ALIAS = {"电池设备部": "电池制造部-设备部", "电池工艺部": "电池制造部-工艺部",
                "电池制造部-电池设备部": "电池制造部-设备部"}
-_ORG_RE = re.compile(r"(制造中心|职能中心|营销中心|研发中心)")
+_ORG_RE = re.compile("(" + "|".join(map(re.escape, CONFIG["options"]["job"]["org"])) + ")")
 _SKIP_TOKEN_RE = re.compile(r"^(附件\d*[:：]?岗位说明书|岗位说明书|说明书|曲靖制造基地|曲靖基地|.*基地)$")
-_CITY_RE = re.compile(r"(北京|上海|深圳|杭州|成都|广州|南京|武汉|曲靖)")
+_CITY_RE = re.compile("(" + "|".join(map(re.escape, CONFIG["options"]["job"]["work_location"])) + ")")
 _JOB_NAME_RE = re.compile(r"(?:岗位名称|职位名称|职位)\s*(?:Position)?\s*[:：]\s*([^\n：:]{2,40})")
 _SEC_PATTERNS = {
     "responsibilities": r"(岗位职责|工作职责|主要工作职责|工作内容|Major responsibilities)",
@@ -21,15 +28,6 @@ _SEC_PATTERNS = {
 }
 _SEC_END_RE = re.compile(
     r"(关键绩效指标|KPI|起草|Draft|审核|批准|工作地点|职位名称|职等|直接上司|下属)")
-_SKILL_WORDS = (
-    "暖通", "PLC", "CAD", "电气", "设备运维", "设备管理", "工艺", "切片", "镀膜",
-    "组件", "电池", "硅片", "单晶", "拉晶", "EHS", "安全管理", "财务", "成本",
-    "预算", "Python", "Java", "SQL", "Excel", "SAP", "MES", "ERP", "自动化",
-    "机电", "机械", "焊接", "电工", "TPM", "精益", "SPC", "质量管理", "ISO9001",
-    "光伏", "半导体", "扩散", "PECVD", "丝网印刷", "层压", "串焊", "项目管理",
-    "会计", "税务", "审计", "报表", "账务", "高压", "特种设备", "消防",
-)
-_SKILL_SORTED = tuple(sorted(set(_SKILL_WORDS), key=lambda w: (-len(w), w)))
 _GATE_RE = re.compile(
     r"[^\n。；;]*(?:学历|大专|本科|硕士|博士|年及以上|年以上|证书|电工证|注册)[^\n。；;]*")
 
@@ -83,7 +81,7 @@ def _first(regex, text, group=1, default=""):
 
 def _skills(text):
     low = (text or "").lower()
-    return [w for w in _SKILL_SORTED if w.lower() in low]
+    return [w for w in SKILL_WORDS_SORTED if w.lower() in low]
 
 
 def parse(text, filename=""):

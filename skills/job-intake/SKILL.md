@@ -30,9 +30,9 @@ python3 skills/job-intake/scripts/upload_jobs.py <目录> --dry-run  # 预演，
 - 组织/部门从文件名拆（形如 `岗位说明书-制造中心-曲靖制造基地-单晶制造部-设备部 - 工程师.doc`），
   部门归一到 Base 已有枚举；两级部门（硅片制造部-工艺部）保留连字符。
 - **必做：三列由智能体分析后回写**（脚本从正文词表命中的结果不算数，例如只写出「会计、财务、账务」）。
-  **触发时机是用户说「智能分析JD」，不是在上传环节**——上传只做解析/幂等去重/写原文与附件；
-  推理时逐岗读完任职要求与岗位职责，产出 payload 并执行
-  `python3 skills/job-intake/scripts/sync_job_columns.py payload.json`：
+  上传只做解析/幂等去重/写原文与附件；精析由后台周期任务消费队列异步完成，用户说「智能分析JD」
+  时也可手动触发（流水线见下）。推理时逐岗读完任职要求与岗位职责，产出 payload 并执行
+  `python3 skills/job-intake/scripts/sync_job_columns.py payload.json`（同一次 update 打 ai_refined_at 标记出队）：
   - `hard_gates` 固定五段、缺项写"不作硬性要求"：`学历：…；专业：…；经验：…；证书：…；年龄：…`
     （这四五项是一票否决依据，也是匹配复核的对照清单）；
   - `must_skills` 6~10 个、`bonus_skills` 4~8 个，用「、」分隔的短词，
@@ -49,19 +49,24 @@ python3 skills/job-intake/scripts/upload_jobs.py <目录> --dry-run  # 预演，
 
 ## 「智能分析JD」并发流水线（subagent，agent数硬上限20）
 
-以下命令一律以仓库根为 CWD 执行：
+三列精析不必卡在上传环节：上传即写正则粗值入队（标记列 `ai_refined_at` 空），精析由后台周期
+任务消费队列异步完成；队列谓词唯一真源 `shared/refine_loop.py`（job 队列 = ai_refined_at 空且
+responsibilities 非空）。手动触发或补跑用以下命令（一律以仓库根为 CWD）：
 
 ```bash
-python3 skills/job-intake/scripts/jobs_analyze.py prepare --all     # 自动负载均衡：agent 数尽量铺满，硬上限 20
+python3 skills/job-intake/scripts/jobs_analyze.py prepare            # 只取队列中的岗；--all = 连已精析的一起重析
 # → 按 meta.batches 的数量，在同一条消息里一次性并发发 agent（≤20，不分波、不串行）
 #   每个只给：提示词 skills/job-intake/references/job-subagent-prompt.md + 批次号 + part 路径
+#   part 路径必须是盘上真实存在的 pending 文件（禁止凭记忆写前缀/序号）；
+#   done 文件名由 agent 从输入自派生（pending→done，N 不变），分派方不指定
 python3 skills/job-intake/scripts/jobs_analyze.py merge             # → outputs/jobs_done.json（missing_batches 非空则补发该批）
-python3 skills/job-intake/scripts/sync_job_columns.py outputs/jobs_done.json   # 写回三列
+python3 skills/job-intake/scripts/sync_job_columns.py outputs/jobs_done.json   # 写回三列，同一次 update 打 ai_refined_at 标记（出队）
 python3 skills/job-intake/scripts/check_skill_coverage.py           # 词表同源校验，必须 exit 0
 ```
 
-19 个岗位 → 19 个 agent（每个1岗，未超20）。子任务判不了时才手工兜底（直接在 payload 里写三字段）。
-**新增岗位后重跑本流水线即可，已分析过的岗位 prepare 会自动跳过（加 `--all` 才强制重做）。**
+子任务判不了时才手工兜底（直接在 payload 里写三字段）。
+**check_skill_coverage 与 match_gated 同纪律**：岗位队列非空即 exit 2（粗词表覆盖率无意义），
+先跑完本流水线清空队列再自检。
 
 ## 报告处置
 

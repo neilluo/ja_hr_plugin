@@ -6,9 +6,11 @@
   HYPERS  单向上下位：候选人写的具体项可满足岗位的宽泛项（单晶炉 ⊨ 光伏设备），反向不算
                   （岗位要"切片机"，候选人只有"单晶炉"不算命中）
 """
-import re
+import os
+import sys
 
-SEP = r"[、,，;；/]\s*"
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "shared"))
+from vocab import SEP, toks  # noqa: E402,F401  分词唯一源（shared/vocab.py），SEP 一并转出供引用
 
 SYNONYM = [
     ["成本管控", "成本控制", "降本改善", "降本增效", "费用管控"],
@@ -86,10 +88,9 @@ for gi, g in enumerate(SYNONYM):
         EQ.setdefault(w, set()).add(gi)
 
 
-def toks(s):
-    if isinstance(s, list):
-        return [str(x).strip() for x in s if str(x).strip()]
-    return [t.strip() for t in re.split(SEP, s or "") if t.strip()]
+def txt(v):
+    """字段取值归一为字符串（config 类型已对齐真表全 text，读回即字符串）。"""
+    return "" if v is None else str(v)
 
 
 def hit(cands, need):

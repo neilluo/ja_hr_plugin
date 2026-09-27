@@ -120,18 +120,18 @@ class Notable:
         os.replace(tmp, CACHE)
         return self._token
 
-    def call(self, method, path, body=None, raw=None, retries=3, idempotent=True):
-        """调钉钉 OpenAPI。path 不含 operatorId，自动追加。raw=bytes 时裸请求（OSS PUT）。
+    def call(self, method, path, body=None, retries=3, idempotent=True):
+        """调钉钉 OpenAPI。path 不含 operatorId，自动追加。
 
         idempotent=False（create 等非幂等写）：429/5xx 不盲重试——服务端可能已提交，
         重投会把整块写第二遍；直接抛错交给入口脚本的「写后查重自愈」与重跑兜底。
+        裸字节流（OSS 直传）走 put()，不经此处。
         """
         sep = "&" if "?" in path else "?"
-        url = API + path + ("" if raw is not None else sep + "operatorId=" + self.op)
-        data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
-        headers = {"Content-Type": "application/json"} if raw is None else {"Content-Type": "application/octet-stream"}
-        if raw is None:
-            headers["x-acs-dingtalk-access-token"] = self.token()
+        url = API + path + sep + "operatorId=" + self.op
+        data = json.dumps(body).encode() if body is not None else None
+        headers = {"Content-Type": "application/json",
+                   "x-acs-dingtalk-access-token": self.token()}
         attempt, qps_attempts = 0, 0
         while True:
             _pace()
@@ -330,11 +330,6 @@ class Notable:
                 return None
         if t == "multipleSelect":
             return val if isinstance(val, list) else [str(val)]
-        if t == "richText":
-            # AI表格富文本字段要求结构化值，传纯文本会被服务端 400 拒绝
-            if isinstance(val, dict):
-                return val
-            return {"markdown": str(val).replace("\r\n", "\n")}
         if t == "attachment":
             return val if isinstance(val, list) else [val]
         return str(val)
