@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""refine_loop.py — AI 精析队列唯一真源：队列谓词 / 队列计数 / 周期锁。
+"""refine_loop.py — AI 精析队列唯一真源：队列谓词 / 队列计数 / 周期锁 / 触发时刻（fire_at）。
 
 背景：三列精析（skills/ai_extract/ai_deep 与岗位三列）是匹配的前置而非上传的前置，
 上传链路写完表即返回；精析消费方 = 上传后 agent 注册的一次性消费任务（注册时刻取上传报告字段
-refine_fire_at，延迟秒数唯一真源 = upload_resumes.REFINE_DELAY_S；触发纪律见
+refine_fire_at，延迟秒数唯一真源 = 本文件 REFINE_DELAY_S；触发纪律见
 skills/resume-intake/SKILL.md）+ 每日 03:00 兜底巡检。无看门狗层：崩溃恢复靠
 "未打标记录仍在队列 + 租约过期自动接管 + 兜底重吃"，理由见 resume-intake SKILL 裁撤记录。
 队列状态不靠"三列是否为空"推断（岗位三列入库即有正则粗值、推断必失效），
@@ -38,6 +38,15 @@ QUEUE_BIZ = {"resume": ["ai_refined_at", "full_text", "source_file", "name"],
              "job": ["ai_refined_at", "responsibilities"]}
 _TEXT_KEY = {"resume": "full_text", "job": "responsibilities"}
 TABLES = ("resume", "job")
+
+# 精析消费任务的触发延迟（秒）：唯一真源，resume/job 两条上传链共用（AGENTS.md 不变量 10/11）。
+# 各 SKILL.md 与 prompt 一律只引用报告字段 refine_fire_at，禁止复述本数字。
+REFINE_DELAY_S = 45
+
+
+def fire_at(delay=REFINE_DELAY_S):
+    """注册精析消费任务的目标时刻：当前 +delay 秒，UTC ISO8601 秒级带 Z（cron schedule.at 直接可用）。"""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + delay))
 
 
 def refinable(fields, table):

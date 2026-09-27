@@ -47,6 +47,8 @@ import upload_jobs                        # noqa: E402
 
 CN_JOB_ID = "岗位ID"
 CN_ATTACH = "JD附件"
+CN_RESP = "岗位职责"             # config.fields.job.responsibilities
+CN_REFINED = "AI精析时间"        # config.fields.job.ai_refined_at
 JD_EXTS = (".doc", ".docx", ".pdf")
 
 
@@ -652,6 +654,60 @@ class TestCrashJob(unittest.TestCase):
         self.assertGreaterEqual(self.h.db.token_calls, 2, "401 后必须刷新 token")
         self.assertEqual(self.h.db.count(), EXPECTED_FILES)
         self.assertEqual(self.h.db.dup_job_ids(), {})
+
+
+class TestJobRefineFireAt(unittest.TestCase):
+    """纯 mock 层：岗位报告 refine_fire_at 语义（不依赖 JA_TEST_DATA_DIR 夹具，永不 skip）。
+
+    空目录跑 main()（created=0），队列状态完全由预置内存记录决定：
+    队列非空 → 报告含 refine_fire_at（UTC ISO8601 秒级带 Z）；队列为空 → 不输出该字段。"""
+
+    def setUp(self):
+        # 假凭证走环境变量，避免依赖本机 .secrets.json（mock server 无条件发 token）
+        self._old_env = {k: os.environ.get(k)
+                         for k in ("DINGTALK_APP_KEY", "DINGTALK_APP_SECRET")}
+        os.environ["DINGTALK_APP_KEY"] = "crash-job-test-key"
+        os.environ["DINGTALK_APP_SECRET"] = "crash-job-test-secret"
+        self.h = Harness()
+        self.d = tempfile.mkdtemp(prefix="crash_job_fireat_")
+        # preflight 要求目录至少含一份支持格式文件；放一份不可解析的占位文件，
+        # 解析失败进 failed、created=0，队列状态完全由预置内存记录决定。
+        with open(os.path.join(self.d, "placeholder.pdf"), "wb") as f:
+            f.write(b"not-a-real-jd")
+
+    def tearDown(self):
+        for k, v in self._old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.d, ignore_errors=True)
+        self.h.close()
+
+    def test_fire_at_emitted_when_queue_nonempty(self):
+        # 预置一条待精析岗位（无标记 + 有职责）→ refine_queued=1 → 输出 refine_fire_at
+        self.h.db.add({CN_JOB_ID: "JSEED000001", CN_RESP: "负责设备维护与保养",
+                       CN_REFINED: None})
+        code, out, exc = self.h.run_main(self.d)
+        rep = _report(out)
+        self.assertIsNone(exc)
+        self.assertEqual(code, 0)
+        # 种子记录保证队列非空（占位文件能否解析不影响本断言）
+        self.assertGreater(rep.get("refine_queued"), 0)
+        self.assertIn("refine_fire_at", rep)
+        self.assertRegex(rep["refine_fire_at"],
+                         r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+    def test_no_fire_at_when_queue_empty(self):
+        # 队列空（唯一记录已打标）→ refine_queued=0 且不输出 refine_fire_at
+        self.h.db.add({CN_JOB_ID: "JSEED000002", CN_RESP: "已精析",
+                       CN_REFINED: 1789924509618})
+        code, out, exc = self.h.run_main(self.d)
+        rep = _report(out)
+        self.assertIsNone(exc)
+        self.assertEqual(code, 0)
+        self.assertEqual(rep.get("refine_queued"), 0)
+        self.assertNotIn("refine_fire_at", rep)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,10 @@
 
 前置门禁：岗位精析队列非空（真源 shared/refine_loop.py）→ exit 2：三列还是入库正则粗值，
 覆盖率结论无意义，先跑 JD 精析流水线（jobs_analyze → sync_job_columns）再来自检。
+简历标签池为空（resume 表无 skills，如简历尚未精析）→ 输出 skipped 并 exit 0：
+命中率无从谈起，跳过自检而非把全岗误判低覆盖。
+简历标签池为空（resume 表无 skills，如简历尚未精析）→ 输出 skipped 并 exit 0：
+命中率无从谈起，跳过自检而非把全岗误判低覆盖。
 
 用法:  python3 skills/job-intake/scripts/check_skill_coverage.py [--min 0.5]
 输出:  每岗一行命中比例 + 汇总；存在低覆盖岗位时 exit 2。
@@ -44,6 +48,11 @@ def main():
     for c in nt.list_records("resume", biz_fields=["skills"]):
         pool.update(c["fields"].get("skills") or [])
     cands = sorted(pool)
+    if not cands:
+        # 简历标签池为空（如简历尚未精析）：命中率无从谈起，跳过自检而非全岗误判低覆盖
+        print(json.dumps({"skipped": True, "reason": "简历标签池为空，覆盖率自检无意义",
+                          "jobs": len(jobs)}, ensure_ascii=False))
+        sys.exit(0)
 
     low, empty_tag = [], 0
     for j in jobs:

@@ -47,11 +47,36 @@ python3 skills/job-intake/scripts/upload_jobs.py <目录> --dry-run  # 预演，
 - JD 附件与简历同纪律：先传后写，附件失败该条不入库。
 - 统计字段（候选人总数/推荐数等）入库时留空，由匹配流程后续刷新。
 
+## 上传后：注册精析消费任务（硬性步骤，脚本退出后立即执行）
+
+**上传回合不跑精析流水线**：脚本只解析、去重、写原文与附件（三列先落正则粗值入队）。
+岗位三列由**独立后台会话**消费精析队列产出，与简历链完全对称（机制与边界见 AGENTS.md 不变量 11，
+此处不复述细节）。
+
+脚本跑完、报告 `refine_queued > 0` 时，agent **必须立即注册一个一次性消费任务**
+（定时任务管理工具，schedule kind=at）。**时刻直接取报告字段 `refine_fire_at` 原样填入**——
+脚本已按唯一常量（`shared/refine_loop.py` 的 `REFINE_DELAY_S`，resume/job 两链共用）算好目标时刻，
+禁止再跑 `date` 自行加偏移、也禁止复述那个秒数：
+
+- **消费任务（时刻 = `refine_fire_at`）**：payload 指令——进本仓库跑
+  `python3 skills/job-intake/scripts/jobs_analyze.py queue`；job 为 0 则静默结束；
+  非空则按本 SKILL「智能分析JD」流水线全自动执行到 `sync_job_columns.py` 写回。
+- 写回后跑 `python3 skills/job-intake/scripts/check_skill_coverage.py`，低覆盖按本 SKILL
+  两因分辨纪律处理：① 用词与简历标签不同源 → 改词重同步直到 exit 0；② 库里确实没有这类
+  候选人 → 保留原词并在任务结果里说明，不强行凑 exit 0。
+  简历标签池为空（resume 表无 skills）时跳过覆盖率自检。
+- prepare 返回 refused（exit 2，撞活租约）即退出、禁止抢跑；不设看门狗，消费任务崩溃由
+  每日 03:00 兜底巡检重吃（不变量 11）。
+- 注册只能由 agent 做（脚本是独立进程，宿主机没有向千问办公写调度的本地 API）；
+  脚本的配套职责是输出 `refine_queued`（触发信号）与 `refine_fire_at`（注册时刻）。
+- 注册完成后向用户一句话说明：队列 N 条、约 1 分钟后后台自动精析、异常时最迟次日 03:00 兜底。
+
 ## 「智能分析JD」并发流水线（subagent，agent数硬上限20）
 
-三列精析不必卡在上传环节：上传即写正则粗值入队（标记列 `ai_refined_at` 空），精析由后台周期
-任务消费队列异步完成；队列谓词唯一真源 `shared/refine_loop.py`（job 队列 = ai_refined_at 空且
-responsibilities 非空）。手动触发或补跑用以下命令（一律以仓库根为 CWD）：
+三列精析不必卡在上传环节：上传即写正则粗值入队（标记列 `ai_refined_at` 空）。精析消费入口 =
+上传后 agent 注册的一次性消费任务（见上节）+ 每日 03:00 兜底巡检；队列谓词唯一真源
+`shared/refine_loop.py`（job 队列 = ai_refined_at 空且 responsibilities 非空）。
+用户说「智能分析JD」时也可手动触发或补跑，用以下命令（一律以仓库根为 CWD）：
 
 ```bash
 python3 skills/job-intake/scripts/jobs_analyze.py prepare            # 只取队列中的岗；--all = 连已精析的一起重析
@@ -72,5 +97,9 @@ python3 skills/job-intake/scripts/check_skill_coverage.py           # 词表同�
 
 ## 报告处置
 
-`created` 与 `readback_missing`：missing 非空重跑即可（幂等）。`failed` 看 error，
-多为文本提取失败（加密 doc 等），向用户列出文件名。
+| 字段 | 处置 |
+|---|---|
+| `created` / `readback_missing` | missing 非空重跑即可（幂等） |
+| `failed` | 看 error 文本，多为文本提取失败（加密 doc 等），向用户列出文件名 |
+| `refine_queued` | 当前待精析队列长度：精析异步进行，向用户说明"已入队，后台周期消费"即可，**不要在上传回合里跑精析** |
+| `refine_fire_at` | 仅 `refine_queued > 0` 时输出：注册消费任务的目标时刻（UTC ISO8601，脚本已按唯一常量算好）。**原样填入 cron 的 `at` 字段**，禁止再单独跑 `date` 算偏移 |

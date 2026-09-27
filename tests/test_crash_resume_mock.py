@@ -36,6 +36,7 @@ sys.path.insert(0, os.path.join(ROOT, "skills", "resume-intake", "scripts"))
 
 import notable as notable_mod                    # noqa: E402
 from notable import Notable                      # noqa: E402
+import refine_loop                               # noqa: E402  延迟常量与 fire_at 唯一真源
 import upload_resumes as ur                      # noqa: E402
 import preflight as preflight_mod                # noqa: E402  (upload_resumes 已把其加入 sys.path)
 
@@ -687,13 +688,13 @@ class TestR10RoundTripFields(CrashTestBase):
         """refine_fire_at = 当前 + REFINE_DELAY_S（UTC ISO8601）。延迟秒数不许有第二份副本。"""
         import datetime
         before = _real_time.time()
-        iso = ur._fire_at()
+        iso = refine_loop.fire_at()
         after = _real_time.time()
         self.assertRegex(iso, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
         fire = datetime.datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(
             tzinfo=datetime.timezone.utc).timestamp()
-        lo = before + ur.REFINE_DELAY_S - 2      # strftime 截断到秒，留 2 秒容差
-        hi = after + ur.REFINE_DELAY_S + 2
+        lo = before + refine_loop.REFINE_DELAY_S - 2      # strftime 截断到秒，留 2 秒容差
+        hi = after + refine_loop.REFINE_DELAY_S + 2
         self.assertTrue(lo <= fire <= hi, "fire_at=%s 不在 [%s, %s]" % (iso, lo, hi))
 
     def test_backfill_queues_via_source_file(self):

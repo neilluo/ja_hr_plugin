@@ -112,7 +112,7 @@ EOF
 
 批量模式脚本跑完、报告 `refine_queued > 0` 时，agent **必须立即注册一个一次性消费任务**
 （定时任务管理工具，schedule kind=at）。**时刻直接取报告字段 `refine_fire_at` 原样填入**——
-脚本已按唯一常量（`upload_resumes.REFINE_DELAY_S`）算好目标时刻，禁止再跑 `date` 自行加偏移、
+脚本已按唯一常量（`shared/refine_loop.py` 的 `REFINE_DELAY_S`）算好目标时刻，禁止再跑 `date` 自行加偏移、
 也禁止在本文件或 AGENTS.md 复述那个秒数：
 
 - **消费任务（时刻 = `refine_fire_at`）**：payload 指令——进本仓库跑

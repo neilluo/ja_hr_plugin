@@ -79,8 +79,9 @@
     - 每次新增枚举/阈值：先落唯一真源，再让消费方派生；同一提交内 grep 确认无第二份副本，unittest 全绿。
 11. 精析异步队列三层闭环（触发/出队/并发防护），禁止加第四层：
     - 触发 = 上传后 agent 注册一次性消费任务，**时刻直接取报告字段 `refine_fire_at`**
-      （延迟秒数唯一真源 = `upload_resumes.REFINE_DELAY_S`，文档与 prompt 只引用字段名、禁止复述数值，
-      也不许再跑 `date` 现算；纪律在 resume-intake SKILL.md，`refine_queued` 供触发信号；
+      （延迟秒数唯一真源 = `shared/refine_loop.REFINE_DELAY_S`，resume/job 两条上传链共用同一触发机制，
+      时刻均取各自报告的 `refine_fire_at`；文档与 prompt 只引用字段名、禁止复述数值，
+      也不许再跑 `date` 现算；纪律在 resume-intake / job-intake SKILL.md，`refine_queued` 供触发信号；
       注册只能由 agent 做，脚本无本地调度 API）。
     - 出队唯一凭证 = `ai_refined_at` 与三列同一次 update 落表（空即在队，崩溃无中间态要清）。
       队列谓词与它的补集（`unrefinable`：原件已删的扫描件）必须同处 `refine_loop.py` 一源，

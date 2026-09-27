@@ -118,8 +118,15 @@ def main():
         sys.exit(1)
     report["created"] = len(ids)
     report["readback_missing"] = [r["job_id"] for r in write_rows if r["job_id"] not in back]
-    # 精析队列计数（谓词真源 refine_loop）：>0 即事件驱动触发后台精析周期的信号
-    report["refine_queued"] = len(refine_loop.queue(nt, "job"))
+    try:
+        # 精析队列计数（谓词真源 refine_loop）：>0 即事件驱动触发后台精析周期的信号
+        report["refine_queued"] = len(refine_loop.queue(nt, "job"))
+        if report["refine_queued"]:
+            # 队列非空 = 需注册消费任务；时刻由脚本算好，agent 原样填入 cron，不必再跑 date
+            report["refine_fire_at"] = refine_loop.fire_at()
+    except NotableError as e:
+        print(json.dumps({**report, "error": "精析队列计数失败: %s" % e}, ensure_ascii=False))
+        sys.exit(1)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     sys.exit(1 if report["readback_missing"] else 0)
 

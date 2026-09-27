@@ -14,11 +14,14 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "shared"))
 sys.path.insert(0, os.path.join(ROOT, "skills", "match-verify", "scripts"))
+sys.path.insert(0, os.path.join(ROOT, "skills", "job-intake", "scripts"))
 
+import check_skill_coverage  # noqa: E402
 import match_analyze  # noqa: E402
 import match_gated  # noqa: E402
 
@@ -198,6 +201,28 @@ class TestApplyOrgAndSource(ApplyHarness):
         self.assertEqual(row["org"], "制造中心")
         self.assertEqual(row["source"], SYS)
         self.assertEqual(row["name"], "张三")
+
+
+class TestCoverageEmptyPool(unittest.TestCase):
+    """check_skill_coverage：简历标签池为空 → skipped exit 0（不误判全岗低覆盖）。"""
+
+    def _run(self, nt):
+        with mock.patch.object(check_skill_coverage, "Notable", return_value=nt), \
+                mock.patch.object(sys, "argv", ["check_skill_coverage.py"]):
+            with self.assertRaises(SystemExit) as ctx:
+                check_skill_coverage.main()
+        return ctx.exception.code
+
+    def test_empty_pool_skips_exit_0(self):
+        nt = FakeNotable({"job": [_job(refined=True, must="设备维修、点检管理")],
+                          "resume": [_resume("r1", "张三", [])]})
+        self.assertEqual(self._run(nt), 0)
+
+    def test_nonempty_pool_low_coverage_exit_2(self):
+        # 对照组：池非空且岗位词不同源 → 照常判低覆盖 exit 2
+        nt = FakeNotable({"job": [_job(refined=True, must="账务处理、金蝶")],
+                          "resume": [_resume("r1", "张三", ["设备维修"])]})
+        self.assertEqual(self._run(nt), 2)
 
 
 if __name__ == "__main__":

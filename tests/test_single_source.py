@@ -15,6 +15,8 @@ sys.path.insert(0, os.path.join(ROOT, "skills", "resume-intake", "scripts"))
 import extract  # noqa: E402
 import parse_job  # noqa: E402
 import parse_resume  # noqa: E402
+import refine_loop  # noqa: E402
+import upload_jobs  # noqa: E402
 import upload_resumes  # noqa: E402
 import vocab  # noqa: E402
 
@@ -100,6 +102,27 @@ class TestExtractExtsSingleSource(unittest.TestCase):
             self.assertIn(e, extract.SUPPORTED_EXTS)
         for e in (".pdf", ".doc", ".docx", ".txt", ".md"):
             self.assertIn(e, extract.SUPPORTED_EXTS)
+
+
+class TestRefineDelaySingleSource(unittest.TestCase):
+    """不变量 10：精析触发延迟唯一真源 = shared/refine_loop.py 的 REFINE_DELAY_S，
+    两条上传链（upload_resumes/upload_jobs）禁止本地副本（含转发别名）。"""
+
+    def test_constant_defined_only_in_refine_loop(self):
+        self.assertEqual(refine_loop.REFINE_DELAY_S, 45)
+        for mod in (upload_resumes, upload_jobs):
+            self.assertFalse(hasattr(mod, "REFINE_DELAY_S"))
+            self.assertFalse(hasattr(mod, "_fire_at"))
+            self.assertFalse(hasattr(mod, "fire_at"))
+
+    def test_upload_scripts_have_no_local_copy(self):
+        # grep 式断言：上传脚本源码不得再出现延迟常量定义或本地时刻函数（防副本复活）；
+        # docstring 里以"指向 shared/refine_loop.py"形式引用常量名属指针、不算副本。
+        for parts in (("skills", "resume-intake", "scripts", "upload_resumes.py"),
+                      ("skills", "job-intake", "scripts", "upload_jobs.py")):
+            src = open(os.path.join(ROOT, *parts), encoding="utf-8").read()
+            self.assertNotIn("REFINE_DELAY_S =", src, "%s 出现延迟常量定义副本" % (parts,))
+            self.assertNotIn("def _fire_at", src, "%s 出现本地 fire_at 函数副本" % (parts,))
 
 
 class TestMatchGatedNoLinkResidue(unittest.TestCase):

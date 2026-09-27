@@ -21,7 +21,8 @@ timing_ms 为各阶段机器耗时（毫秒）：list_existing/extract(批量)/b
 table_total = 表内记录总数（回读那趟全表扫描顺带得出，零额外请求）：agent 交付用户时直接引用，
 禁止再跑 query.py 复核（readback_missing 为空即已逐手机号回读，不变量 4）。
 refine_fire_at = 注册精析消费任务的目标时刻（当前 +REFINE_DELAY_S 秒，UTC ISO8601）：仅当 refine_queued>0 时输出，
-agent 原样填入 cron 的 at 字段即可，禁止再单独跑 date 算偏移（延迟秒数唯一真源 = 本文件 REFINE_DELAY_S，文档只引用字段名）。
+agent 原样填入 cron 的 at 字段即可，禁止再单独跑 date 算偏移（延迟秒数唯一真源 = shared/refine_loop.py 的
+REFINE_DELAY_S，文档只引用字段名）。
 补录（--backfill）只写基础字段与 source_file（原件本地路径），不写 AI 三列、不打 ai_refined_at：
 扫描件与批量记录一样进精析队列，三列由后台 subagent 读原件产出（谓词与读图机制见 shared/refine_loop.py）。
 """
@@ -47,14 +48,6 @@ FULL_TEXT_MAX = 20000  # 全文参考字段截断上限（打分用 skills，不
 # 新入库默认沟通状态；合法枚举清单见 config.options.resume.comm_status
 COMM_STATUS_DEFAULT = "待筛选"
 UPLOAD_WORKERS = 10  # 附件上传/文本解析并发；notable.map_parallel 默认 5 对 30+ 文件偏保守
-# 精析消费任务的触发延迟（秒）：唯一真源。AGENTS.md 不变量 11 与各 SKILL.md 一律只引用报告字段
-# refine_fire_at，禁止复述本数字（不变量 10：阈值只允许存在于唯一具名常量）。
-REFINE_DELAY_S = 45
-
-
-def _fire_at(delay=REFINE_DELAY_S):
-    """注册精析消费任务的目标时刻：当前 +delay 秒，UTC ISO8601（cron schedule.at 直接可用）。"""
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + delay))
 
 
 def _md5(path):
@@ -118,7 +111,7 @@ def _finalize(nt, table, rows, report, chrono=None):
                 nt, table, lambda f: f.get("phone") or f.get("attach_md5"))
             report["refine_queued"] = len(refine_loop.queue(nt, "resume"))
             if report["refine_queued"]:
-                report["refine_fire_at"] = _fire_at()
+                report["refine_fire_at"] = refine_loop.fire_at()
         except NotableError as e:
 
             if chrono:
@@ -164,7 +157,7 @@ def _finalize(nt, table, rows, report, chrono=None):
         report["refine_queued"] = len(refine_loop.queue(nt, "resume"))
         if report["refine_queued"]:
             # 队列非空 = 需注册消费任务；时刻由脚本算好，agent 原样填入 cron，不必再跑 date
-            report["refine_fire_at"] = _fire_at()
+            report["refine_fire_at"] = refine_loop.fire_at()
     except NotableError as e:
         if chrono:
             report["timing_ms"] = chrono.finish()
