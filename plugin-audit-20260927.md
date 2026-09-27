@@ -162,3 +162,25 @@ SKILL.md:55-56 明说二者不要混跑——但没有任何代码强制。
 8+2 条静默路径全部报错或显式标注；重复实现清零（grep + 元测试）；入口测试全覆盖；
 真表 e2e 全链（upload_jobs → upload_resumes → 精析周期 ×2 → match_gated → match_analyze → stats）
 绿 + unittest 全绿；逐阶段耗时记录，长耗时点修复后清表重跑复测。
+
+## 9. 两轮真表 e2e 耗时对比（2026-09-27，清表重跑）
+
+| 阶段 | 轮1 | 轮2 | 说明 |
+|---|---|---|---|
+| upload_jobs（19 JD） | 4s | 5s | 附件并行 5 并发，含回读 |
+| upload_resumes（31 份） | 6s | 6s | 28 入库 + 3 扫描件入 needs_ocr |
+| OCR backfill（3 份） | 4s | 3s | 同批打 ai_refined_at |
+| wave1 岗位精析（19 agent） | 43.8s | 89.0s | 波次跨度受后端 stall 窗口扰动 |
+| wave2 简历精析（14 agent） | 215.9s | 50.4s | 同上，stall 命中与否决定跨度 |
+| 门禁+commit | 8s | 21s(含回写) | 队列非空时 exit 2 已验证（轮1） |
+| wave3 匹配分析 | 1023.7s（长尾 part8=12 对） | **636.1s**（最大块 8 对） | _cap_blocks 生效：长尾 -38% |
+| merge/apply/stats | 10s | 8s | — |
+
+- 机器侧总耗时 ≈ 上传 14s + 三波推理（轮2 实测 775s）+ 收尾 <1min；
+  **唯一不可压缩项 = subagent 波次推理**，其中 stall 窗口为平台行为（代码不可修），
+  负载不均已用 MAX_PAIRS_PER_AGENT=8 修复（轮1 part8 单块 12 对 → 轮2 最大 8 对）。
+- 轮1 发现并修复：年限回填正则不容「约N年」致 4 份简历年限静默漏回填（正则放宽 + prompt 禁修饰词，已补回填 4/4/3/20 年）。
+- 轮2 业务观察（非 bug）：keep=48 中 0 条「推荐」（42 不推荐 + 6 待定），
+  与 check_skill_coverage exit 2 同源——简历池无安全/EHS 背景候选人，安全两岗 must 命中 3/10；
+  分数普遍 <80 是数据事实，需业务侧补简历池或调岗。
+- 后台周期：事件驱动（上传报告 refine_queued>0）+ 每日 03:00 兜底巡检（cron 2141bf7e，空队列秒退）。
