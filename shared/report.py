@@ -43,7 +43,7 @@ class Chrono:
 # 未列出的键按原插入顺序追加在 error 之后、timing_ms 之前，保证不丢字段。
 _KEY_ORDER = [
     "user_line", "next_action",
-    "created", "readback_missing", "table_total", "refine_queued", "refine_fire_at", "cron_job",
+    "created", "readback_missing", "table_total", "refine_queued", "cron_job",
     "created_summary",
     "total", "parsed", "skipped_dup", "needs_ocr", "backfill_stripped", "failed",
     "duplicates_removed",
@@ -114,8 +114,8 @@ def user_line(report):
     if report.get("readback_missing"):
         line += "；%d 条回读缺失，重跑同目录即可恢复" % len(report["readback_missing"])
     if report.get("refine_queued"):
-        line += ("。精析已入队 %d 条，约 %s 后后台自动精析，异常时最迟次日 %s 兜底"
-                 % (report["refine_queued"], refine_loop.delay_human(), refine_loop.fallback_hhmm()))
+        line += ("。精析已入队 %d 条，约 %s内后台自动精析，异常时最迟次日 %s 兜底"
+                 % (report["refine_queued"], refine_loop.every_human(), refine_loop.fallback_hhmm()))
     return line + "。"
 
 
@@ -124,8 +124,8 @@ def next_action(report):
     一个回合的确定性动作，杜绝手写 payload、再跑 query.py 复核、再跑 date 算偏移。"""
     steps = []
     if report.get("cron_job"):
-        steps.append("把报告里的 cron_job **原样**传给定时任务工具注册（一次性精析消费任务），"
-                     "禁止改写其中的 name/at/message")
+        steps.append("把报告里的 cron_job **原样**传给定时任务工具注册（every 型精析消费任务），"
+                     "禁止改写其中的 name/schedule/message")
     if report.get("needs_ocr"):
         steps.append("按 SKILL.md 用视觉读 needs_ocr 里的原件、只抽基础字段，"
                      "用 `--backfill -` heredoc 一条命令补录（补录报告会带自己的 cron_job，同样原样注册）")

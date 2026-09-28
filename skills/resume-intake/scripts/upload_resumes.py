@@ -19,9 +19,9 @@
   user_line       = 交付用户的一句话原话（措辞与"约 X 分钟/次日 HH:MM 兜底"由 report.py 从
                     refine_loop 真源派生），agent 原样复述即结束，禁止自行组织长汇报；
   next_action     = 下一步动作清单（机器产出），照它做；
-  cron_job        = 精析消费任务的完整注册规格（name/schedule.at/payload/contextDirs 全备好，
-                    refine_loop.consume_task_spec 产出）：仅 refine_queued>0 时输出，agent **原样透传**
-                    给定时任务工具，禁止手写字段、禁止再跑 date 算时刻（延迟真源 = REFINE_DELAY_S）；
+  cron_job        = 精析消费任务的完整注册规格（name/schedule/payload/contextDirs 全备好，
+                    refine_loop.consume_task_spec 产出，schedule 为 every 型无绝对时刻）：仅
+                    refine_queued>0 时输出，agent **原样透传**给定时任务工具，禁止手写字段；
   created_summary = 本次入库记录关键字段回带（最多 SUMMARY_MAX 条）：用户问"传进去的是谁"直接引用，
                     禁止再跑 query.py 复核（readback_missing 为空即已逐手机号回读，不变量 4）；
   created / skipped_dup / needs_ocr / failed / readback_missing / table_total / refine_queued / timing_ms。
@@ -94,7 +94,7 @@ def _finalize(nt, table, rows, report, chrono=None):
     """批量与补录共用尾部：附件先传 → 写表 → 写后查重自愈 → 按手机号回读 → 队列计数。
     rows 含 _file/attach_md5。chrono 非空时按 attach/create/readback 分段计时并写入 report。
     批量与补录一视同仁：两者新记录都入精析队列（扫描件靠 source_file 入队、由 subagent 读图），
-    故队列非空时都输出 refine_fire_at / cron_job 供 agent 注册消费任务（trigger 唯一真源）。"""
+    故队列非空时都输出 cron_job（every 型规格）供 agent 注册消费任务（trigger 唯一真源）。"""
     if not rows:
         try:
             report["duplicates_removed"], report["table_total"] = _dedupe_selfheal(

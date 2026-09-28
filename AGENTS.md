@@ -93,14 +93,16 @@
       有 per-batch 渲染器的链（skills_analyze.render_prompts）则用占位符从常量注入、不留镜像数字。
     - 每次新增枚举/阈值：先落唯一真源，再让消费方派生；同一提交内 grep 确认无第二份副本，unittest 全绿。
 11. 精析异步队列三层闭环（触发/出队/并发防护），禁止加第四层：
-    - 触发 = 上传后 agent 注册一次性消费任务，**注册规格由脚本产出、agent 只透传**：
-      报告 `cron_job` 字段是完整的定时任务 add 入参（name/schedule.at/payload.message/contextDirs 全备好），
-      由 `shared/refine_loop.consume_task_spec` 从唯一真源派生（延迟 = `REFINE_DELAY_S`、任务名前缀 =
-      `TASK_PREFIX`、消费命令 = `_CHAIN`，resume/job 两链共用 `refine_loop.trigger` 一处产出，禁止各抄）。
-      agent 禁止手写 payload、禁止改写 cron_job 任何字段、禁止再跑 `date` 算时刻；被"时刻必须在未来"拒收时
-      用 `python3 shared/refine_loop.py consume <chain>` 重取规格，不许自己拼时刻。
+    - 触发 = 上传后 agent 注册消费任务，**注册规格由脚本产出、agent 只透传**：
+      报告 `cron_job` 字段是完整的定时任务 add 入参（name/schedule/payload.message/contextDirs 全备好），
+      由 `shared/refine_loop.consume_task_spec` 从唯一真源派生（schedule = every 型、间隔 = `EVERY_MS`、
+      任务名前缀 = `TASK_PREFIX`、消费命令 = `_CHAIN`，resume/job 两链共用 `refine_loop.trigger` 一处产出，禁止各抄）。
+      agent 禁止手写 payload、禁止改写 cron_job 任何字段。
       注册只能由 agent 做（脚本是独立进程，宿主机无本地调度 API：CLI 仅暴露 document/pdf/pptx 能力）；
-      **脚本退出后立刻注册、中间不插任何回合**（延迟窗口有限，插队回合会把 at 时刻耗过期）。
+      **脚本退出后立刻注册、中间不插任何回合**。
+      **schedule 必须是 every 型、禁止 at 型绝对时刻**（曾取 at=`now+45s`，单份小文件秒回时"脚本返回→agent 注册"
+      的模型往返（实测 25-30s）吃光窗口、注册被"Scheduled time must be in the future"拒收，反多花 3 回合重算；
+      every 型无绝对时刻、注册永不过期，失败模式被结构性消除——`fire_at`/`REFINE_DELAY_S` 已整体删除、禁止复活）。
     - 出队唯一凭证 = `ai_refined_at` 与三列同一次 update 落表（空即在队，崩溃无中间态要清）。
       队列谓词与它的补集（`unrefinable`：原件已删的扫描件）必须同处 `refine_loop.py` 一源，
       消费方禁止各抄一半。扫描件靠 `source_file`（原件本地绝对路径）入队、由 subagent 读图精析——
@@ -112,8 +114,9 @@
       （`python3 shared/refine_loop.py fallback`：任务名 `FALLBACK_NAME`、时刻 `FALLBACK_CRON`、
       自清理前缀取自 `TASK_PREFIX`），部署/重建时原样注册，**禁止在 cron payload 里手抄名称前缀或时刻**。
       看门狗/补跑任务层已裁撤（它既与兜底重叠、又无法凭新鲜度区分"已崩"与"在跑"，判活窗口>看门狗延迟时必然误判），禁止复活。
-      消费任务**完成即自删**（该指令已写进 `cron_job` 的 payload）：结束时（含队列为 0 静默结束）按任务名删除自身，
-      已消费完的不留列表；兜底 payload 的**自清理**（每次巡检删除已停用且有执行记录的一次性消费任务，
+      消费任务**完成即自删**（该指令已写进 `cron_job` 的 payload）：**无论队列空静默结束 / refused 撞租约退出 /
+      正常消费完，结束前都按任务名删除自身**——every 型任务任一出口漏删就会每 60s 反复触发，故三个出口都写死自删；
+      已消费完的不留列表；兜底 payload 的**自清理**（每次巡检删除已消费完、有执行记录的残留消费任务，
       名称以 `TASK_PREFIX` 各前缀开头）只是对崩溃在自删之前的任务的兜底网；兜底自身是周期任务不在清理范围。
       已接受的边界：消费任务崩溃且 30 分钟内又有新上传时，新任务被僵尸租约拒绝、延至兜底重吃。
 
@@ -216,5 +219,14 @@ python3 skills/replicate/scripts/sync_schema.py --check  # 只读：报 config �
     再花 3 个往返重算时刻。教训重申（同上一条）：**凡确定性的动作一律下沉代码，别写"你必须记得"赌 agent 自觉**。
     现修法：路径纪律写进 SKILL（直取不臆造）；`report.py` 产出 `user_line`（回复原话）/`next_action`（下一步）/
     `created_summary`（入库明细回带，替代 query.py 复核）；`refine_loop.consume_task_spec` 产出完整 `cron_job`
-    注册规格（agent 只透传），`REFINE_DELAY_S` 提到吃得下一次 agent 往返，兜底任务规格也由
-    `refine_loop.py fallback` 产出（消除 cron 里手抄的名称前缀）。元测试 test_report_actions.py + test_single_source.py 防退化。
+    注册规格（agent 只透传），兜底任务规格也由 `refine_loop.py fallback` 产出（消除 cron 里手抄的名称前缀）。
+    元测试 test_report_actions.py + test_single_source.py 防退化。
+- 曾把精析消费任务做成 at 型绝对时刻（`schedule.at = now + REFINE_DELAY_S`），并把 45s 延迟"调大到 180s"当作修法 →
+  治标不治本：只要 agent 多插一个回合，窗口照样可能被吃光，且 `REFINE_DELAY_S` 这个魔法数字的取值永远在
+  "够不够一次往返"上赌。现整体改成 **every 型**（`{"kind":"every","everyMs":EVERY_MS}`）：注册即启用、
+  每 60s 触发、消费完自删，schedule 里**没有绝对时刻字段**，平台不再校验"时刻必须在未来"，
+  失败模式被结构性消除而非靠余量躲避；`fire_at`/`REFINE_DELAY_S`/`delay_human`/报告 `refine_fire_at`
+  字段整体删除（grep 零引用、test_single_source 钉 `assertFalse(hasattr(...))` 防复活）。
+  连带纪律：every 型漏自删会每 60s 反复触发，故 `_consume_message` 把"按名自删"写死到**所有出口**
+  （队列空 / refused 撞租约 / 正常消费完），不能只挂在"正常结束"上。教训：**绝对时刻型调度对"由 agent 转发注册"
+  的链路天然脆弱，凡触发时刻不依赖外部日历的周期消费，一律用 every 型 + 完成即自删，别用 at 型赌时间窗口。**

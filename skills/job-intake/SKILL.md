@@ -53,25 +53,29 @@ python3 skills/job-intake/scripts/upload_jobs.py <目录> --dry-run  # 预演，
 岗位三列由**独立后台会话**消费精析队列产出，与简历链完全对称（机制与边界见 AGENTS.md 不变量 11，
 此处不复述细节）。
 
-脚本跑完、报告 `refine_queued > 0` 时，agent **必须立即注册一个一次性消费任务**
-（定时任务管理工具，schedule kind=at）。**时刻直接取报告字段 `refine_fire_at` 原样填入**——
-脚本已按唯一常量（`shared/refine_loop.py` 的 `REFINE_DELAY_S`，resume/job 两链共用）算好目标时刻，
-禁止再跑 `date` 自行加偏移、也禁止复述那个秒数：
+脚本跑完、报告 `refine_queued > 0` 时，agent **必须立即注册一个消费任务**
+（定时任务管理工具，schedule kind=every）。**注册规格直接取报告字段 `cron_job` 原样透传**——
+脚本已备好完整规格（`shared/refine_loop.py` 的 `consume_task_spec` 产出，resume/job 两链共用），
+禁止手写 payload、禁止改写任何字段：
 
-- **消费任务（时刻 = `refine_fire_at`）**：payload 指令——进本仓库跑
+- **消费任务（schedule = every 型，无绝对时刻）**：payload 指令——进本仓库跑
   `python3 skills/job-intake/scripts/jobs_analyze.py queue`；job 为 0 则静默结束；
   非空则按本 SKILL「智能分析JD」流水线全自动执行到 `sync_job_columns.py` 写回。
-- **完成即自删**：payload 末条指令必须是"任务结束时（含队列为 0 静默结束）按任务名删除本一次性任务自身"——
-  已消费完的任务不留列表；每日 09:30 兜底的自清理只是对崩溃在自删之前的任务的兜底网。
+- **完成即自删**：payload 末条指令必须是"无论队列空 / refused 撞租约 / 正常消费完，都按任务名删除
+  本任务自身"——every 型漏删会每 60s 反复触发；每日 09:30 兜底的自清理只是对崩溃在自删之前的任务的兜底网。
+- **为何是 every 型而非 at 型**：at 型要求 `schedule.at > now`，而"脚本返回 → agent 发出注册"至少要一个
+  模型回合（实测 25-30s），曾取 `now+45s` 时窗口被吃光、注册被"Scheduled time must be in the future"拒收。
+  every 型注册即启用、每 60s 触发、消费完自删，注册永不过期（间隔真源 = `EVERY_MS`，文档不复述数值）。
 - 写回后跑 `python3 skills/job-intake/scripts/check_skill_coverage.py`，低覆盖按本 SKILL
   两因分辨纪律处理：① 用词与简历标签不同源 → 改词重同步直到 exit 0；② 库里确实没有这类
   候选人 → 保留原词并在任务结果里说明，不强行凑 exit 0。
   简历标签池为空（resume 表无 skills）时跳过覆盖率自检。
-- prepare 返回 refused（exit 2，撞活租约）即退出、禁止抢跑；不设看门狗，消费任务崩溃由
+- prepare 返回 refused（exit 2，撞活租约）即自删退出、禁止抢跑；不设看门狗，消费任务崩溃由
   每日 09:30 兜底巡检重吃（不变量 11）。
 - 注册只能由 agent 做（脚本是独立进程，宿主机没有向千问办公写调度的本地 API）；
-  脚本的配套职责是输出 `refine_queued`（触发信号）与 `refine_fire_at`（注册时刻）。
-- 注册完成后向用户一句话说明：队列 N 条、约 1 分钟后后台自动精析、异常时最迟次日 09:30 兜底。
+  脚本的配套职责是输出 `refine_queued`（触发信号）与 `cron_job`（现成注册规格）。
+- 注册完成后向用户一句话说明：队列 N 条、约 1 分钟后后台自动精析、异常时最迟次日 09:30 兜底
+  （措辞取 `user_line`，禁止手抄分钟数）。
 
 ## 「智能分析JD」并发流水线（subagent，agent数硬上限20）
 
@@ -106,4 +110,4 @@ python3 skills/job-intake/scripts/check_skill_coverage.py           # 词表同�
 | `needs_ocr` | 图片型/抽不出正文的 JD，**不入库**（岗位侧无简历那样的 OCR 补录链，空正文记录会静默卡在精析队列外、匹配时表现为"没人合适"）。向用户列出文件名，请其提供可提取文本的原件 |
 | `failed` | 看 error 文本，多为文本提取失败（加密 doc 等），向用户列出文件名 |
 | `refine_queued` | 当前待精析队列长度：精析异步进行，向用户说明"已入队，后台周期消费"即可，**不要在上传回合里跑精析** |
-| `refine_fire_at` | 仅 `refine_queued > 0` 时输出：注册消费任务的目标时刻（UTC ISO8601，脚本已按唯一常量算好）。**原样填入 cron 的 `at` 字段**，禁止再单独跑 `date` 算偏移 |
+| `cron_job` | 仅 `refine_queued > 0` 时输出：精析消费任务的**完整注册规格**（name/schedule/message/contextDirs 都已备好，schedule 为 every 型无绝对时刻）。**原样传给定时任务工具**，禁止手写字段、禁止改写 |

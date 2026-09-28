@@ -474,9 +474,11 @@ class TestBackfillQueueReport(unittest.TestCase):
             self.assertNotIn("ai_refined_at", row)
             self.assertNotIn("ai_extract", row)
             self.assertNotIn("ai_deep", row)
-            # 扫描件照常入队 → refine_queued=1 且给出注册时刻（补录后同样要注册消费任务）
+            # 扫描件照常入队 → refine_queued=1 且给出 every 型注册规格（补录后同样要注册消费任务）
             self.assertEqual(rep["refine_queued"], 1)
-            self.assertIn("refine_fire_at", rep)
+            self.assertIn("cron_job", rep)
+            self.assertEqual(rep["cron_job"]["schedule"]["kind"], "every")
+            self.assertNotIn("refine_fire_at", rep)      # at 型字段已废弃
             self.assertEqual(rep["table_total"], 1)
         finally:
             shutil.rmtree(d, ignore_errors=True)

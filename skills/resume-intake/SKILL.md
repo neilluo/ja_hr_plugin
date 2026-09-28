@@ -38,7 +38,7 @@ python3 skills/resume-intake/scripts/upload_resumes.py <目录> --dry-run  # 预
 | `VERDICT`（stdout 首行） | `OK`/`WARN`/`BAD` 一行结论，读报告先看它——不必逐字段扫 JSON 判成败。格式真源 `shared/report.py` |
 | `user_line` | **交付用户的原话**：一句话中文结论（含新增数/表内总数/精析入队与兜底时刻）。原样复述即结束，禁止再写长汇报 |
 | `next_action` | **agent 下一步动作清单**（机器产出）：如"把 cron_job 原样注册""补录扫描件""重跑同目录"。照它做，不要自己发挥 |
-| `cron_job` | 仅 `refine_queued > 0` 时输出：一次性精析消费任务的**完整注册规格**（name/at/message/contextDirs 都已备好）。**原样传给定时任务工具**，禁止改写其中任何字段、禁止手写 payload |
+| `cron_job` | 仅 `refine_queued > 0` 时输出：精析消费任务的**完整注册规格**（name/schedule/message/contextDirs 都已备好，schedule 为 every 型无绝对时刻）。**原样传给定时任务工具**，禁止改写其中任何字段、禁止手写 payload |
 | `created_summary` | 本次入库记录的关键字段回带（姓名/手机号/期望职位等，条数上限见 `report.SUMMARY_MAX`，溢出带计数）：用户问"传进去的是谁"直接引用，**禁止再跑 `query.py` 复核** |
 | `created` / `readback_missing` | missing 非空 = 失败，重跑同目录即可（幂等） |
 | `skipped_dup` | 正常：MD5 或手机号已存在，向用户说明即可 |
@@ -46,7 +46,6 @@ python3 skills/resume-intake/scripts/upload_resumes.py <目录> --dry-run  # 预
 | `needs_ocr` | 扫描件/图片的**原件绝对路径**，按下节补录（读图与 `_file` 直接用它，禁止手拼目录+文件名） |
 | `table_total` | 表内记录总数（回读那趟全表扫描顺带得出）：`user_line` 已引用，不必单独复述 |
 | `refine_queued` | 当前待精析队列长度：精析异步进行，**不要在上传回合里跑精析** |
-| `refine_fire_at` | 仅 `refine_queued > 0` 时输出：`cron_job.schedule.at` 的同一时刻，供人工核对；注册一律走 `cron_job`，不必单独取它 |
 | `timing_ms` | 脚本各阶段机器耗时（毫秒）：`list_existing`/`extract`(批量)/`build_rows`/`attach`/`create`/`readback`/`total`。用户问性能时引用此数据定位瓶颈（`attach`/`create` 为主要网络段），不要凭感觉猜 |
 
 ## Agent 执行纪律（性能关键，必须遵守）
@@ -65,10 +64,11 @@ python3 skills/resume-intake/scripts/upload_resumes.py <目录> --dry-run  # 预
    （用 `--backfill -` heredoc，见下节），一律合进同一条 Bash 或同一条消息发出。
 4. **不为脚本内建的保障追加验证回合**：`readback_missing` 为空即已逐手机号回读校验（不变量 4），
    总数取 `table_total`、入库明细取 `created_summary`，**禁止再跑 `query.py` 复核**；
-   注册时刻取 `cron_job`（脚本已按唯一常量算好），**禁止再跑 `date` 自行加偏移**。
-5. **脚本退出后立刻注册 cron_job，中间不插任何回合**：`refine_fire_at` 的延迟窗口有限，
-   多插一轮（哪怕是"顺手复核一下"）就可能让时刻过期、注册被拒，反要多花数轮重算。
-   注册动作 = 把 `cron_job` 原样传给定时任务工具，与 `user_line` 回复**同一条消息**发出。
+   注册规格取 `cron_job`（脚本已备好），**禁止手写 payload、禁止再跑 `date` 算时刻**。
+5. **脚本退出后立刻注册 cron_job，中间不插任何回合**：`cron_job` 是 every 型（注册即启用、
+   每 60s 触发、消费完自删），没有绝对时刻、注册永不过期，所以不必抢时间窗口；但仍应紧跟脚本
+   注册、别拖到用户下一轮才想起来。注册动作 = 把 `cron_job` 原样传给定时任务工具，
+   与 `user_line` 回复**同一条消息**发出。
 6. **不预探扫描件属性**：`needs_ocr` 里的文件不必先查页数/尺寸，`Read` 可直接读 PDF 与图片，
    单页多页都不影响下一步。多份扫描件必须在**同一条消息里一次性并发读**（含多页 PDF 的每页），
    禁止一份一回合串行读。仅当扫描件 ≥8 份且单消息上下文吃紧时，才拆 subagent 并发（每个 subagent
@@ -130,19 +130,19 @@ EOF
 （prepare → 一波 subagent ≤20 → merge → apply，见 `skills/skills-analyze/SKILL.md`）。
 队列谓词唯一真源 `shared/refine_loop.py`（此处不复述条件）：批量记录与扫描件补录记录同样入队。
 
-报告 `refine_queued > 0` 时，脚本已在 **`cron_job` 字段产出完整的注册规格**（name / schedule.at /
+报告 `refine_queued > 0` 时，脚本已在 **`cron_job` 字段产出完整的注册规格**（name / schedule /
 payload.message / contextDirs 全部备好，由 `refine_loop.consume_task_spec` 从唯一真源派生）。
 agent 的动作退化为一步：**把 `cron_job` 原样传给定时任务工具的 add**，与 `user_line` 回复同一条消息发出。
 
-- **禁止手写 payload、禁止改写 cron_job 里任何字段、禁止再跑 `date` 算时刻**——任务名前缀、
-  消费命令、"完成即自删"指令、触发时刻都是代码产物（曾手写 payload 一次吃掉 25s 模型思考，
-  且手抄的任务名前缀与流水线细节构成双源）。
-- **时刻窗口有限，脚本退出后立刻注册**：`cron_job.schedule.at` = 脚本时刻 + `REFINE_DELAY_S`
-  （唯一常量，文档不复述数值）。中间每多插一个回合都可能让它过期、注册被"Scheduled time must be
-  in the future"拒收；真被拒时用 `python3 shared/refine_loop.py consume resume` 重取一份规格再注册，
-  不要自己拼时刻。
-- **完成即自删**已写进 `cron_job` 的 payload（按任务名删除自身）；每日兜底巡检的自清理只是对
-  崩溃在自删之前的任务的兜底网。
+- **禁止手写 payload、禁止改写 cron_job 里任何字段**——任务名前缀、消费命令、"完成即自删"指令、
+  schedule 都是代码产物（曾手写 payload 一次吃掉 25s 模型思考，且手抄的任务名前缀与流水线细节构成双源）。
+- **schedule 是 every 型（`{"kind":"every","everyMs":60000}`），不是 at 型绝对时刻**：注册即启用、
+  每 60s 触发、消费完自删。之所以弃用 at 型——at 型要求 `schedule.at > now`，而"脚本返回 → agent 发出
+  注册"至少要一个模型回合（实测 25-30s），曾取 `now+45s` 时单份小文件秒回、窗口被 agent 往返吃光，
+  注册被"Scheduled time must be in the future"拒收，反多花 3 个回合重算。every 型注册永不过期，
+  失败模式被结构性消除。间隔唯一真源 = `shared/refine_loop.py` 的 `EVERY_MS`，文档不复述数值。
+- **完成即自删**已写进 `cron_job` 的 payload（无论队列空 / refused 撞租约 / 正常消费完，都按任务名删除
+  自身——every 型漏删会每 60s 反复触发）；每日兜底巡检的自清理只是对崩溃在自删之前的任务的兜底网。
 
 **不设看门狗/补跑任务**（曾设 +15 分钟看门狗，已裁撤）：消费任务崩溃时未写回记录天然仍在
 队列（`ai_refined_at` 为空即在队，队列状态就是表数据本身、无中间态要清），僵尸租约 30 分钟
