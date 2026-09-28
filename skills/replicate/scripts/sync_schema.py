@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "shared", "preflight"))
 from notable import Notable, NotableError  # noqa: E402
 from preflight import run_preflight  # noqa: E402
+import datefmt  # noqa: E402  date 列显示格式唯一真源 config.formats.date，禁止本地抄第二份
 
 _CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "config.json")
 
@@ -137,6 +138,10 @@ def main():
                 body = {"name": cn, "type": ftype}
                 if ftype in ("singleSelect", "multipleSelect") and opts:
                     body["property"] = {"options": [{"name": o} for o in opts]}
+                elif ftype == "date":
+                    prop = datefmt.property_for(tkey, biz, cfg)
+                    if prop:
+                        body["property"] = prop
                 nt.call("POST", "/v1.0/notable/bases/%s/sheets/%s/fields" % (nt.base, sheet), body)
                 created.append(cn)
                 time.sleep(0.2)  # 建字段限流余量

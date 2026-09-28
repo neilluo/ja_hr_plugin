@@ -11,7 +11,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "shared"))
 sys.path.insert(0, os.path.join(ROOT, "skills", "job-intake", "scripts"))
 sys.path.insert(0, os.path.join(ROOT, "skills", "resume-intake", "scripts"))
+sys.path.insert(0, os.path.join(ROOT, "skills", "replicate", "scripts"))
 
+import datefmt  # noqa: E402
 import extract  # noqa: E402
 import parse_job  # noqa: E402
 import parse_resume  # noqa: E402
@@ -131,6 +133,25 @@ class TestMatchGatedNoLinkResidue(unittest.TestCase):
                                 "match_gated.py"), encoding="utf-8").read()
         self.assertNotIn("关联岗位", src)
         self.assertNotIn("linkedRecordIds", src)
+
+
+class TestDateFormatSingleSource(unittest.TestCase):
+    """不变量 10：date 列显示格式唯一真源 = config.formats.date，
+    建表/补列经 datefmt.property_for 派生，脚本禁止本地抄 formatter 字面量。"""
+
+    def test_declared_matches_config(self):
+        self.assertEqual(datefmt.declared(_CONFIG), _CONFIG["formats"]["date"])
+        self.assertEqual(datefmt.property_for("resume", "ai_refined_at", _CONFIG),
+                         {"formatter": "YYYY-MM-DD HH:mm"})
+        self.assertIsNone(datefmt.property_for("perm", "user", _CONFIG))
+
+    def test_build_scripts_have_no_formatter_literal(self):
+        # grep 式断言：建表/补列源码不得出现 formatter 字面量（防副本复活），只许经 datefmt 派生
+        for parts in (("skills", "replicate", "scripts", "replicate_base.py"),
+                      ("skills", "replicate", "scripts", "sync_schema.py")):
+            src = open(os.path.join(ROOT, *parts), encoding="utf-8").read()
+            self.assertNotIn("formatter", src, "%s 出现 formatter 字面量副本" % (parts,))
+            self.assertIn("datefmt.property_for", src)
 
 
 if __name__ == "__main__":

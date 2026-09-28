@@ -200,6 +200,21 @@
       "org": ["职能中心", "制造中心"]
     }
   },
+  "formats": {
+    "date": {
+      "resume": {
+        "upload_time": "YYYY-MM-DD HH:mm",
+        "ai_refined_at": "YYYY-MM-DD HH:mm"
+      },
+      "job": {
+        "submit_time": "YYYY-MM-DD HH:mm",
+        "ai_refined_at": "YYYY-MM-DD HH:mm"
+      },
+      "match": {
+        "update_time": "YYYY-MM-DD HH:mm"
+      }
+    }
+  },
   "refs": {
     "resume": {
       "school_985": [
@@ -216,5 +231,5 @@
       ]
     }
   },
-  "note": "业务键→中文字段名映射；OpenAPI 记录接口以中文字段名为 key，无需字段 ID。凭证在 .secrets.json 或环境变量 DINGTALK_APP_KEY/DINGTALK_APP_SECRET。字段顺序以 fields 书写顺序为建表顺序；options 为 select 字段选项真源。refs 是派生参考数据真源（如简历院校 985/211 名单，供解析器运行时读取），非 select 选项，消费方禁止本地留副本。"
+  "note": "业务键→中文字段名映射；OpenAPI 记录接口以中文字段名为 key，无需字段 ID。凭证在 .secrets.json 或环境变量 DINGTALK_APP_KEY/DINGTALK_APP_SECRET。字段顺序以 fields 书写顺序为建表顺序；options 为 select 字段选项真源。formats.date 为 date 列显示格式真源（建表/补列经 shared/datefmt.py 派生，未声明者用平台默认）；refs 是派生参考数据真源（如简历院校 985/211 名单，供解析器运行时读取），非 select 选项，消费方禁止本地留副本。"
 }
