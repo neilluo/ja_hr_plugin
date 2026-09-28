@@ -15,8 +15,9 @@ author:
 # 简历 AI 精析（后台周期流水线）
 
 精析**不由上传同步触发**：上传写完表即结束，本流水线由后台任务消费精析队列
-（消费入口 = 上传后 agent 注册的一次性消费任务，注册时刻取上传报告字段 `refine_fire_at`
-（延迟秒数唯一真源 = `shared/refine_loop.py` 的 `REFINE_DELAY_S`）+ 每日 09:30 兜底巡检，触发纪律见
+（消费入口 = 上传后 agent 注册的一次性消费任务，注册规格由上传报告的 `cron_job` 字段带出、agent 原样透传
+（延迟唯一真源 = `shared/refine_loop.py` 的 `REFINE_DELAY_S`，规格由其 `consume_task_spec` 产出）
++ 每日兜底巡检（时刻见 `refine_loop.FALLBACK_CRON`），触发纪律见
 `skills/resume-intake/SKILL.md`；提示词唯一源 = `references/subagent-prompt.md`）。
 队列谓词唯一真源 `shared/refine_loop.py`（此处不复述条件）。被触发后**全自动执行，不分步等用户确认**：
 查队列 → 切分 → 同一消息内并发 subagent → 合并 → 写回（含出队标记）→ 回读校验。

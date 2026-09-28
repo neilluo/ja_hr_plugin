@@ -4,6 +4,7 @@
 两种模式:
     # A. 批量入库（可解析的 pdf/docx/doc；扫描件/图片进 needs_ocr 队列）
     python3 skills/resume-intake/scripts/upload_resumes.py <目录> [--dry-run]
+    # <目录> 也可直接传单个简历文件路径：只处理这一份，无需建临时目录/软链
 
     # B. 扫描件补录（agent 用视觉读取 needs_ocr 文件后，把字段+原文件路径写成 JSON 交给本命令）
     python3 skills/resume-intake/scripts/upload_resumes.py --backfill records.json
@@ -14,17 +15,20 @@
 补录与批量走完全一致的不变量，扫描件的原件也会进表、MD5 也写入，重跑幂等。
 
 输出报告（格式唯一真源 shared/report.py）：stdout 首行 VERDICT:OK|WARN|BAD 一行结论，
-其后 JSON 报告（结果字段 created/readback_missing/table_total/refine_queued 前置，
-timing_ms 垫底）：created / skipped_dup / needs_ocr / failed / readback_missing / table_total /
-refine_queued / timing_ms（+ 队列非空时的 refine_fire_at）。
+其后 JSON 报告（成品指令与结果字段前置，timing_ms 垫底）。报告是**给 agent 的成品**，照做即可：
+  user_line       = 交付用户的一句话原话（措辞与"约 X 分钟/次日 HH:MM 兜底"由 report.py 从
+                    refine_loop 真源派生），agent 原样复述即结束，禁止自行组织长汇报；
+  next_action     = 下一步动作清单（机器产出），照它做；
+  cron_job        = 精析消费任务的完整注册规格（name/schedule.at/payload/contextDirs 全备好，
+                    refine_loop.consume_task_spec 产出）：仅 refine_queued>0 时输出，agent **原样透传**
+                    给定时任务工具，禁止手写字段、禁止再跑 date 算时刻（延迟真源 = REFINE_DELAY_S）；
+  created_summary = 本次入库记录关键字段回带（最多 SUMMARY_MAX 条）：用户问"传进去的是谁"直接引用，
+                    禁止再跑 query.py 复核（readback_missing 为空即已逐手机号回读，不变量 4）；
+  created / skipped_dup / needs_ocr / failed / readback_missing / table_total / refine_queued / timing_ms。
 timing_ms 为各阶段机器耗时（毫秒）：list_existing/extract(批量)/build_rows/attach/create/readback/total，
 用于定位脚本侧瓶颈（附件与建记录是主要网络段）。精析是异步队列：上传写完表即结束，refine_queued = 当前待精析队列长度
 （谓词唯一真源 shared/refine_loop.py），由后台周期消费，上传环节不衔接精析。
-table_total = 表内记录总数（回读那趟全表扫描顺带得出，零额外请求）：agent 交付用户时直接引用，
-禁止再跑 query.py 复核（readback_missing 为空即已逐手机号回读，不变量 4）。
-refine_fire_at = 注册精析消费任务的目标时刻（当前 +REFINE_DELAY_S 秒，UTC ISO8601）：仅当 refine_queued>0 时输出，
-agent 原样填入 cron 的 at 字段即可，禁止再单独跑 date 算偏移（延迟秒数唯一真源 = shared/refine_loop.py 的
-REFINE_DELAY_S，文档只引用字段名）。
+table_total = 表内记录总数（回读那趟全表扫描顺带得出，零额外请求）。
 补录（--backfill）只写基础字段与 source_file（原件本地路径），不写 AI 三列、不打 ai_refined_at：
 扫描件与批量记录一样进精析队列，三列由后台 subagent 读原件产出（谓词与读图机制见 shared/refine_loop.py）。
 """
@@ -112,14 +116,12 @@ def _finalize(nt, table, rows, report, chrono=None):
     """批量与补录共用尾部：附件先传 → 写表 → 写后查重自愈 → 按手机号回读 → 队列计数。
     rows 含 _file/attach_md5。chrono 非空时按 attach/create/readback 分段计时并写入 report。
     批量与补录一视同仁：两者新记录都入精析队列（扫描件靠 source_file 入队、由 subagent 读图），
-    故队列非空时都输出 refine_fire_at 供 agent 注册消费任务。"""
+    故队列非空时都输出 refine_fire_at / cron_job 供 agent 注册消费任务（trigger 唯一真源）。"""
     if not rows:
         try:
             report["duplicates_removed"], report["table_total"] = _dedupe_selfheal(
                 nt, table, lambda f: f.get("phone") or f.get("attach_md5"))
-            report["refine_queued"] = len(refine_loop.queue(nt, "resume"))
-            if report["refine_queued"]:
-                report["refine_fire_at"] = refine_loop.fire_at()
+            refine_loop.trigger(nt, "resume", report)
         except NotableError as e:
 
             if chrono:
@@ -161,11 +163,8 @@ def _finalize(nt, table, rows, report, chrono=None):
         report["duplicates_removed"], report["table_total"] = _dedupe_selfheal(
             nt, table, lambda f: f.get("phone") or f.get("attach_md5"))
         back = {r["fields"].get("phone") for r in nt.list_records(table, biz_fields=["phone"])}
-        # 写表回读完成后计队列（谓词真源 refine_loop；dry-run 不走 _finalize 天然不含）
-        report["refine_queued"] = len(refine_loop.queue(nt, "resume"))
-        if report["refine_queued"]:
-            # 队列非空 = 需注册消费任务；时刻由脚本算好，agent 原样填入 cron，不必再跑 date
-            report["refine_fire_at"] = refine_loop.fire_at()
+        # 写表回读完成后计队列（谓词与注册规格唯一真源 refine_loop.trigger；dry-run 不走 _finalize 天然不含）
+        refine_loop.trigger(nt, "resume", report)
     except NotableError as e:
         if chrono:
             report["timing_ms"] = chrono.finish()
@@ -178,14 +177,25 @@ def _finalize(nt, table, rows, report, chrono=None):
     report["created"] = len(ids)
     report["readback_missing"] = [r["phone"] for r in write_rows
                                   if r.get("phone") and r["phone"] not in back]
-    print_report(report)
+    # created_summary：把入库记录的关键字段回带进报告，agent 无需再跑 query.py 复核（省一个回合）
+    print_report(report, created_rows=write_rows)
     sys.exit(1 if report["readback_missing"] else 0)
+
+
+def _scan(dir_or_file):
+    """返回 (base_dir, files)：files 是 base_dir 下的文件名列表。
+    dir_or_file 既可是目录（扫全部支持格式），也可是单个文件（只处理它）——
+    单份上传是常见诉求，此前只能整目录跑或让 agent 在 /tmp 建软链绕路（多花 2 个回合）。"""
+    if os.path.isfile(dir_or_file):
+        return os.path.dirname(os.path.abspath(dir_or_file)), [os.path.basename(dir_or_file)]
+    files = sorted(f for f in os.listdir(dir_or_file)
+                   if os.path.splitext(f)[1].lower() in SUPPORTED_EXTS)
+    return dir_or_file, files
 
 
 def run_batch(nt, args):
     chrono = _Chrono()
-    files = sorted(f for f in os.listdir(args.dir)
-                   if os.path.splitext(f)[1].lower() in SUPPORTED_EXTS)
+    base_dir, files = _scan(args.dir)
     if args.dry_run:
         phones, md5s = set(), set()
     else:
@@ -195,12 +205,12 @@ def run_batch(nt, args):
         chrono.mark("list_existing")
 
     # 阶段1：并行提取文本（extract 走 subprocess pdftotext，I/O 密集，线程可提速）
-    paths = [os.path.join(args.dir, fn) for fn in files]
+    paths = [os.path.join(base_dir, fn) for fn in files]
     extracts, _errs = nt.map_parallel(extract, paths, workers=UPLOAD_WORKERS)
     chrono.mark("extract")
 
     rows = []
-    report = {"total": len(files), "parsed": 0, "skipped_dup": [],
+    report = {"kind": "简历", "total": len(files), "parsed": 0, "skipped_dup": [],
               "needs_ocr": [], "failed": []}
     for fn, path, ex in zip(files, paths, extracts):
         try:
@@ -263,7 +273,7 @@ def run_backfill(nt, args):
     md5s = {r["fields"].get("attach_md5") for r in old}
     chrono.mark("list_existing")
 
-    report = {"total": len(records), "parsed": 0, "skipped_dup": [],
+    report = {"kind": "简历", "total": len(records), "parsed": 0, "skipped_dup": [],
               "needs_ocr": [], "failed": []}
     rows = []
     for rec in records:
@@ -323,21 +333,25 @@ def run_backfill(nt, args):
 
 def main():
     ap = argparse.ArgumentParser(description="简历批量入库 / 扫描件补录")
-    ap.add_argument("dir", nargs="?", help="简历目录（批量模式）")
+    ap.add_argument("dir", nargs="?", help="简历目录（批量模式）；也可直接传单个简历文件路径")
     ap.add_argument("--dry-run", action="store_true", help="只解析不上传不写表（批量模式）")
     ap.add_argument("--backfill", metavar="JSON",
                     help="扫描件补录：字段+原文件路径的 JSON 文件；传 - 从 stdin 读（heredoc 一条命令跑完）")
     args = ap.parse_args()
 
     if bool(args.dir) == bool(args.backfill):
-        ap.error("二选一：提供 <目录> 走批量，或用 --backfill JSON 走补录")
+        ap.error("二选一：提供 <目录或单个文件> 走批量，或用 --backfill JSON 走补录")
     # --dry-run 只在批量路径生效；补录曾静默忽略它、照传附件建记录（人以为在预览实则已写表）。
     # 补录无 dry-run 语义，直接拒收该组合，不赌调用方知道"这个 flag 会被吞"。
     if args.backfill and args.dry_run:
         ap.error("--dry-run 仅用于批量模式（<目录>）；补录（--backfill）无预演语义，会真实写表")
 
-    # stage 0: 环境预检
-    run_preflight(config_path=_CONFIG, files_dir=args.dir)
+    # stage 0: 环境预检。单文件走 files= 精确校验，目录走 files_dir= 扫描（两者互斥，别把单文件
+    # 当目录传——_check_files_dir 会因目录里只有 1 个文件而误判/漏判）。
+    if args.dir and os.path.isfile(args.dir):
+        run_preflight(config_path=_CONFIG, files=[args.dir])
+    else:
+        run_preflight(config_path=_CONFIG, files_dir=args.dir)
 
     nt = Notable()
     if args.backfill:

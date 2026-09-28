@@ -76,20 +76,27 @@
       补列（sync_schema）经 `skills/replicate/scripts/datefmt.py` 派生 property，真表存量列经 datefmt.align 对齐；
       存储值恒为毫秒时间戳（notable._cast），formatter 只管显示；脚本禁止抄 formatter 字面量（元测试防复活）。
     - 入库报告（stdout 首行 VERDICT 结论 + JSON 结果字段前置顺序）唯一真源 = `shared/report.py`
-      （print_report/verdict/_KEY_ORDER）：upload_resumes/upload_jobs 一律经它输出，禁止各自
+      （print_report/verdict/_KEY_ORDER/enrich）：upload_resumes/upload_jobs 一律经它输出，禁止各自
       `print(json.dumps(...))` 抄字段顺序；README/SKILL 只引用"VERDICT 首行 + 结果前置"这一契约、
       禁止复述字段清单顺序（元测试 test_report_contract.py 防退化）。
+      报告同时产出**给 agent 的成品指令**（确定性动作下沉代码，不赌 agent 自觉）：`user_line`（回复用户的
+      一句话结论，措辞与"约 X 分钟/次日 HH:MM 兜底"均由 refine_loop 真源派生）、`next_action`（下一步动作清单）、
+      `created_summary`（入库记录关键字段回带，免再跑 query.py 复核）、`cron_job`（精析消费任务完整注册规格，见不变量 11）。
+      agent 只透传/复述这些字段，禁止自行组织长汇报或展开原始字段（实测一次单份上传 185s/14 往返里 8 个无业务价值）。
     - 中文字段名禁止硬编码进脚本：记录接口经 `Notable.cn()/_cells()` 从 config 取，结构接口按中文名运行时解析。
     - 文档（README/recruit-model/SKILL）不得手抄 base_id/table_id/完整字段清单/技能词表，一律指向真源。
     - 例外：写入值字面量（如 source="系统匹配"、status="招聘中"）、解析私有规则（_DEPT_ALIAS 别名、
       分类→关键词映射）、安全白名单（sync_job_columns.KEYS）属单一出现，不算双源，但须注释指向 config 真源。
     - 每次新增枚举/阈值：先落唯一真源，再让消费方派生；同一提交内 grep 确认无第二份副本，unittest 全绿。
 11. 精析异步队列三层闭环（触发/出队/并发防护），禁止加第四层：
-    - 触发 = 上传后 agent 注册一次性消费任务，**时刻直接取报告字段 `refine_fire_at`**
-      （延迟秒数唯一真源 = `shared/refine_loop.REFINE_DELAY_S`，resume/job 两条上传链共用同一触发机制，
-      时刻均取各自报告的 `refine_fire_at`；文档与 prompt 只引用字段名、禁止复述数值，
-      也不许再跑 `date` 现算；纪律在 resume-intake / job-intake SKILL.md，`refine_queued` 供触发信号；
-      注册只能由 agent 做，脚本无本地调度 API）。
+    - 触发 = 上传后 agent 注册一次性消费任务，**注册规格由脚本产出、agent 只透传**：
+      报告 `cron_job` 字段是完整的定时任务 add 入参（name/schedule.at/payload.message/contextDirs 全备好），
+      由 `shared/refine_loop.consume_task_spec` 从唯一真源派生（延迟 = `REFINE_DELAY_S`、任务名前缀 =
+      `TASK_PREFIX`、消费命令 = `_CHAIN`，resume/job 两链共用 `refine_loop.trigger` 一处产出，禁止各抄）。
+      agent 禁止手写 payload、禁止改写 cron_job 任何字段、禁止再跑 `date` 算时刻；被"时刻必须在未来"拒收时
+      用 `python3 shared/refine_loop.py consume <chain>` 重取规格，不许自己拼时刻。
+      注册只能由 agent 做（脚本是独立进程，宿主机无本地调度 API：CLI 仅暴露 document/pdf/pptx 能力）；
+      **脚本退出后立刻注册、中间不插任何回合**（延迟窗口有限，插队回合会把 at 时刻耗过期）。
     - 出队唯一凭证 = `ai_refined_at` 与三列同一次 update 落表（空即在队，崩溃无中间态要清）。
       队列谓词与它的补集（`unrefinable`：原件已删的扫描件）必须同处 `refine_loop.py` 一源，
       消费方禁止各抄一半。扫描件靠 `source_file`（原件本地绝对路径）入队、由 subagent 读图精析——
@@ -97,11 +104,13 @@
     - 并发防护 = `shared/refine_loop.py` 周期租约：prepare 获取 `outputs/refine_{resume,job}.lock`、
       写回端释放，30 分钟 mtime 判活，撞活租约 refused exit 2（消费方见 refused 即退、禁止抢跑），
       同周期重切批 --force 夺回；锁路径走 OUTDIR 供测试隔离。
-    - 每日 09:30 兜底 cron 是**唯一崩溃恢复层**（时刻选白天工作时段，电脑通常在开机状态）；
+    - 每日兜底 cron 是**唯一崩溃恢复层**（时刻取白天工作时段，电脑通常在开机状态）；其规格同样由代码产出
+      （`python3 shared/refine_loop.py fallback`：任务名 `FALLBACK_NAME`、时刻 `FALLBACK_CRON`、
+      自清理前缀取自 `TASK_PREFIX`），部署/重建时原样注册，**禁止在 cron payload 里手抄名称前缀或时刻**。
       看门狗/补跑任务层已裁撤（它既与兜底重叠、又无法凭新鲜度区分"已崩"与"在跑"，判活窗口>看门狗延迟时必然误判），禁止复活。
-      消费任务**完成即自删**：payload 末条指令为结束时（含队列为 0 静默结束）按任务名删除本一次性任务自身，
+      消费任务**完成即自删**（该指令已写进 `cron_job` 的 payload）：结束时（含队列为 0 静默结束）按任务名删除自身，
       已消费完的不留列表；兜底 payload 的**自清理**（每次巡检删除已停用且有执行记录的一次性消费任务，
-      名称以「简历精析消费」/「岗位JD精析消费」开头）只是对崩溃在自删之前的任务的兜底网；兜底自身是周期任务不在清理范围。
+      名称以 `TASK_PREFIX` 各前缀开头）只是对崩溃在自删之前的任务的兜底网；兜底自身是周期任务不在清理范围。
       已接受的边界：消费任务崩溃且 30 分钟内又有新上传时，新任务被僵尸租约拒绝、延至兜底重吃。
 
 ## 验证命令
@@ -195,3 +204,13 @@ python3 skills/replicate/scripts/sync_schema.py --check  # 只读：报 config �
   agent 扫 stdout 开头只见 total/needs_ocr 就误判"报告缺 created"，白白多绕 Grep+纠正两回合（实测一次
   上传 162s 里 63s 是这桩空转，占非 OCR 成本的大头）。教训重申：文档约束赌 agent"读全"不可靠，
   现由 `shared/report.py` 先把 VERDICT 结论行打到首行、再把结果字段前置，把"读全才懂成败"变成"一眼可见"。
+- 曾让 agent 徒手完成三件**确定性**动作，单份上传因此从应有的 ~1 分钟拖到 185s/14 往返（8 个往返无业务价值）：
+  ① 凭记忆发明路径再逐个 `ls` 试探（3 个往返）——用户给的路径与运行环境里的 CWD 本可直接用；
+  ② 上传成功后又跑一次 `query.py` "复核"（1 个往返）——`readback_missing` 为空即已逐手机号回读（不变量 4），
+    纯属重复劳动，SKILL 早有禁令但赌 agent 自觉没用；③ 手写精析消费任务的 cron payload（25s 模型思考）
+    且手抄任务名前缀构成双源，又因先插了 ② 那轮把 `refine_fire_at` 窗口耗过期、被"时刻必须在未来"拒收，
+    再花 3 个往返重算时刻。教训重申（同上一条）：**凡确定性的动作一律下沉代码，别写"你必须记得"赌 agent 自觉**。
+    现修法：路径纪律写进 SKILL（直取不臆造）；`report.py` 产出 `user_line`（回复原话）/`next_action`（下一步）/
+    `created_summary`（入库明细回带，替代 query.py 复核）；`refine_loop.consume_task_spec` 产出完整 `cron_job`
+    注册规格（agent 只透传），`REFINE_DELAY_S` 提到吃得下一次 agent 往返，兜底任务规格也由
+    `refine_loop.py fallback` 产出（消除 cron 里手抄的名称前缀）。元测试 test_report_actions.py + test_single_source.py 防退化。

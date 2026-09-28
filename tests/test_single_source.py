@@ -120,7 +120,9 @@ class TestRefineDelaySingleSource(unittest.TestCase):
     两条上传链（upload_resumes/upload_jobs）禁止本地副本（含转发别名）。"""
 
     def test_constant_defined_only_in_refine_loop(self):
-        self.assertEqual(refine_loop.REFINE_DELAY_S, 45)
+        # 值本身不钉死（会随往返实测调整），但必须 ≥ 一次 agent 回合往返，
+        # 否则单份秒回时 refine_fire_at 会在注册前过期、被"时刻必须在未来"拒收（见 AGENTS 犯错记录）。
+        self.assertGreaterEqual(refine_loop.REFINE_DELAY_S, 120)
         for mod in (upload_resumes, upload_jobs):
             self.assertFalse(hasattr(mod, "REFINE_DELAY_S"))
             self.assertFalse(hasattr(mod, "_fire_at"))
@@ -134,6 +136,26 @@ class TestRefineDelaySingleSource(unittest.TestCase):
             src = open(os.path.join(ROOT, *parts), encoding="utf-8").read()
             self.assertNotIn("REFINE_DELAY_S =", src, "%s 出现延迟常量定义副本" % (parts,))
             self.assertNotIn("def _fire_at", src, "%s 出现本地 fire_at 函数副本" % (parts,))
+
+    def test_task_spec_is_code_product(self):
+        """消费/兜底任务规格是代码产物：任务名前缀、时刻、payload 均从 refine_loop 派生，
+        禁止 agent 手写 payload 或手抄前缀（曾一次手写 payload 吃掉 25s 模型思考）。"""
+        import report
+        spec = refine_loop.consume_task_spec("resume", at="2026-01-01T00:00:00Z", root="/tmp/repo")
+        self.assertTrue(spec["name"].startswith(refine_loop.TASK_PREFIX["resume"]))
+        self.assertEqual(spec["schedule"], {"kind": "at", "at": "2026-01-01T00:00:00Z"})
+        self.assertEqual(spec["payload"]["contextDirs"], ["/tmp/repo"])
+        self.assertIn("删除本一次性任务", spec["payload"]["message"])   # 完成即自删
+        self.assertIn(refine_loop._CHAIN["resume"]["queue_cmd"], spec["payload"]["message"])
+        fb = refine_loop.fallback_task_spec(root="/tmp/repo")
+        self.assertEqual(fb["name"], refine_loop.FALLBACK_NAME)
+        self.assertEqual(fb["schedule"]["kind"], "cron")
+        # 兜底自清理的前缀取自 TASK_PREFIX，不是手抄字面量
+        for t in refine_loop.TABLES:
+            self.assertIn(refine_loop.TASK_PREFIX[t], fb["payload"]["message"])
+        # 人话表述与真源一致（汇报里"约 N 分钟""次日 HH:MM"由此派生）
+        self.assertIn(str(refine_loop.REFINE_DELAY_S // 60), report.refine_loop.delay_human())
+        self.assertRegex(refine_loop.fallback_hhmm(), r"^\d{2}:\d{2}$")
 
 
 class TestMatchGatedNoLinkResidue(unittest.TestCase):

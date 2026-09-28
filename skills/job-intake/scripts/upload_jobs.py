@@ -46,7 +46,7 @@ def main():
     existing = {r["fields"].get("job_id") for r in nt.list_records("job", biz_fields=["job_id"])} \
         if not args.dry_run else set()
 
-    rows, report = [], {"total": len(files), "parsed": 0, "skipped_dup": [],
+    rows, report = [], {"kind": "岗位", "total": len(files), "parsed": 0, "skipped_dup": [],
                         "needs_ocr": [], "failed": []}
     for fn in files:
         try:
@@ -128,15 +128,12 @@ def main():
     report["created"] = len(ids)
     report["readback_missing"] = [r["job_id"] for r in write_rows if r["job_id"] not in back]
     try:
-        # 精析队列计数（谓词真源 refine_loop）：>0 即事件驱动触发后台精析周期的信号
-        report["refine_queued"] = len(refine_loop.queue(nt, "job"))
-        if report["refine_queued"]:
-            # 队列非空 = 需注册消费任务；时刻由脚本算好，agent 原样填入 cron，不必再跑 date
-            report["refine_fire_at"] = refine_loop.fire_at()
+        # 精析队列计数与注册规格（谓词与规格唯一真源 refine_loop.trigger，与简历链共用同一函数）
+        refine_loop.trigger(nt, "job", report)
     except NotableError as e:
         print_report({**report, "error": "精析队列计数失败: %s" % e})
         sys.exit(1)
-    print_report(report)
+    print_report(report, created_rows=write_rows)
     sys.exit(1 if report["readback_missing"] else 0)
 
 

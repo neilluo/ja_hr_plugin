@@ -44,9 +44,11 @@ python3 skills/replicate/scripts/sync_schema.py --check           # 只读：报
 ```
 
 入库类命令（简历/岗位）stdout 首行是 `VERDICT:OK|WARN|BAD ...` 结论行，其后为 JSON 报告
-（`created / readback_missing / table_total / refine_queued` 等结果字段前置，`timing_ms` 垫底）。
-`readback_missing` 非空或带 `error` 即 BAD（exit 1）；`failed`/`needs_ocr` 非空为 WARN。
-报告格式唯一真源 `shared/report.py`（结论与字段顺序），文档只引用不复述。
+（`user_line / next_action` 成品指令与 `created / readback_missing / table_total / refine_queued / cron_job`
+等结果字段前置，`timing_ms` 垫底）。`readback_missing` 非空或带 `error` 即 BAD（exit 1）；`failed`/`needs_ocr` 非空为 WARN。
+报告格式唯一真源 `shared/report.py`（结论、字段顺序、`user_line`/`next_action`/`created_summary` 措辞），文档只引用不复述：
+`user_line` 是回复用户的原话、`next_action` 是下一步动作、`cron_job` 是精析消费任务的现成注册规格（agent 原样透传）。
+简历入库的 `<目录>` 参数也可直接传单个简历文件路径（脚本自动只处理它，无需建临时目录/软链）。
 `--dry-run` 只解析不触网写表。匹配链路的报告字段见各脚本 stdout。
 所有入口 stage 0 会跑环境预检（`shared/preflight/`，输出走 stderr），缺凭证/缺依赖直接失败。
 
