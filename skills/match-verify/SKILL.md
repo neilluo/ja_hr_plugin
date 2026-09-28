@@ -22,9 +22,10 @@ author:
 ```bash
 python3 skills/match-verify/scripts/match_gated.py            # 1 机械门槛（组织/学历/年限/证书/年龄）→ outputs/gate_pairs.json
 python3 skills/match-verify/scripts/match_analyze.py prepare  # 2 自动负载均衡：一岗一 agent 起，硬上限 20
-# → 按 meta.batches 一次性并发发 agent（≤20，不分波不串行），每个只给：
-#   提示词 skills/match-verify/references/match-subagent-prompt.md + 批次号 + part 路径
-#   part 路径必须是盘上真实存在的 pending 文件（禁止凭记忆写前缀/序号）；
+# → prepare 落分派清单 outputs/match_dispatch.json（{"batches":N,"parts":[真实 pending 路径…]}），
+#   meta.dispatch 指向它；按清单一次性并发发 agent（≤20，不分波不串行），每个只给：
+#   提示词 skills/match-verify/references/match-subagent-prompt.md + 批次号 + 清单里的 part 路径
+#   （禁止凭记忆手拼前缀/序号——路径一律复制自 match_dispatch.json）；
 #   done 文件名由 agent 从输入自派生（pending→done，N 不变），分派方不指定
 python3 skills/match-verify/scripts/match_analyze.py merge    # 3 合并判定（missing_batches 非空则补发该批）
 python3 skills/match-verify/scripts/match_analyze.py apply    # 4 只建 keep=true 的配对（幂等：先删该岗位旧的「系统匹配」记录，人工记录不动；写入 ai_analysis）
@@ -49,7 +50,7 @@ python3 skills/match-verify/scripts/match_analyze.py stats    # 5 单独一次�
 - **agent 数硬上限 20**（`shared/waves.py`，`MAX_AGENTS` 只能下调）：默认一岗一 agent，超过 20 才自动加大
   每 agent 的岗位数；一次性并发发完，**不分波、不串行**。三个环节（分析JD/分析简历/匹配）共用同一调度。
 - **不用分数阈值代替方向判断**：`MIN_SCORE=1` 实测会灌进 174 对跨方向噪声，调高又会漏人——
-  方向由子任务逐对判，阈值（match_gated 的 `MIN_SCORE` 环境变量，默认 20）只用于剔除零交集。
+  方向由子任务逐对判，阈值（`match_gated` 的 `MIN_SCORE` 环境变量，默认值以代码为准）只用于剔除零交集。
 - **写完必须另起一次读取**（stats 独立执行），同一脚本里回读会拿到索引前的旧值。
 
 - **智能匹配是三个触发点里的第三步**：先「智能分析JD」（门槛与技能词表已写好）→再「智能分析简历」

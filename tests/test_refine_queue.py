@@ -72,7 +72,7 @@ class FakeNT:
         self.rows = {"resume": resume or [], "job": job or []}
         self.calls = []
 
-    def list_records(self, table, flt=None, biz_fields=None, limit=0):
+    def list_records(self, table, flt=None, biz_fields=None):
         self.calls.append((table, tuple(biz_fields or ())))
         return [dict(r, fields=dict(r["fields"])) for r in self.rows.get(table, [])]
 
@@ -422,7 +422,7 @@ class _UploadNT(FakeNT):
         self.store = []          # [{"id","fields":业务键行}]
         self.created_rows = []
 
-    def list_records(self, table, flt=None, biz_fields=None, limit=0):
+    def list_records(self, table, flt=None, biz_fields=None):
         return [dict(r, fields=dict(r["fields"])) for r in self.store]
 
     def map_parallel(self, fn, items, workers=5):

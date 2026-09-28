@@ -119,6 +119,54 @@ def score(cand, jf):
     return sk, bo, tot, rec, ev
 
 
+def _match_row(cf, jf, scores, source=SYS_SOURCE):
+    """match 表一行的唯一组装点（不变量 10）。
+
+    两条写表链路共用：stage_commit（机械打分直连兜底）与 match_analyze.apply_
+    （subagent 判定）。cf = 简历表 fields，jf = 岗位表 fields，
+    scores = 打分产物 dict（name/skill_score/bonus_score/total_score/recommend/evidence，
+    可带 ai_analysis）；缺推荐值时兜底 REJ_LABEL（唯一派生自 config.options.match.recommend，
+    禁止在此写"不推荐"字面量）。source 是写入值，选项真源 config.options.match.source。"""
+    return {"job_id": jf.get("job_id"), "name": scores.get("name"), "phone": cf.get("phone"),
+            "job_name": jf.get("job_name"), "org": jf.get("org"),
+            "source": source, "cand_skills": "、".join(toks(cf.get("skills"))),
+            "must_skills": txt(jf.get("must_skills")), "bonus_skills": txt(jf.get("bonus_skills")),
+            "hard_gates": txt(jf.get("hard_gates")),
+            "expected_position": cf.get("expected_position"),
+            "years_experience": str(cf.get("years_experience") or "无"),
+            "skill_score": int(scores.get("skill_score") or 0),
+            "bonus_score": int(scores.get("bonus_score") or 0),
+            "total_score": int(scores.get("total_score") or 0),
+            "recommend": scores.get("recommend") or REJ_LABEL,
+            "evidence": scores.get("evidence") or "",
+            "ai_analysis": scores.get("ai_analysis") or "",
+            "update_time": int(time.time() * 1000)}
+
+
+def refresh_job_stats(nt):
+    """岗位四项统计刷新的唯一实现（stage_stats 与 match_analyze.stats 共用）。
+
+    位次派生自 config.options.match.recommend 顺序（推荐→1 待定→2 不推荐→3）。
+    返回 (match 行数, 刷新的岗位数, recommend 分布 Counter)。"""
+    rows = nt.list_records("match", biz_fields=["job_id", "recommend"])
+    rec_idx = {r: i + 1 for i, r in enumerate(_RECOMMEND)}
+    st = collections.defaultdict(lambda: [0, 0, 0, 0])
+    for r in rows:
+        f = r["fields"]
+        s = st[f.get("job_id")]
+        s[0] += 1
+        s[rec_idx.get(f.get("recommend"), len(_RECOMMEND))] += 1
+    jobs = nt.list_records("job", biz_fields=["job_id"])
+    upd = []
+    for j in jobs:
+        v = st.get(j["fields"].get("job_id"), [0, 0, 0, 0])
+        upd.append({"id": j["id"], "stat_total": v[0], "stat_recommend": v[1],
+                    "stat_pending": v[2], "stat_reject": v[3]})
+    nt.update_records("job", upd)
+    dist = collections.Counter(r["fields"].get("recommend") for r in rows)
+    return len(rows), len(upd), dist
+
+
 def _refuse(reason, **extra):
     """门禁拒绝：打印 JSON 原因并 exit 2。"""
     print(json.dumps({"refused": True, "reason": reason, **extra}, ensure_ascii=False))
@@ -204,40 +252,19 @@ def stage_commit(nt):
         if not jf or not cf:
             continue
         sk, bo, tot, rec, ev = score({"skills": toks(cf.get("skills"))}, jf["fields"])
-        rows.append({"job_id": p["job_id"], "name": p["name"], "phone": cf.get("phone"),
-                     "job_name": jf["fields"].get("job_name"), "org": jf["fields"].get("org"),
-                     # 写入值，选项真源 config.options.match.source
-                     "source": SYS_SOURCE, "cand_skills": "、".join(toks(cf.get("skills"))),
-                     "must_skills": jf["fields"].get("must_skills"),
-                     "bonus_skills": jf["fields"].get("bonus_skills"),
-                     "hard_gates": txt(jf["fields"].get("hard_gates")),
-                     "expected_position": cf.get("expected_position"),
-                     "years_experience": str(cf.get("years_experience") or "无"),
-                     "skill_score": sk, "bonus_score": bo, "total_score": tot,
-                     "recommend": rec, "evidence": ev, "update_time": int(time.time() * 1000)})
+        # 行组装唯一真源 _match_row（与 match_analyze.apply_ 共用）
+        rows.append(_match_row(cf, jf["fields"],
+                               {"name": p["name"], "skill_score": sk, "bonus_score": bo,
+                                "total_score": tot, "recommend": rec, "evidence": ev}))
     nt.create_records("match", rows)
     print(json.dumps({"created": len(rows), "deleted_old": len(olds)},
                      ensure_ascii=False))
 
 
 def stage_stats(nt):
-    rows = nt.list_records("match", biz_fields=["job_id", "recommend"])
-    # 统计位次派生自 config.options.match.recommend 顺序（推荐→1 待定→2 不推荐→3）
-    rec_idx = {r: i + 1 for i, r in enumerate(_RECOMMEND)}
-    st = collections.defaultdict(lambda: [0, 0, 0, 0])
-    for r in rows:
-        f = r["fields"]
-        s = st[f.get("job_id")]
-        s[0] += 1
-        s[rec_idx.get(f.get("recommend"), len(_RECOMMEND))] += 1
-    jobs = nt.list_records("job", biz_fields=["job_id"])
-    upd = []
-    for j in jobs:
-        v = st.get(j["fields"].get("job_id"), [0, 0, 0, 0])
-        upd.append({"id": j["id"], "stat_total": v[0], "stat_recommend": v[1],
-                    "stat_pending": v[2], "stat_reject": v[3]})
-    nt.update_records("job", upd)
-    print(json.dumps({"match_rows": len(rows), "jobs_updated": len(upd)}, ensure_ascii=False))
+    # 统计唯一实现 refresh_job_stats（与 match_analyze.stats 共用）
+    n_rows, n_jobs, _dist = refresh_job_stats(nt)
+    print(json.dumps({"match_rows": n_rows, "jobs_updated": n_jobs}, ensure_ascii=False))
 
 
 def main():

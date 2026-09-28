@@ -73,7 +73,7 @@
       `semantic_score.py`（SYNONYM/HYPERS）；简历支持扩展名唯一真源 = `shared/extract.py`（SUPPORTED_EXTS）。
     - 匹配阈值/MIN_SCORE 等标量提为**唯一具名常量**（match_gated.REC_MIN/PEND_MIN），文档与 prompt 只引用不复述。
     - date 列显示格式（钉钉字段 property.formatter）唯一真源 = `config.formats.date`：建表（replicate_base）/
-      补列（sync_schema）经 `skills/replicate/scripts/datefmt.py` 派生 property，真表存量列经 datefmt.align 对齐；
+      补列（sync_schema）经 `skills/replicate/scripts/datefmt.py` 派生 property；
       存储值恒为毫秒时间戳（notable._cast），formatter 只管显示；脚本禁止抄 formatter 字面量（元测试防复活）。
     - 入库报告（stdout 首行 VERDICT 结论 + JSON 结果字段前置顺序）唯一真源 = `shared/report.py`
       （print_report/verdict/_KEY_ORDER/enrich）：upload_resumes/upload_jobs 一律经它输出，禁止各自
@@ -87,6 +87,10 @@
     - 文档（README/recruit-model/SKILL）不得手抄 base_id/table_id/完整字段清单/技能词表，一律指向真源。
     - 例外：写入值字面量（如 source="系统匹配"、status="招聘中"）、解析私有规则（_DEPT_ALIAS 别名、
       分类→关键词映射）、安全白名单（sync_job_columns.KEYS）属单一出现，不算双源，但须注释指向 config 真源。
+    - 例外（subagent prompt 镜像）：subagent 提示词无法 import Python 常量，凡其运行时必须自带的判定值
+      （match-subagent-prompt 的阈值 80/60、语义词典 SYNONYM/HYPERS 示例）以"代码是主、本段仅镜像"形式复述，
+      且必须在同段注明唯一真源（match_gated.REC_MIN/PEND_MIN、semantic_score）与"改代码须同步镜像"纪律；
+      有 per-batch 渲染器的链（skills_analyze.render_prompts）则用占位符从常量注入、不留镜像数字。
     - 每次新增枚举/阈值：先落唯一真源，再让消费方派生；同一提交内 grep 确认无第二份副本，unittest 全绿。
 11. 精析异步队列三层闭环（触发/出队/并发防护），禁止加第四层：
     - 触发 = 上传后 agent 注册一次性消费任务，**注册规格由脚本产出、agent 只透传**：

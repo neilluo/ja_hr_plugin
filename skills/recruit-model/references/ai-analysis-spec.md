@@ -36,16 +36,12 @@ total_score = skill_score + bonus_score
 
 ## 推荐阈值
 
-| total_score | recommend |
-|---|---|
-| ≥ 80 | 推荐 |
-| 60–79 | 待定 |
-| < 60 | 不推荐 |
-
-阈值常量在 `match_gated.py` 的 `REC_MIN` / `PEND_MIN`；三个状态标签按顺序派生自
+推荐/待定/不推荐的分数阈值唯一真源是 `match_gated.py` 的 `REC_MIN` / `PEND_MIN`，
+本文档与 prompt 只引用不复述数值；三个状态标签按顺序派生自
 `config.json options.match.recommend`，不在代码里另抄一份。
 
-落库门槛：`total_score ≥ MIN_SCORE`（**环境变量**，默认 20）。门槛过了但技能几乎无交集的
+落库门槛：`total_score ≥ MIN_SCORE`（**环境变量**，默认值以 `match_gated.py` 代码为准）。
+门槛过了但技能几乎无交集的
 人-岗不建废配对；方向对不对由 subagent 的 keep 判定，不靠调阈值。
 
 ## 证据格式（evidence 字段）

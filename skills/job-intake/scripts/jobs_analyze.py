@@ -42,7 +42,7 @@ def prepare(args):
     # sync_job_columns 写回时释放。同周期重切批 --force 夺回自有租约。
     force = "--force" in args
     args = [a for a in args if a != "--force"]
-    if refine_loop.acquire_lock(OUTDIR, "job", stale_after=1800, force=force) is None:
+    if refine_loop.acquire_lock(OUTDIR, "job", force=force) is None:
         print(json.dumps({"refused": True,
                           "reason": "另一精析周期持锁中（outputs/refine_job.lock 租约未过期）：本轮跳过避免并发双写；"
                                     "确属本周期重切批则加 --force"}))
@@ -71,12 +71,19 @@ def prepare(args):
                       "responsibilities": txt(f.get("responsibilities"))[:4000],
                       "requirements": txt(f.get("requirements"))[:4000]})
     batch = int(args[args.index("--batch") + 1]) if "--batch" in args else None
-    ap.write_parts(OUTDIR, PREFIX, items,
-                   {"total": len(items), "queued": sum(1 for r in rows if r["id"] in queued_ids)},
-                   batch)
+    meta = ap.write_parts(OUTDIR, PREFIX, items,
+                          {"total": len(items), "queued": sum(1 for r in rows if r["id"] in queued_ids)},
+                          batch)
     if not items:
         # 切出 0 条 = 队列已被并发周期吃空，sync_job_columns 永远不会来释放，此处即时释放租约
         refine_loop.release_lock(refine_loop.lock_path(OUTDIR, "job"))
+    elif meta["batches"]:
+        # 分派清单落盘：agent 复制真实 pending 路径指针分派，不再凭记忆手拼 *_pending_part<N>.json
+        # （清单形态唯一真源 = shared/analyze_parts.write_dispatch，与 match_analyze 同机制；
+        # stdout 仍只留 write_parts 打的单行 meta）
+        meta["dispatch"] = ap.write_dispatch(OUTDIR, PREFIX, meta["batches"])
+        json.dump(meta, open(ap.meta_path(OUTDIR, PREFIX), "w", encoding="utf-8"))
+    return meta
 
 
 def merge(args):

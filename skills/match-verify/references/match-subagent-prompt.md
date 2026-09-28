@@ -30,6 +30,10 @@ total_score  = skill_score + bonus_score
 recommend    = total>=80 推荐 / 60-79 待定 / <60 不推荐
 ```
 
+上面的阈值 80/60 是**镜像**（代码是主）：唯一真源 = `skills/match-verify/scripts/match_gated.py`
+的 `REC_MIN=80` / `PEND_MIN=60`，三值标签真源 = `config.options.match.recommend`。
+改阈值只改代码，并同步本段镜像数字（与上文 SYNONYM/HYPERS 镜像 semantic_score 同纪律）。
+
 **"部分覆盖"要如实计分**：候选人用别的证据体现了该项能力（如用"年降本1400万"证明成本管控），
 可以给该项命中，但必须在 evidence 里写清依据；没有依据不得送分。
 

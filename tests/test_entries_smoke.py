@@ -191,7 +191,7 @@ class TestSyncAiColumnsThinWrapper(unittest.TestCase):
                       open(pj, "w", encoding="utf-8"), ensure_ascii=False)
 
             class FakeNT:
-                def list_records(self, table, flt=None, biz_fields=None, limit=0):
+                def list_records(self, table, flt=None, biz_fields=None):
                     return [{"id": "r1", "fields": {"name": "张三", "phone": "13800000000"}}]
 
             sync_ai_columns.Notable = lambda *a, **k: FakeNT()

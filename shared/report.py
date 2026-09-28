@@ -13,8 +13,31 @@
 """
 
 import json
+import time
 
 import refine_loop   # 同目录 shared/：延迟与兜底时刻的人话表述由其唯一真源派生，禁止此处手抄
+
+
+class Chrono:
+    """阶段计时器：mark(name) 记录自上次 mark 起的毫秒增量并按 name 累加。
+
+    报告 timing_ms 字段唯一生产者。分段名在批量/补录两模式间保持一致以便横向比对：
+    list_existing / extract(仅批量) / build_rows / attach / create / readback / total。
+    纯本地 monotonic 计时，不触网、不改变任何业务行为。"""
+
+    def __init__(self):
+        self._start = self._last = time.monotonic()
+        self.segs = {}
+
+    def mark(self, name):
+        now = time.monotonic()
+        self.segs[name] = self.segs.get(name, 0) + round((now - self._last) * 1000)
+        self._last = now
+
+    def finish(self):
+        # total = 自构造起墙钟耗时（非末段残差）；各分段之和 ≈ total（含未打标间隙）
+        self.segs["total"] = round((time.monotonic() - self._start) * 1000)
+        return self.segs
 
 # 结果字段展示顺序：给 agent 的行动指令与判成败字段在最前，性能诊断字段 timing_ms 垫底。
 # 未列出的键按原插入顺序追加在 error 之后、timing_ms 之前，保证不丢字段。

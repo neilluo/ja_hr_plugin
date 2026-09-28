@@ -151,7 +151,7 @@ class _MiniNT:
     def __init__(self, rows):
         self._rows = rows
 
-    def list_records(self, table, flt=None, biz_fields=None, limit=0):
+    def list_records(self, table, flt=None, biz_fields=None):
         return self._rows
 
 

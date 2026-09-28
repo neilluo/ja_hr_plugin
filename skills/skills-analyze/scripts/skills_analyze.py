@@ -53,6 +53,8 @@ DONE_TEXT_MAX = 200      # ai_structured / ai_deep 上限（字符）
 DONE_SKILLS_RANGE = (5, 12)
 DONE_SKILL_LEN_MAX = 12  # 任意标签总字符 ≤ 12
 DONE_SKILL_ZH_RANGE = (2, 6)   # 含中文字符时，中文字数 ∈ [2, 6]；纯英文/缩写不限
+# 上述常量同时经 render_prompts 注入提示词模板（<SKILLS_RANGE>/<SKILL_ZH_RANGE>/<TEXT_MAX>/
+# <SEGS_N>/<SEG_i> 占位符）：模板禁止手抄数值与段名，改口径只改这里一处（不变量 10）。
 
 
 def validate_row(r):
@@ -114,6 +116,18 @@ def render_prompts(n_batches, vocab_path):
     """
     with open(PROMPT_TPL, encoding="utf-8") as f:
         tpl = f.read()
+    # schema 数值/段名/校正字段名从唯一真源注入模板（不变量 10）：
+    # DONE_* 在本文件，CORRECTIONS 在同 skill 的 skills_apply.py，模板只留占位符。
+    from skills_apply import CORRECTIONS   # 延迟 import：render 才需要，避免模块加载环
+    subs = {"<SKILLS_RANGE>": "%d-%d" % DONE_SKILLS_RANGE,
+            "<SKILL_ZH_RANGE>": "%d-%d" % DONE_SKILL_ZH_RANGE,
+            "<TEXT_MAX>": str(DONE_TEXT_MAX),
+            "<SEGS_N>": str(len(DONE_STRUCTURED_SEGS)),
+            "<CORR_N>": str(len(CORRECTIONS))}
+    for i, seg in enumerate(DONE_STRUCTURED_SEGS, 1):
+        subs["<SEG_%d>" % i] = seg
+    for i, k in enumerate(CORRECTIONS, 1):
+        subs["<CORR_%d>" % i] = k
     # 清旧 prompt 文件：write_parts 只清 pending/done，prompt 是本函数产物须自清，
     # 否则上轮大批次（如 16）残留的 prompt_part15/16.md 会在小批次（如 2）轮里成僵尸文件。
     for old in os.listdir(OUTDIR):
@@ -123,8 +137,10 @@ def render_prompts(n_batches, vocab_path):
     for i in range(1, n_batches + 1):
         pend = ap.pending_path(OUTDIR, PREFIX, i)   # 路径经公共骨架派生，禁止本地抄 parts 命名
         body = (tpl.replace("<BATCH_PATH>", pend)
-                   .replace("<VOCAB_PATH>", vocab_path)
-                   .replace("<N>", str(i)))
+                   .replace("<VOCAB_PATH>", vocab_path))
+        for ph, val in subs.items():
+            body = body.replace(ph, val)
+        body = body.replace("<N>", str(i))   # <N> 最后替换：防其他占位符名里含 "<N" 子串误伤
         out = os.path.join(OUTDIR, "%s_prompt_part%d.md" % (PREFIX, i))
         with open(out, "w", encoding="utf-8") as f:
             f.write(body)
@@ -185,13 +201,13 @@ def prepare(args):
     # 同周期内重新切批（改 --batch/--since）用 --force 夺回自有租约。
     force = "--force" in args
     args = [a for a in args if a != "--force"]
-    if refine_loop.acquire_lock(OUTDIR, "resume", stale_after=1800, force=force) is None:
+    if refine_loop.acquire_lock(OUTDIR, "resume", force=force) is None:
         print(json.dumps({"refused": True,
                           "reason": "另一精析周期持锁中（outputs/refine_resume.lock 租约未过期）：本轮跳过避免并发双写；"
                                     "确属本周期重切批则加 --force"}))
         sys.exit(2)
     nt = Notable()
-    since, all_mode = None, False   # 不传 --batch 时自动铺满 agent
+    since = None   # 不传 --batch 时自动铺满 agent
     ids_file = None
     if "--since" in args:
         since = int(args[args.index("--since") + 1])

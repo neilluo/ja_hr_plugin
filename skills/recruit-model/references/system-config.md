@@ -6,7 +6,7 @@
 **base_id、每表 table_id 与表名一律见 `config.json` 的 `base_id` / `tables`**，文档不手抄
 （换 Base 只改 config，抄进文档的 id 会立刻变成谎报）。
 
-config.json 是表结构唯一事实源，存：`base_name` / `base_id` / `operator_id` /
+config.json 是表结构唯一事实源，存：`base_id` / `operator_id` /
 `tables`（业务键→table_id+表名）/ `fields`（业务键→中文字段名，书写顺序=建表顺序）/
 `types`（字段类型）/ `options`（单选、多选选项清单）。建表
 （`skills/replicate/scripts/replicate_base.py`）与补列（`sync_schema.py`）都从 config 派生，

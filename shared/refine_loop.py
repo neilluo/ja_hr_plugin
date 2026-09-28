@@ -24,7 +24,7 @@ match_gated 前置门禁经 queue_counts() 判断：队列非空 → exit 2 拒�
 
 周期租约（防并发双写）：prepare 获取 outputs/refine_<chain>.lock（resume/job 两链各自独立、
 可并行），写回端（skills_apply / sync_job_columns）完成后释放；租约跨进程存活（prepare 进程即退，
-PID 无法判活，故以 mtime 新鲜度为凭），30 分钟内视为有周期在跑、后来者 exit 2 秒退。
+PID 无法判活，故以 mtime 新鲜度为凭），STALE_AFTER_S（30 分钟）内视为有周期在跑、后来者 exit 2 秒退。
 崩溃遗留的租约随过期自然失效，队列项由下一周期（新即时任务/每日兜底巡检）重吃；
 prepare 切出 0 条时即时自释（并发周期已吃空，不留僵尸租约）。
 --force = 夺回自有租约（同周期内重切批用）。
@@ -46,6 +46,11 @@ TABLES = ("resume", "job")
 # 曾取 45s，单份小文件秒回时窗口被 agent 往返吃光，注册被"Scheduled time must be in the future"
 # 拒收，反要多花 3 个回合重算时刻。代价（三列晚几分钟填好）对不阻塞人的异步链路是免费的。
 REFINE_DELAY_S = 180
+
+# 周期租约判活窗口（秒，唯一真源）：锁 mtime 在此窗口内视为有周期在跑（30 分钟）。
+# 消费方（skills_analyze/jobs_analyze 的 prepare）一律用 acquire_lock 默认值，禁止再显式传
+# stale_after 抄第二份字面量（不变量 10）；文档只写"30 分钟"人话并指向本常量。
+STALE_AFTER_S = 1800
 
 # 一次性消费任务名前缀 / 每日兜底任务名（唯一真源）：兜底 cron 的自清理按前缀匹配已消费完的
 # 一次性任务，前缀与兜底规格在此定义一次、由本文件 CLI 产出，禁止在 cron payload 里手抄副本。
@@ -234,7 +239,7 @@ def lock_path(outdir, chain="resume"):
     return os.path.join(outdir, "refine_%s.lock" % chain)
 
 
-def acquire_lock(outdir, chain="resume", stale_after=1800, force=False):
+def acquire_lock(outdir, chain="resume", stale_after=STALE_AFTER_S, force=False):
     """周期租约：防同一条精析链被两个周期并发双写。返回锁路径或 None（租约被活周期占用）。
 
     force=True：夺回租约（同周期内重新 prepare 切批时用，覆盖锁文件刷新租约）。"""

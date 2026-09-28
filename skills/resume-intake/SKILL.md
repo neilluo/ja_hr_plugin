@@ -39,11 +39,11 @@ python3 skills/resume-intake/scripts/upload_resumes.py <目录> --dry-run  # 预
 | `user_line` | **交付用户的原话**：一句话中文结论（含新增数/表内总数/精析入队与兜底时刻）。原样复述即结束，禁止再写长汇报 |
 | `next_action` | **agent 下一步动作清单**（机器产出）：如"把 cron_job 原样注册""补录扫描件""重跑同目录"。照它做，不要自己发挥 |
 | `cron_job` | 仅 `refine_queued > 0` 时输出：一次性精析消费任务的**完整注册规格**（name/at/message/contextDirs 都已备好）。**原样传给定时任务工具**，禁止改写其中任何字段、禁止手写 payload |
-| `created_summary` | 本次入库记录的关键字段回带（姓名/手机号/期望职位等，最多 5 条+溢出计数）：用户问"传进去的是谁"直接引用，**禁止再跑 `query.py` 复核** |
+| `created_summary` | 本次入库记录的关键字段回带（姓名/手机号/期望职位等，条数上限见 `report.SUMMARY_MAX`，溢出带计数）：用户问"传进去的是谁"直接引用，**禁止再跑 `query.py` 复核** |
 | `created` / `readback_missing` | missing 非空 = 失败，重跑同目录即可（幂等） |
 | `skipped_dup` | 正常：MD5 或手机号已存在，向用户说明即可 |
 | `failed` | 看 error 文本；附件类错误重跑可恢复 |
-| `needs_ocr` | 扫描件/图片，按下节补录 |
+| `needs_ocr` | 扫描件/图片的**原件绝对路径**，按下节补录（读图与 `_file` 直接用它，禁止手拼目录+文件名） |
 | `table_total` | 表内记录总数（回读那趟全表扫描顺带得出）：`user_line` 已引用，不必单独复述 |
 | `refine_queued` | 当前待精析队列长度：精析异步进行，**不要在上传回合里跑精析** |
 | `refine_fire_at` | 仅 `refine_queued > 0` 时输出：`cron_job.schedule.at` 的同一时刻，供人工核对；注册一律走 `cron_job`，不必单独取它 |
@@ -76,7 +76,8 @@ python3 skills/resume-intake/scripts/upload_resumes.py <目录> --dry-run  # 预
 
 ## 扫描件补录（agent 只抽基础字段，三列交后台读图精析）
 
-1. 用视觉能力读取 `needs_ocr` 里的每个文件（Read 工具直接看图/扫描 PDF，多页逐页读）。
+1. 用视觉能力读取 `needs_ocr` 里的每个文件（报告给出的是**原件绝对路径**，直接 `Read` 该路径看图/扫描
+   PDF，多页逐页读；禁止自己拼目录+文件名）。
 2. 只抽**基础字段**——姓名、手机号、邮箱、学历、院校、专业、工作年限、期望职位等入库与去重所需。
    **派生列不用填**：`category`（简历库分类）/`school_rank`（院校排名）/`expected_location`（空缺时
    落兜底枚举）由脚本按与批量 `parse()` **同一批函数**（`parse_resume.derive`）补齐，agent 已给出的值
@@ -93,7 +94,8 @@ python3 skills/resume-intake/scripts/upload_resumes.py <目录> --dry-run  # 预
 ]
 ```
 
-`_file` 必须是**原件绝对路径**：脚本把它写进「原件本地路径」列（业务键 `source_file`），
+`_file` 必须是**原件绝对路径**：`needs_ocr` 报告的正是该路径，**原样填入即可**（脚本已算好，
+禁止另行拼路径）。脚本把它写进「原件本地路径」列（业务键 `source_file`），
 这是扫描件入精析队列的唯一凭证——它没有 `full_text`，后台 subagent 靠这个路径直接读图。
 表里的附件 url 是 OSS 签名链（约 2 小时过期、无换签接口），不能当精析依据，故必须存本地路径。
 
@@ -168,8 +170,8 @@ agent 的动作退化为一步：**把 `cron_job` 原样传给定时任务工具
 
 ## 边界
 
-- 支持的文件类型以 `shared/extract.py` 的 `SUPPORTED_EXTS` 为唯一源：pdf/doc/docx/txt/md +
-  png/jpg/jpeg/bmp/gif/webp/tif/tiff；图片与抽不出文本/联系方式的一律进 `needs_ocr`，其余格式忽略不扫。
+- 支持的文件类型以 `shared/extract.py` 的 `SUPPORTED_EXTS` 为唯一源（清单不在此复述）；
+  图片与抽不出文本/联系方式的一律进 `needs_ocr`，其余格式忽略不扫。
 - 单目录可重复跑：MD5+手机号双重去重，不会写重复记录。
 - 字段口径见 README「表结构」；枚举值（学历/分类/沟通状态）服务端自动补建选项。
 - 入库脚本的正则字段提取有已知偏差（姓名/院校可能吃进标签、期望职位带"应聘企业/期望工资"尾巴、
