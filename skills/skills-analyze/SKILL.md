@@ -20,8 +20,11 @@ author:
 `skills/resume-intake/SKILL.md`；提示词唯一源 = `references/subagent-prompt.md`）。
 队列谓词唯一真源 `shared/refine_loop.py`（此处不复述条件）。被触发后**全自动执行，不分步等用户确认**：
 查队列 → 切分 → 同一消息内并发 subagent → 合并 → 写回（含出队标记）→ 回读校验。
-三列（技能标签 / AI结构化提取 / AI深度解析）**必须由 subagent 读简历全文推理得出**，
-脚本的正则词表命中不算结果；表内这两列是普通文本列，平台不会自动算。
+三列（技能标签 / AI结构化提取 / AI深度解析）+ 基础字段校正（name/major/school/certificates/
+years_experience/expected_position，subagent 读全文校正正则粗值，null 不覆盖表内已有值）
+**必须由 subagent 读简历全文推理得出**，
+脚本的正则词表命中不算结果；表内这些列是普通文本列，平台不会自动算。
+校正字段的产出口径唯一源 = `references/subagent-prompt.md`（此处不复述）。
 
 ## 流水线（6 步，一步接一步）
 
@@ -85,7 +88,7 @@ python3 skills/skills-analyze/scripts/skills_analyze.py merge
 python3 skills/skills-analyze/scripts/skills_apply.py outputs/skills_done.json
 ```
 
-自动做：技能标签选项扩展 → **逐条**更新三列 + `ai_refined_at`（同一次 update，出队凭证）→ 输出
+自动做：技能标签选项扩展 → **逐条**更新三列 + 基础字段校正（非 null 才写，null 不覆盖）+ `ai_refined_at`（同一次 update，出队凭证）→ 输出
 `{"input,updated,options_added,bad,failed"}`。遇到 `the option 'X' is invalid` 会自动剔掉该词重试，
 所以 subagent 偶发新词不会阻断写回（该词被丢弃，可在报告 `failed` 为空时视为正常）。
 写失败的条目不打标记 → 仍在队列 → 下一周期重试。
@@ -132,6 +135,9 @@ python3 skills/skills-analyze/scripts/skills_apply.py outputs/skills_done.json -
 - 技能标签是 multipleSelect：`skills_apply.py` 写回前自动扩选项，**已有选项必须带 id 回传**。
 - 三列无条件逐人精析：**不按硬门槛筛人**——简历库是人才池，不达标者照样分析、照样保留，
   是否进匹配表由「智能匹配」的门槛判定决定。
+- 基础字段校正只在 subagent 读到原件真实载明值时给出，`null` 一律不覆盖表内已有值
+  （口径唯一源 references/subagent-prompt.md）；这是正则粗值偏差的异步回补层，
+  发现明显错误想立即修也可走 sync_ai_columns 手工通道。
 - 路径固定为本套件 `skills/skills-analyze/scripts/`，不要照抄其他机器的绝对路径；Windows 用 `py -X utf8`（`python` 别名会静默失败）。
 - ai_extract / ai_deep 是文本列，无需选项扩展。
 - 零散手工修正（不经队列）仍走 `sync_ai_columns.py payload.json`（手工修正薄通道，实现委托 skills_apply.apply_rows，不打 ai_refined_at）。

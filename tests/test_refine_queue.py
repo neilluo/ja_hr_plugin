@@ -356,11 +356,43 @@ class TestSkillsApplyStamp(unittest.TestCase):
         self.assertEqual(rep["updated"], 0)
         self.assertEqual([b["id"] for b in rep["bad"]], ["r5"])
 
-    def test_years_backfill_untouched(self):
-        # 年限回填正则保留：ai_extract「工作经验｜N年」回填 years_experience
+    def test_years_regex_backfill_removed(self):
+        # 年限回填正则已删（B 层改造）：ai_extract「工作经验｜N年」不再回填 years_experience，
+        # 年限只认 done 记录里 subagent 直接给出的校正字段
         nt, _, _ = self._apply([{"id": "r2", "skills": [], "ai_extract": "工作经验｜7年",
                                  "ai_deep": "d"}])
-        self.assertEqual(nt.updated[0].get("years_experience"), 7)
+        self.assertNotIn("years_experience", nt.updated[0])
+
+    def test_correction_fields_written_when_not_null(self):
+        # B 层：done 记录里 6 个校正字段非 null 即随三列同一次 update 写入（业务键=config.fields）
+        nt, rep, _ = self._apply([{
+            "id": "r2", "skills": ["PLC"], "ai_extract": "工作经验｜4年", "ai_deep": "d",
+            "name": "林之府", "major": "电气自动化技术", "school": "昆明冶金高等专科学校",
+            "certificates": "低压电工证、特种作业操作证", "years_experience": 4,
+            "expected_position": "设备工程师、自动化工程师",
+        }])
+        self.assertEqual(rep["updated"], 1)
+        row = nt.updated[0]
+        self.assertEqual(row["name"], "林之府")
+        self.assertEqual(row["major"], "电气自动化技术")
+        self.assertEqual(row["school"], "昆明冶金高等专科学校")
+        self.assertEqual(row["certificates"], "低压电工证、特种作业操作证")
+        self.assertEqual(row["years_experience"], 4)
+        self.assertEqual(row["expected_position"], "设备工程师、自动化工程师")
+        # 类型转换走 config.types：years_experience=number（_cast 转 float 写出）
+        self.assertEqual(Notable._cast(row["years_experience"], "number"), 4.0)
+
+    def test_correction_fields_null_not_written(self):
+        # null=未载明/不确定 → 不进 update 载荷（_cells 亦会跳过空值），不覆盖表内已有值
+        nt, _, _ = self._apply([{
+            "id": "r2", "skills": [], "ai_extract": "e", "ai_deep": "d",
+            "name": None, "major": None, "school": None, "certificates": None,
+            "years_experience": None, "expected_position": None,
+        }])
+        row = nt.updated[0]
+        for k in ("name", "major", "school", "certificates", "years_experience",
+                  "expected_position"):
+            self.assertNotIn(k, row)
 
 
 class _UploadNT(FakeNT):

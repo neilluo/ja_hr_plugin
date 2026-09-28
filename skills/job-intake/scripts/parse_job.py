@@ -26,8 +26,11 @@ _SEC_PATTERNS = {
     "responsibilities": r"(岗位职责|工作职责|主要工作职责|工作内容|Major responsibilities)",
     "requirements": r"(任职要求|资格条件|任职资格|岗位要求|Qualifications)",
 }
+# 起草/Draft/审核/批准 是正文高频动词，仅在行首表单字段形态（词+冒号）才作为段末停止词；
+# Python 3.11+ 禁止 pattern 中段的全局 (?m)，故用作用域内联组 (?m:...)。
 _SEC_END_RE = re.compile(
-    r"(关键绩效指标|KPI|起草|Draft|审核|批准|工作地点|职位名称|职等|直接上司|下属)")
+    r"(关键绩效指标|KPI|工作地点|职位名称|职等|直接上司|下属)"
+    r"|(?m:^\s*(?:起草|Draft|审核|批准)\s*[:：])")
 _GATE_RE = re.compile(
     r"[^\n。；;]*(?:学历|大专|本科|硕士|博士|年及以上|年以上|证书|电工证|注册)[^\n。；;]*")
 
@@ -105,8 +108,9 @@ def parse(text, filename=""):
         g = m.strip(" 、，,：:")
         if g and g not in gates:
             gates.append(g)
-    loc = _CITY_RE.findall(text)
-    work_location = sorted(set(loc), key=loc.index) if loc else ["曲靖"]
+    # 正文无城市时回退扫文件名（如"曲靖制造基地"）；两处都无信号则留空，不盲目兜底。
+    loc = _CITY_RE.findall(text) or _CITY_RE.findall(os.path.splitext(filename or "")[0])
+    work_location = sorted(set(loc), key=loc.index) if loc else []
     return {
         "job_name": job_name, "department": dept, "org": org, "status": "招聘中",
         "work_location": work_location, "responsibilities": resp[:3000],

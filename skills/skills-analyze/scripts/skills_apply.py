@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
-"""skills_apply.py — 把子任务产出的三列结果写回简历库（自动扩选项 + 回读校验）
+"""skills_apply.py — 把子任务产出的三列 + 基础字段校正结果写回简历库（自动扩选项 + 回读校验）
 
     python3 skills/skills-analyze/scripts/skills_apply.py outputs/skills_done.json          # 扩展选项 + 批量更新
     python3 skills/skills-analyze/scripts/skills_apply.py outputs/skills_done.json --verify # 单独一次读取做回读校验
 
 字段名映射（本机表结构）：skills→技能标签，ai_structured→AI结构化提取，ai_deep→AI深度解析。
+基础字段校正（CORRECTIONS）：subagent 读全文给出的 name/major/school/certificates/years_experience/
+expected_position，非 null 即写（null=未载明，不覆盖）；口径唯一源 references/subagent-prompt.md。
 每条记录在三列的同一次 update 里打 ai_refined_at 标记（毫秒时间戳）——它是精析队列出队的
 唯一凭证（谓词真源 shared/refine_loop.py，此处不复述条件）。
 写回（非 --verify）完成后释放 resume 链周期租约（prepare 获取，见 shared/refine_loop.py）。
@@ -17,6 +19,10 @@ sys.path.insert(0, os.path.join(ROOT, "shared"))
 os.chdir(ROOT)
 from notable import Notable, NotableError  # noqa: E402
 import refine_loop  # noqa: E402  周期锁释放方（prepare 获取、apply 释放，见 shared/refine_loop.py）
+
+# 基础字段校正（业务键=config.fields 真源，写入值经 Notable._cast 按 config.types 转换：
+# years_experience 是 number，其余 text）。产出规则唯一源 references/subagent-prompt.md「基础字段校正」。
+CORRECTIONS = ("name", "major", "school", "certificates", "years_experience", "expected_position")
 
 
 def top_up_options(nt, want):
@@ -42,7 +48,8 @@ def apply_rows(nt, rows, stamp=True, require_three=True):
     """三列写回的可复用写函数（唯一实现，sync_ai_columns 亦委托此函数）。
 
     rows: [{"id":..., "skills":[...], "ai_extract"(或"ai_structured")/extract:..., "ai_deep"(或deep):...}]
-    stamp=True（精析流水线）：固定写三列并打 ai_refined_at 出队标记（与三列同一次 update）；
+    stamp=True（精析流水线）：固定写三列并打 ai_refined_at 出队标记（与三列同一次 update），
+    另写 subagent 基础字段校正（CORRECTIONS，非 null 即写；null=未载明/不确定，不覆盖表内已有值）；
     require_three=True：三列皆空的行进 bad 不写。
     stamp=False（sync_ai_columns 手工修正通道）：extract/deep 归一成列名，行内其余档案字段原样写回。
     返回报告 dict {"input","updated","options_added","bad","failed"}。
@@ -62,6 +69,9 @@ def apply_rows(nt, rows, stamp=True, require_three=True):
         if stamp:
             row = {"id": r["id"], "skills": sk, "ai_extract": st, "ai_deep": dp,
                    "ai_refined_at": stamped}
+            for k in CORRECTIONS:   # 基础字段校正：值经 _cast 按 config.types 转换
+                if r.get(k) is not None:
+                    row[k] = r[k]
         else:   # 手工修正通道：其余档案字段原样写回，不打出队标记
             row = {"id": r["id"]}
             for k, v in r.items():
@@ -77,15 +87,6 @@ def apply_rows(nt, rows, stamp=True, require_three=True):
         want.update(sk)
         upd.append(row)
     added = top_up_options(nt, want) if want else []
-    # 顺带回填工作年限：upload 脚本常抽不出「12年」这类表述，从精析的"工作经验｜N年"补
-    # 容忍 subagent 偶写的约/近修饰（prompt 已禁，正则兜底防静默漏回填）
-    have_years = {r["id"]: r["fields"].get("years_experience")
-                  for r in nt.list_records("resume", biz_fields=["years_experience"])}
-    for row in upd:
-        if not have_years.get(row["id"]):
-            m = re.search(r"工作经验｜\s*(?:约|近)?\s*(\d{1,2})\s*年", row.get("ai_extract") or "")
-            if m:
-                row["years_experience"] = int(m.group(1))
     ok, failed = 0, []
     for row in upd:                       # 逐条写：非法选项只影响本条，剔词重试
         for _ in range(12):

@@ -39,11 +39,16 @@ if _LOCATION_FALLBACK not in _RESUME_OPTS["expected_location"]:
     raise RuntimeError("兜底城市 %r 不在 config.options.resume.expected_location 中" % _LOCATION_FALLBACK)
 _DEGREE_RE = re.compile(r"(?:学\s*历|学位|文化程度)\s*[:：|]?\s*(?:是|为)?\s*(博士|硕士研究生|硕士|研究生|大学本科|统招本科|全日制本科|本科|学士|大专|大学专科|专科|高职)")
 _DEGREE_SCAN_RE = re.compile(r"(博士|硕士|研究生|本科|学士|大专|专科|高职|中专)")
-_SCHOOL_RE = re.compile(r"([\u4e00-\u9fff]{2,14}?(?:大学|学院|职业技术学院|高等专科学校|技师学院))")
+# 贪婪 {2,14} + 后缀长词优先：防"贵州财经大学商务学院"在第一个后缀（大学）处被非贪婪截断；
+# 贪婪可能带入的动词前缀由 _pick_school 的 _SCHOOL_NOISE_RE 清洗，裸词/黑名单仍走 _SCHOOL_BAD。
+_SCHOOL_RE = re.compile(r"([\u4e00-\u9fff]{2,14}(?:职业技术学院|高等专科学校|技师学院|大学|学院))")
 _SCHOOL_LABEL_RE = re.compile(r"(?:毕业院校|毕业学校|学校名称|就读学校|院校)\s*[:：|]?\s*([^\n；;，,。|：:]{2,30})")
 _SCHOOL_NOISE_RE = re.compile(r"毕业于|就读于|毕业自|结业于|就读|入读|考取|参加|升学|本科|大专|硕士|博士|研究生|中专|高职|全日制|统招|成人")
 _SCHOOL_BAD = ("主要参加学院", "主要学院", "宁夏", "学院", "大学", "学校")
-_MAJOR_RE = re.compile(r"(?:专\s*业(?:名称)?|所学专业|主修专业|主修)(?:\s*[:：|]\s*|\s*\n\s*)([\u4e00-\u9fffA-Za-z]{2,20})")
+_MAJOR_RE = re.compile(r"(?:专\s*业(?:名称)?|所学专业|主修专业|主修)(?:\s*[:：|/｜]\s*|\s*\n\s*|\s+)([\u4e00-\u9fffA-Za-z]{2,20})")
+# 表格行兜底：「院校|专业|学历」竖线格式（_MAJOR_RE 无"专业"标签可抓时），
+# 命中"哈尔滨远东理工学院|机械设计制造及其自动化|本科"这类行，取中间专业段。
+_MAJOR_TABLE_RE = re.compile(r"(?:大学|学院|学校)\s*[|｜/]\s*([\u4e00-\u9fffA-Za-z（）()]{2,20})\s*[|｜/]\s*(?:本科|大专|硕士|博士|研究生|专科)")
 _MAJOR_BAD = ("课程", "基础扎实", "培训", "大专", "本科", "知识", "技能", "技术", "能力", "方向", "相关", "学习", "理论")
 _NAME_BAD = frozenset((
     "自我评价 专业技能 技能证书 核心优势 优势亮点 姓名 名字 本科 大专 硕士 博士 研究生 专科 "
@@ -52,7 +57,9 @@ _NAME_BAD = frozenset((
     "山西 陕西 甘肃 宁夏 青海 新疆 西藏 内蒙 辽宁 吉林 广东 江苏 浙江 安徽 福建 江西 海南 北京 "
     "上海 天津 重庆 暖通 电工 焊工 会计 出纳 司机 普工 工程师").split())
 _POS_RE = re.compile(r"(?:期望|意向|应聘|求职|目标)\s*(?:岗位|职位|职务|意向)?\s*[:：]\s*([\u4e00-\u9fffA-Za-z/、（）() ]{2,25})")
-_CERT_RE = re.compile(r"(注册安全工程师|注册电气工程师|建造师|电工证|特种作业[证操]?[作证]?|高压电工证|注册会计师|中级会计师|初级会计[职称]?|会计从业|教师资格证|法律职业资格|PMP|CFA|CPA|软考|系统分析师|六级|四级|CET-?\d?)")
+# 证书词表长词优先（显式交替，不用字符类缩写——`[职称]` 只匹配单字会截断"初级会计职称"；
+# `特种作业[证操]?[作证]?` 匹配"特种作业操作证"会丢"证"字）
+_CERT_RE = re.compile(r"(注册安全工程师|注册电气工程师|注册消防工程师|建造师|高压电工证|低压电工证|电工证|焊工证|特种作业操作证|特种作业证|特种作业|注册会计师|中级会计师|初级会计(?:职称|资格)?|会计从业|教师资格证|法律职业资格|PMP|CFA|CPA|软考|系统分析师|六级|四级|CET-?\d?)")
 # 院校名单唯一真源：config.refs.resume.school_985 / school_211（派生参考数据，非 select 选项），本地不留副本
 _985 = tuple(CONFIG["refs"]["resume"]["school_985"])
 _211 = tuple(CONFIG["refs"]["resume"]["school_211"])
@@ -161,12 +168,15 @@ def parse(text, filename=""):
             education = "大专"
         elif re.search(r"大学|学院", school):
             education = "本科"
-    major = _first(_MAJOR_RE, text)
+    major = _first(_MAJOR_RE, text) or _first(_MAJOR_TABLE_RE, text)
     if major and (major in _MAJOR_BAD or major.startswith(_MAJOR_BAD)):
         major = ""
     certs = sorted(set(_CERT_RE.findall(text)))
     position = _first(_POS_RE, text)
-    position = re.sub(r"[：:，,。].*$", "", position)[:25]
+    # 捕获组字符类含空格，会吞入后续"应聘企业/期望工资/求职类型"标签：
+    # 先按空白与标签词切头，再走原有标点切尾；[:40] 容纳多职位顿号列表。
+    position = re.split(r"\s+|(?=应聘|期望薪|期望工资|求职类型)", position)[0]
+    position = re.sub(r"[：:，,。].*$", "", position)[:40]
     skills = [w for w in SKILL_WORDS_SORTED if w.lower() in text.lower()][:15]
     return {
         "name": name, "phone": phone, "email": email, "education": education,

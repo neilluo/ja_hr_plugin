@@ -8,16 +8,16 @@
 - 词表文件（`<VOCAB_PATH>`，即仓库根下 `outputs/job_vocab.json`）
   —— 岗位必备/加分技能同源词表，**选词优先与它一致**（否则后续匹配打分会对不上）
 
-**先分流，再精析**（两条路径产出的三个字段完全同规格，校验脚本同一条）：
+**先分流，再精析**（两条路径产出的全部字段——三列 + 6 个基础字段校正——完全同规格，校验脚本同一条）：
 
-- `full_text` 非空 → 直接通读 `full_text` 产出三字段（下述规则一致）。
+- `full_text` 非空 → 直接通读 `full_text` 产出全部字段（三列 + 6 个校正字段，下述规则一致）。
 - `full_text` 为空且 `source_file` 非空 → 这是扫描件/图片简历，**必须先用 Read 工具读原件**
-  （Read 可直接读 PDF 与图片，多页 PDF 逐页读全部页），据看到的版面内容产出三字段。
+  （Read 可直接读 PDF 与图片，多页 PDF 逐页读全部页），据看到的版面内容产出全部字段。
   读图纪律：同一批次内的多份原件必须在**同一条消息里一次性并发发出所有 Read 调用**，
   禁止一份一回合串行读；`source_file` 指向的文件不存在或读不出内容时，该条三个字段一律输出
-  `skills: []` 与"未提及"填充，**禁止编造**。
+  `skills: []` 与"未提及"填充、6 个校正字段一律输出 `null`，**禁止编造**。
 - 两者皆空 → 该条输出 `skills: []`、`ai_structured` 五段全填"未提及"、`ai_deep` 写
-  "亮点：无 风险：原件与文本均缺失 建议：人工补录"，不要跳过该条。
+  "亮点：无 风险：原件与文本均缺失 建议：人工补录"、6 个校正字段一律 `null`，不要跳过该条。
 
 ## 1. skills（技能标签数组）
 
@@ -43,7 +43,7 @@
 学历背景｜<最高学历> <院校> <专业> <院校层次判断>
 工作经验｜<总年限>年，<最近一份工作的公司+岗位+时长>，<行业关键词>
 （<总年限> 只写纯数字如 `4年`，禁止「约4年/近4年/4年以上」；简历未明写时按经历时间段做减法估出数字。
-下游有正则从本段回填年限字段，修饰词会让回填静默失败）
+此数字须与校正字段 `years_experience` 一致）
 核心技能｜<Top 5 硬技能，逗号分隔>
 求职意向｜<期望职位> <期望地点> <期望薪资>
 匹配度评估｜<一句话判断适合什么岗位/产线，如"适合单晶拉棒产线设备工程师">
@@ -60,6 +60,24 @@
 
 整段控制在 200 字以内，自然语言，不用列表符号。
 
+## 4. 基础字段校正（6 个，可为 null）
+
+你反正已逐份读全文，顺带校正脚本正则粗提取的基础档案字段。每条记录必须输出以下 6 个字段
+（字段名=业务键，与表列一一对应）：
+
+- `name`：**仅当**简历原件正文明确显示的姓名与输入的 `name` 不同时，才输出原件真值；
+  相同或原件无姓名时输出 `null`。
+- `major`：原件真实载明的所学专业（最高学历对应的专业）。无法确定输出 `null`。
+- `school`：原件真实载明的毕业院校全名（独立学院要完整，如"贵州财经大学商务学院"）。无法确定输出 `null`。
+- `certificates`：原件真实载明的证书清单，多个证书用「、」连接成**一个字符串**
+  （如"低压电工证、特种作业操作证"）。无证书或无法确定输出 `null`。
+- `years_experience`：**整数**，按工作经历时间线推算的总年限（经历时间段做减法；应届/在读给 `0`，
+  只有实习经历给实际实习年数）。无法确定输出 `null`。
+- `expected_position`：原件真实载明的期望/应聘职位，多职位用「、」连接成一个字符串。无法确定输出 `null`。
+
+铁律：**只输出简历原件真实载明的值，无法确定一律输出 `null`，禁止猜测**。`null` 不会覆盖表内已有值，
+猜错的值会——宁可 null。
+
 ## 输出
 
 把结果写入与批次文件同目录、**文件名由输入自派生**的 done 文件（输入 `skills_pending_part<N>.json` →
@@ -71,7 +89,13 @@
     "id": "recordId",
     "skills": ["技能1", "技能2"],
     "ai_structured": "学历背景｜本科 昆明理工 材料工程 普通本科\n工作经验｜...",
-    "ai_deep": "亮点：… 风险：… 建议：…"
+    "ai_deep": "亮点：… 风险：… 建议：…",
+    "name": null,
+    "major": "材料科学与工程",
+    "school": "昆明理工大学",
+    "certificates": "低压电工证、特种作业操作证",
+    "years_experience": 4,
+    "expected_position": "组件工艺工程师"
   }
 ]
 ```
@@ -88,7 +112,8 @@ inp = json.load(open(sys.argv[1] if len(sys.argv) > 1 else 'BATCH'))  # 占位�
 out = json.load(open(sys.argv[2] if len(sys.argv) > 2 else 'DONE'))   # 占位：替换为 skills_done_part<N>.json
 assert {r['id'] for r in inp} == {r['id'] for r in out}, 'id 集合不一致'
 for r in out:
-    for f in ('skills', 'ai_structured', 'ai_deep'):
+    for f in ('skills', 'ai_structured', 'ai_deep',
+              'name', 'major', 'school', 'certificates', 'years_experience', 'expected_position'):
         assert f in r, f'缺字段 {f}'
     segs = [l.split('｜')[0] for l in r['ai_structured'].split('\n')]
     assert segs == ['学历背景', '工作经验', '核心技能', '求职意向', '匹配度评估'], f'段名错 {segs}'
@@ -97,6 +122,10 @@ for r in out:
     for s in r['skills']:
         zh = len(re.findall(r'[\u4e00-\u9fff]', s))
         assert 0 < len(s) <= 12 and (zh == 0 or 2 <= zh <= 6), f'标签字数违规 {s}'
+    ye = r['years_experience']
+    assert ye is None or (isinstance(ye, int) and not isinstance(ye, bool)), f'years_experience 须为 int 或 null {ye!r}'
+    for f in ('name', 'major', 'school', 'certificates', 'expected_position'):
+        assert r[f] is None or isinstance(r[f], str), f'{f} 须为字符串或 null'
 print('OK', len(out))
 EOF
 ```
