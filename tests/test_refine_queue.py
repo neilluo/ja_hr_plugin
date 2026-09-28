@@ -198,11 +198,14 @@ class TestSkillsAnalyzeQueueCmd(unittest.TestCase):
         old_outdir, old_nt = sa.OUTDIR, sa.Notable
         sa.OUTDIR = tmp
         sa.Notable = lambda *a, **k: FakeNT()      # merge 不应触网：FakeNT 无 call 等方法
+        good = {"id": "r2", "skills": ["PLC", "拉晶", "单晶", "切片", "设备管理"],
+                "ai_structured": "学历背景｜a\n工作经验｜b\n核心技能｜c\n求职意向｜d\n匹配度评估｜e",
+                "ai_deep": "亮点：x 风险：y 建议：z",
+                "name": None, "major": None, "school": None, "certificates": None,
+                "years_experience": 3, "expected_position": None}
         try:
-            json.dump([{"id": "r2", "skills": ["PLC"], "ai_extract": "e", "ai_deep": "d"}],
-                      open(os.path.join(tmp, "skills_pending_part1.json"), "w"))
-            json.dump([{"id": "r2", "skills": ["PLC"], "ai_extract": "e", "ai_deep": "d"}],
-                      open(os.path.join(tmp, "skills_done_part1.json"), "w"))
+            json.dump([{"id": "r2"}], open(os.path.join(tmp, "skills_pending_part1.json"), "w"))
+            json.dump([good], open(os.path.join(tmp, "skills_done_part1.json"), "w"))
             buf = io.StringIO()
             old_argv = sys.argv
             sys.argv = ["skills_analyze.py", "merge"]
@@ -212,7 +215,9 @@ class TestSkillsAnalyzeQueueCmd(unittest.TestCase):
             finally:
                 sys.argv = old_argv
             out = json.loads(buf.getvalue().strip().splitlines()[-1])
-            self.assertEqual(out, {"merged": 1, "batches": 1, "missing_batches": []})
+            # merge 报告契约：盘上体检 + schema 违规行过滤（validate_row SSOT）
+            self.assertEqual(out, {"merged": 1, "batches": 1, "missing_batches": [],
+                                   "bad_batches": [], "bad_rows": [], "all_complete": True})
         finally:
             sa.OUTDIR, sa.Notable = old_outdir, old_nt
             shutil.rmtree(tmp, ignore_errors=True)

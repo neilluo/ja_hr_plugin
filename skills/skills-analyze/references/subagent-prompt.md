@@ -2,7 +2,7 @@
 
 ## 输入
 
-- 批次文件（下面第一条指令给出的路径 `<BATCH_PATH>`）：数组，每条含
+- 批次文件（`prepare` 渲染时已填入本批绝对路径）：数组，每条含
   `id`、`name`、`current_skills`（脚本正则粗提取的，可能不准/不全）、`full_text`（简历全文，可能被截断）、
   `source_file`（原件本地绝对路径，扫描件时为唯一可用信息源，普通简历可为空）
 - 词表文件（`<VOCAB_PATH>`，即仓库根下 `outputs/job_vocab.json`）
@@ -101,35 +101,11 @@
 ```
 
 要求：
-1. **必须覆盖输入文件里的全部 id**，一条都不能漏；
-2. 写完后**必须原样运行下面这段规范校验脚本**（禁止自写 assert 口径、禁止改动判定边界；
-   把脚本里的 `BATCH`/`DONE` 两处占位替换为你自己的批次文件与输出文件路径）：
+1. **必须覆盖输入文件里的全部 id**，一条都不能漏；done 文件名与输入同目录、pending→done 派生（N 不变）；
+2. **严格按上述 schema 输出**（字段名与类型见上文 JSON 示例：`skills` 是字符串数组、`ai_structured` 是含
+   5 段 `｜` 分隔的一整段字符串、`years_experience` 是 int 或 null、其余 5 个校正字段是字符串或 null）。
+   **不需要也不要自己写/跑校验脚本**：merge 阶段由 `skills_analyze.validate_row` 统一判合规，
+   违规行会被丢弃、其 record 保持未打 `ai_refined_at` 标记 → 下一周期自动重析，无需你在本回合内自检自修。
+   你只 Write 一次、报告条数即可，把回合省到"读输入 → 推理 → 写产物"三步。
+3. 回复只需报告条数和 2-3 个典型标签例子，200 字以内。
 
-```bash
-python3 -X utf8 - <<'EOF'
-import json, re, sys
-inp = json.load(open(sys.argv[1] if len(sys.argv) > 1 else 'BATCH'))  # 占位：agent 运行时替换为 <BATCH_PATH>
-out = json.load(open(sys.argv[2] if len(sys.argv) > 2 else 'DONE'))   # 占位：替换为 skills_done_part<N>.json
-assert {r['id'] for r in inp} == {r['id'] for r in out}, 'id 集合不一致'
-for r in out:
-    for f in ('skills', 'ai_structured', 'ai_deep',
-              'name', 'major', 'school', 'certificates', 'years_experience', 'expected_position'):
-        assert f in r, f'缺字段 {f}'
-    segs = [l.split('｜')[0] for l in r['ai_structured'].split('\n')]
-    assert segs == ['学历背景', '工作经验', '核心技能', '求职意向', '匹配度评估'], f'段名错 {segs}'
-    assert len(r['ai_structured']) <= 200 and len(r['ai_deep']) <= 200, '超 200 字'
-    assert len(r['skills']) == 0 or 5 <= len(r['skills']) <= 12, '技能数越界'
-    for s in r['skills']:
-        zh = len(re.findall(r'[\u4e00-\u9fff]', s))
-        assert 0 < len(s) <= 12 and (zh == 0 or 2 <= zh <= 6), f'标签字数违规 {s}'
-    ye = r['years_experience']
-    assert ye is None or (isinstance(ye, int) and not isinstance(ye, bool)), f'years_experience 须为 int 或 null {ye!r}'
-    for f in ('name', 'major', 'school', 'certificates', 'expected_position'):
-        assert r[f] is None or isinstance(r[f], str), f'{f} 须为字符串或 null'
-print('OK', len(out))
-EOF
-```
-
-3. 流程纪律：**先按规范一次写对再校验；校验失败只允许一次性修正后复验一次**，禁止多轮试探性 Edit；
-4. Windows 下命令用 `py`（`python3`/`python` 会静默失败）；
-5. 回复只需报告条数和 2-3 个典型标签例子，200 字以内。

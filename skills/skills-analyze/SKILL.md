@@ -58,29 +58,60 @@ exit 2 秒退——看到 refused 说明已有周期在跑，直接结束本轮�
 经验：agent 越多总耗时越短（每个 agent 内部是串行的），所以**小批量优先多开 agent**，
 不要手动设大 batch。
 
-输出 `outputs/skills_analyze_meta.json`：`{"total":26,"queued":26,"batches":13,"batch_size":2,"agents":13,"agent_sizes":[...],"max_agents":20}`，
-并生成 `outputs/skills_pending_part<N>.json`（N=1..13）与 `outputs/job_vocab.json`（岗位技能同源词表）。
+输出 `outputs/skills_analyze_meta.json`：`{"total":26,"queued":26,"batches":13,"batch_size":2,"agents":13,"agent_sizes":[...],"max_agents":20,"dispatch":"outputs/skills_dispatch.json"}`，
+并生成 `outputs/skills_pending_part<N>.json`（N=1..13）、`outputs/job_vocab.json`（岗位技能同源词表）、
+**`outputs/skills_prompt_part<N>.md`（每批完整提示词，占位符已填好）**与 `outputs/skills_dispatch.json`（分派清单）。
 **meta 的 batches 就是要起的 agent 数，照它发，不要自己另算。**
+**dispatch.json 的 prompts 数组就是要发的 N 个提示词文件绝对路径，直接照抄，禁止凭记忆拼路径。**
 
 **total == 0 时**：直接结束（队列已在 Step 0 判过，此处兜底）。
 
 ### Step 2：一次性并发启动全部 agent（≤20，不分波）
 
 读 meta 的 `batches = M`，**在同一条消息里一次性发出 M 个 Agent 调用**（M ≤ 20，不分波、不串行）。
-每个 agent 的指令只给：提示词文件路径 + 批次号 N + 输入/输出 part 路径；agent 之间零依赖，各读写自己的文件。
-原则：agent 内部是逐条串行的，所以**在 20 的硬上限内尽量多开 agent**，让总耗时趋近"一条的耗时"；
-条数超过 20 时 prepare 自动加大 batch，把 agent 数压回 20 以内。
-纪律：**分波发送=犯错**（历史教训见 AGENTS.md 犯错记录）——每多一波就多暴露一次后端 stall 窗口，
-且多花一轮组装时间。
 
-### Step 3：合并
+**每个 agent 的 prompt 字段只放两行**（不再内联提示词原文，见 AGENTS.md 犯错记录）：
+
+```
+Read <dispatch.prompts[N-1]> 文件，把里面全部内容作为你的任务并严格执行。
+仓库根：<仓库绝对路径>，命令以仓库根为 CWD 执行。
+```
+
+其中 `dispatch.prompts[N-1]` = 从 `outputs/skills_dispatch.json` 直接照抄的第 N 个路径，
+**不指定 done 输出文件名**（提示词内已含 `<N>` 展开后的具体 pending/done 路径）。
+agent 之间零依赖、各读写自己的文件。**提示词已不含内嵌校验脚本**——done 产物 schema 判定
+唯一真源在 `merge`（`validate_row`），subagent 只负责"读输入 → 推理 → 写产物"，不跑自检 bash。
+
+**为什么只发路径**：旧写法把 8.6KB 提示词原文内联进每一个 Agent 工具调用的 prompt 字段，
+16 批 ≈ 138KB 工具调用入参，实测第 13 个调用的 prompt 在工具流中途被截断（只剩半段），
+只能事后补发批次 14-16 → 16 个 agent 被迫分成 13+3 两波 → 违反"一次性并发发完、不分波"，
+多花约 250s 纯串行等待、并多暴露一次后端 stall 窗口。
+改为只发路径后派发载荷降两个数量级（每批 ~150 字节），截断诱因消除。
+
+纪律：**分波发送=犯错**（历史教训见 AGENTS.md 犯错记录）——每多一波就多暴露一次后端 stall 窗口，
+且多花一轮组装时间。若一条消息实在塞不下 M 个调用，宁可下调 `--batch`（减少批数、每批多扛几条），
+也不许把已经切好的 M 批拆成多波。
+
+### Step 3：合并（含盘上产物体检）
 
 ```bash
 python3 skills/skills-analyze/scripts/skills_analyze.py merge
 ```
 
-产出 `outputs/skills_done.json`；某批次缺失（子任务失败）会在 `missing_batches` 里列出——
-其余照常写回，缺失批次的记录因未打标记仍留在队列，下一周期自动重析（无需手工补发）。
+产出 `outputs/skills_done.json`，报告字段：
+
+```
+{"merged":N,"batches":M,"missing_batches":[...],"bad_batches":[...],"bad_rows":[...],"all_complete":true|false}
+```
+
+`missing_batches` = 该批 done 不存在或 JSON 不可解析；`bad_batches` = 能解析但 id 集合与 pending
+不一致 / 有行缺 id；`bad_rows` = **schema 违规**的行（`validate_row` 返回非空 errors），
+这些行**已被 merge 从 skills_done.json 剔除、不会写回、其 record 不打 `ai_refined_at` → 下周期自动重析**。
+三类都不阻断其余行的写回。`all_complete = true` 当且仅当三类全空。
+
+**schema 唯一真源 = `skills_analyze.validate_row`**（不变量 10），模板与 subagent 不再自校验——
+过去每 agent 一个 bash 回合跑内嵌 assert 脚本、失败要再"修正 + 复验"至多 2 回合，
+把每 agent 固定开销抬高 30-60s。现 agent 只 Write 产物，merge 一次性扫合规性并把违规行丢回队列。
 
 ### Step 4：写回（同批打出队标记）
 
@@ -106,17 +137,24 @@ python3 skills/skills-analyze/scripts/skills_apply.py outputs/skills_done.json -
 
 ## Subagent Prompt（唯一源：references/subagent-prompt.md）
 
-提示词全文**只维护一份**：`skills/skills-analyze/references/subagent-prompt.md`。
-起 subagent 时把该文件内容作为 prompt 发给每个 agent，除以下占位符外一字不改：
+提示词全文**只维护一份**：`skills/skills-analyze/references/subagent-prompt.md`（模板，含占位符）。
+`prepare` 会把它渲染成 per-batch 的 `outputs/skills_prompt_part<N>.md`（占位符已替换），
+分派时**只发该文件的路径指针**（见 Step 2），不再把模板原文内联进工具调用。
+模板内的占位符与替换规则：
 
-- `<BATCH_INDEX>` → 批次号 N（对应 meta 里的 part 序号）
-- `<BATCH_PATH>` → `outputs/skills_pending_part<N>.json` 的路径
-- `<VOCAB_PATH>` → `outputs/job_vocab.json` 的路径
+- `<BATCH_PATH>` → `outputs/skills_pending_part<N>.json` 的绝对路径
+- `<N>` → 批次号 N（done 文件名从 pending→done 自派生，N 不变）
+- `<VOCAB_PATH>` → `outputs/job_vocab.json` 的绝对路径
 
-分派指令必须把**真实存在的 pending 路径**原样给 agent（N 以 meta/盘上文件为准，禁止凭记忆写
-前缀或序号）；done 文件名由 agent 从输入自派生（pending→done，N 不变），分派方不指定。
+**schema 校验不再内嵌进模板**：done 产物合规性判定唯一真源 = `skills_analyze.validate_row` +
+`merge`，违规行 merge 丢弃、record 保持未打 `ai_refined_at` → 下周期自动重析。
+subagent 端不跑 bash 校验、不做"修正-复验"多回合，回合省到"读输入 → 推理 → 写产物"三步。
 
-修改提示词只改 references/subagent-prompt.md，**禁止在本文件里再抄一份全文**（双源零容忍）。
+分派方禁止凭记忆拼路径（N 与路径以 `outputs/skills_dispatch.json` 为准），
+也禁止把模板原文重新内联回工具调用。
+
+修改提示词只改 references/subagent-prompt.md（模板），**禁止在本文件里再抄一份全文**（双源零容忍）；
+`tests/test_dispatch_slim.py` 会锁定"渲染产物必须把上述占位符全部替换干净、且不得复活内嵌校验"。
 
 ## 边界与容错
 
@@ -124,10 +162,11 @@ python3 skills/skills-analyze/scripts/skills_apply.py outputs/skills_done.json -
 - **agent 数硬上限 20，不可超过**（`MAX_AGENTS` 只能下调）。小批量尽量多开 agent（≤20 条→一条一个）；
   条数超 20 时自动加大 batch 压回 20。**一次性并发发完，不分波、不串行。**
 - 子任务之间零依赖、各读写独立文件；部分失败 merge 自动跳过缺失批次，全部失败才整体失败。
-  **subagent 报 failed 时先验盘上产物**，不要立刻补发：检查 `outputs/skills_done_part<N>.json` 是否
-  JSON 可解析、id 集合与对应 pending 一致、三字段齐全；齐全即视为该批成功、直接进 merge——失败常只发生
-  在产物已落盘后的收尾回合（批次 13 即此例：08:32 产物已完整，08:36 收尾回合模型流被 TLS 掐断报 failed，
-  产物其实可用，补发白费一轮还覆盖了好产物）。仅当产物缺失或不完整时，才补发该批。
+  **subagent 报 failed 时不要立刻补发**：先跑 merge，它已内联盘上产物体检（missing_batches=不存在/
+  不可解析、bad_batches=id 集合不一致、bad_rows=schema 违规行），产物齐全即视为该批成功、
+  直接进 apply——失败常只发生在产物已落盘后的收尾回合（历史批次 13 即此例：产物已完整，
+  收尾回合模型流被 TLS 掐断报 failed，补发白费一轮还覆盖了好产物）。仅当体检报出该批 missing/bad
+  时，才补发该批；bad_rows 里的 record 未打标记、下一周期自动重析，也无需手工补发。
 - 扫描件（`full_text` 为空、`source_file` 指向本地原件）**照常入队精析**：subagent 用 Read 直接读原件
   （PDF/图片，多页逐页、同一条消息并发发出），读图规则见 `references/subagent-prompt.md`。
   原件已被移动/删除的记录判为不可精析、不入队（防永久卡队列并阻塞匹配门禁），
