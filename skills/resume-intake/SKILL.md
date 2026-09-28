@@ -122,6 +122,8 @@ EOF
 - **消费任务（时刻 = `refine_fire_at`）**：payload 指令——进本仓库跑
   `python3 skills/skills-analyze/scripts/skills_analyze.py queue`；resume 为 0 则静默结束；
   非空则按 `skills/skills-analyze/SKILL.md` 流水线全自动执行到 apply 写回。
+- **完成即自删**：payload 末条指令必须是"任务结束时（含队列为 0 静默结束）按任务名删除本一次性任务自身"——
+  已消费完的任务不留列表；每日 09:30 兜底的自清理只是对崩溃在自删之前的任务的兜底网。
 
 **不设看门狗/补跑任务**（曾设 +15 分钟看门狗，已裁撤）：消费任务崩溃时未写回记录天然仍在
 队列（`ai_refined_at` 为空即在队，队列状态就是表数据本身、无中间态要清），僵尸租约 30 分钟

@@ -61,6 +61,8 @@ python3 skills/job-intake/scripts/upload_jobs.py <目录> --dry-run  # 预演，
 - **消费任务（时刻 = `refine_fire_at`）**：payload 指令——进本仓库跑
   `python3 skills/job-intake/scripts/jobs_analyze.py queue`；job 为 0 则静默结束；
   非空则按本 SKILL「智能分析JD」流水线全自动执行到 `sync_job_columns.py` 写回。
+- **完成即自删**：payload 末条指令必须是"任务结束时（含队列为 0 静默结束）按任务名删除本一次性任务自身"——
+  已消费完的任务不留列表；每日 09:30 兜底的自清理只是对崩溃在自删之前的任务的兜底网。
 - 写回后跑 `python3 skills/job-intake/scripts/check_skill_coverage.py`，低覆盖按本 SKILL
   两因分辨纪律处理：① 用词与简历标签不同源 → 改词重同步直到 exit 0；② 库里确实没有这类
   候选人 → 保留原词并在任务结果里说明，不强行凑 exit 0。
