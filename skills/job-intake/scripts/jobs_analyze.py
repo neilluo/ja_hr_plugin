@@ -54,6 +54,11 @@ def prepare(args):
     queued_ids = {r["id"] for r in refine_loop.queue(nt, "job")}
     if "--all" not in args:
         rows = [r for r in rows if r["id"] in queued_ids]
+    else:
+        # --all 绕过队列谓词，但仍须过滤无正文的岗（responsibilities 空）：
+        # 否则 subagent 无从精析只能编造三列，sync_job_columns 连同 ai_refined_at 一次落库即静默出队，
+        # 坏数据被当成已精析成果。判据唯一真源 refine_loop.refinable()（与 skills_analyze --all 对称）。
+        rows = [r for r in rows if refine_loop.refinable(r["fields"], "job")]
     items = []
     for r in rows:
         f = r["fields"]

@@ -163,14 +163,29 @@ class TestFilesDir(_PreflightCase):
         self.assertEqual(_preflight_json(out)["blocker"], "files_dir")
 
     def test_no_supported_ext_blocks(self):
-        d = os.path.join(self.tmp, "txtonly")
+        # 用真正不支持的扩展名（.rtf 不在 extract.SUPPORTED_EXTS）。
+        # 曾用 .txt 作"不支持"示例——那是迁就 preflight 漂移的旧清单；现清单已归一到
+        # extract.SUPPORTED_EXTS 唯一真源，.txt/.md/.webp/.tif 皆为合法简历格式，
+        # 只有真不支持的扩展名才该触发 files_dir 拦截。
+        d = os.path.join(self.tmp, "rtfonly")
         os.makedirs(d)
-        with open(os.path.join(d, "readme.txt"), "w") as f:
+        with open(os.path.join(d, "notes.rtf"), "w") as f:
             f.write("x")
         with patch.dict(os.environ, _NO_ENV, clear=False):
             code, out, _ = _run(**self.basic_kwargs(files_dir=d))
         self.assertEqual(code, 1)
         self.assertEqual(_preflight_json(out)["blocker"], "files_dir")
+
+    def test_txt_md_webp_are_supported(self):
+        # 防漂移回归：.txt/.md/.webp 是合法简历格式，仅含这些文件的目录不得被误拦。
+        for ext in (".txt", ".md", ".webp", ".tif"):
+            d = os.path.join(self.tmp, "ok" + ext.strip("."))
+            os.makedirs(d)
+            with open(os.path.join(d, "resume" + ext), "w") as f:
+                f.write("x")
+            with patch.dict(os.environ, _NO_ENV, clear=False):
+                code, out, _ = _run(**self.basic_kwargs(files_dir=d))
+            self.assertIsNone(code, "%s 应视为支持格式，不得拦截：%s" % (ext, out))
 
     def test_supported_ext_passes(self):
         d = os.path.join(self.tmp, "resumes")

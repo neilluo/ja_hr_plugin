@@ -21,6 +21,7 @@ from notable import Notable, NotableError       # noqa: E402
 from parse_job import parse                     # noqa: E402
 from preflight import run_preflight             # noqa: E402
 import refine_loop                              # noqa: E402  队列谓词唯一真源
+from report import print_report                 # noqa: E402  报告输出唯一真源（VERDICT 行 + 结果字段前置）
 
 _CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "config.json")
 
@@ -45,10 +46,18 @@ def main():
     existing = {r["fields"].get("job_id") for r in nt.list_records("job", biz_fields=["job_id"])} \
         if not args.dry_run else set()
 
-    rows, report = [], {"total": len(files), "parsed": 0, "skipped_dup": [], "failed": []}
+    rows, report = [], {"total": len(files), "parsed": 0, "skipped_dup": [],
+                        "needs_ocr": [], "failed": []}
     for fn in files:
         try:
-            ex = extract(os.path.join(args.dir, fn))
+            ex = extract(os.path.join(args.dir, fn)) or {"text": "", "needs_ocr": False}
+            # 岗位侧无 OCR 补录链：图片型/抽不出正文的 JD 若照样入库，会产出 responsibilities 等
+            # 全空的记录——created 正常、回读通过、无告警，且空 responsibilities 永不进精析队列
+            # （谓词真源 refine_loop），匹配时表现为"这岗没人合适"的坏数据。与简历侧同纪律：
+            # 无正文不入库，进 needs_ocr 报出交人工（不变量 5）。
+            if ex.get("needs_ocr") or not (ex.get("text") or "").strip():
+                report["needs_ocr"].append(fn)
+                continue
             jd = parse(ex["text"], fn)
             jid = job_id_of(jd["department"], jd["job_name"])
             if jid in existing:
@@ -78,7 +87,7 @@ def main():
 
     if args.dry_run:
         report["rows"] = [{k: v for k, v in r.items() if k != "_file"} for r in rows]
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+        print_report(report)
         return
 
     # JD 附件先传后写（5 并发），与简历同纪律
@@ -96,7 +105,7 @@ def main():
     try:
         ids = nt.create_records("job", write_rows) if write_rows else []
     except NotableError as e:
-        print(json.dumps({**report, "error": str(e)}, ensure_ascii=False))
+        print_report({**report, "error": str(e)})
         sys.exit(1)
 
     try:
@@ -113,8 +122,8 @@ def main():
         report["duplicates_removed"] = len(dup_ids)
         back = set(groups)
     except NotableError as e:
-        print(json.dumps({**report, "created": len(ids),
-                          "error": "回读/查重失败: %s" % e}, ensure_ascii=False))
+        print_report({**report, "created": len(ids),
+                      "error": "回读/查重失败: %s" % e})
         sys.exit(1)
     report["created"] = len(ids)
     report["readback_missing"] = [r["job_id"] for r in write_rows if r["job_id"] not in back]
@@ -125,9 +134,9 @@ def main():
             # 队列非空 = 需注册消费任务；时刻由脚本算好，agent 原样填入 cron，不必再跑 date
             report["refine_fire_at"] = refine_loop.fire_at()
     except NotableError as e:
-        print(json.dumps({**report, "error": "精析队列计数失败: %s" % e}, ensure_ascii=False))
+        print_report({**report, "error": "精析队列计数失败: %s" % e})
         sys.exit(1)
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    print_report(report)
     sys.exit(1 if report["readback_missing"] else 0)
 
 

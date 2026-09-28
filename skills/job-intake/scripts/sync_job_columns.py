@@ -60,12 +60,16 @@ def main():
             row["ai_refined_at"] = int(time.time() * 1000)
         upd.append(row)
 
-    if upd:
-        nt.update_records("job", upd)
-    # 写回即 job 链周期终点：释放 jobs_analyze prepare 获取的租约
-    refine_loop.release_lock(refine_loop.lock_path(os.path.join(_ROOT, "outputs"), "job"))
-    report = {"total": len(payload), "synced": len(upd), "unmatched": miss}
-    print(json.dumps(report, ensure_ascii=False))
+    # 写回即 job 链周期终点：无论 update 成功还是抛异常，finally 都释放 prepare 获取的租约。
+    # 曾把 release 放在 update 之后的顺序语句里，写回一断网（NotableError）就跳过释放，
+    # 活租约毒化 job 链 30 分钟、下个周期 refused exit 2 静默跳过（与 skills_apply 的 try/finally 对称）。
+    try:
+        if upd:
+            nt.update_records("job", upd)
+        report = {"total": len(payload), "synced": len(upd), "unmatched": miss}
+        print(json.dumps(report, ensure_ascii=False))
+    finally:
+        refine_loop.release_lock(refine_loop.lock_path(os.path.join(_ROOT, "outputs"), "job"))
     sys.exit(2 if miss else 0)
 
 

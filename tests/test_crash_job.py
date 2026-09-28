@@ -614,7 +614,8 @@ class TestCrashJob(unittest.TestCase):
         # 修复后语义：回读/查重 list 失败被捕获 -> exit 1 + JSON 报告，不得裸 traceback
         self.assertIsNone(exc, "回读失败不得裸抛异常")
         self.assertEqual(code, 1)
-        self.assertTrue(out.strip().startswith("{"), "stdout 必须是 JSON 报告")
+        # 新契约：报告首行是 VERDICT 结论行、其后为 JSON（首行即证明是结构化报告而非裸 traceback）
+        self.assertTrue(out.strip().startswith("VERDICT:"), "stdout 必须是 VERDICT+JSON 报告")
         self.assertIn("error", rep)
         self.assertEqual(self.h.db.count(), EXPECTED_FILES, "数据已提交")
         # 重跑：list 正常 -> created=0（全被 dedup 跳过），表完好

@@ -30,6 +30,7 @@ python3 skills/resume-intake/scripts/upload_resumes.py <目录> --dry-run  # 预
 
 | 字段 | 处置 |
 |---|---|
+| `VERDICT`（stdout 首行） | `OK`/`WARN`/`BAD` 一行结论，读报告先看它——不必逐字段扫 JSON 判成败。格式真源 `shared/report.py` |
 | `created` / `readback_missing` | missing 非空 = 失败，重跑同目录即可（幂等） |
 | `skipped_dup` | 正常：MD5 或手机号已存在，向用户说明即可 |
 | `failed` | 看 error 文本；附件类错误重跑可恢复 |
@@ -63,6 +64,9 @@ python3 skills/resume-intake/scripts/upload_resumes.py <目录> --dry-run  # 预
 
 1. 用视觉能力读取 `needs_ocr` 里的每个文件（Read 工具直接看图/扫描 PDF，多页逐页读）。
 2. 只抽**基础字段**——姓名、手机号、邮箱、学历、院校、专业、工作年限、期望职位等入库与去重所需。
+   **派生列不用填**：`category`（简历库分类）/`school_rank`（院校排名）/`expected_location`（空缺时
+   落兜底枚举）由脚本按与批量 `parse()` **同一批函数**（`parse_resume.derive`）补齐，agent 已给出的值
+   不覆盖——手填这些列既是重复劳动，也是历史上"28 有 3 空"静默缺陷的成因。
    **不要写 AI 三列**（`skills` / `ai_extract` / `ai_deep`）：它们由后台精析流水线读原件产出，
    当场手写属重复劳动、且会白烧本回合 30+ 秒。payload 形如（stdin heredoc，见第 3 步）：
 

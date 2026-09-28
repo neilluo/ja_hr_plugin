@@ -99,7 +99,9 @@ python3 skills/job-intake/scripts/check_skill_coverage.py           # 词表同�
 
 | 字段 | 处置 |
 |---|---|
+| `VERDICT`（stdout 首行） | `OK`/`WARN`/`BAD` 一行结论，读报告先看它——不必逐字段扫 JSON 判成败。格式真源 `shared/report.py` |
 | `created` / `readback_missing` | missing 非空重跑即可（幂等） |
+| `needs_ocr` | 图片型/抽不出正文的 JD，**不入库**（岗位侧无简历那样的 OCR 补录链，空正文记录会静默卡在精析队列外、匹配时表现为"没人合适"）。向用户列出文件名，请其提供可提取文本的原件 |
 | `failed` | 看 error 文本，多为文本提取失败（加密 doc 等），向用户列出文件名 |
 | `refine_queued` | 当前待精析队列长度：精析异步进行，向用户说明"已入队，后台周期消费"即可，**不要在上传回合里跑精析** |
 | `refine_fire_at` | 仅 `refine_queued > 0` 时输出：注册消费任务的目标时刻（UTC ISO8601，脚本已按唯一常量算好）。**原样填入 cron 的 `at` 字段**，禁止再单独跑 `date` 算偏移 |

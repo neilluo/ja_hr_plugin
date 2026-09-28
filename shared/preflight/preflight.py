@@ -24,6 +24,11 @@ import sys
 import time as _time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 扩展名唯一真源在 shared/extract.py（SUPPORTED_EXTS）：本文件曾自持一份 _SUPPORTED_RESUME_EXTS
+# 且已漂移（少 .txt/.md/.bmp/.gif/.webp/.tif/.tiff），导致目录里只有 .webp 简历时预检误拦。
+# 改为 import 同一对象，禁止再抄第二份清单（AGENTS.md 双源零容忍）。
+sys.path.insert(0, os.path.join(ROOT, "shared"))
+from extract import SUPPORTED_EXTS as _SUPPORTED_EXTS  # noqa: E402
 
 _CREDS_MSG = ("凭证缺失：请创建 .secrets.json (gitignored) "
               "或设置 DINGTALK_APP_KEY / DINGTALK_APP_SECRET 环境变量")
@@ -129,8 +134,8 @@ def _check_files(files):
     return False, None, reason
 
 
-# Supported resume file extensions for --files-dir scanning
-_SUPPORTED_RESUME_EXTS = {".pdf", ".docx", ".doc", ".png", ".jpg", ".jpeg"}
+# 扩展名清单唯一真源 = 顶部 import 的 _SUPPORTED_EXTS（shared/extract.SUPPORTED_EXTS）。
+# 曾在此自持一份 _SUPPORTED_RESUME_EXTS 且已漂移，删除，禁止复活第二份副本（不变量 10）。
 
 
 def _check_files_dir(files_dir):
@@ -142,7 +147,7 @@ def _check_files_dir(files_dir):
     found = [
         f for f in os.listdir(files_dir)
         if os.path.isfile(os.path.join(files_dir, f))
-        and os.path.splitext(f)[1].lower() in _SUPPORTED_RESUME_EXTS
+        and os.path.splitext(f)[1].lower() in _SUPPORTED_EXTS
     ]
     if not found:
         return False, None, "files-dir 目录无支持格式文件: %s" % files_dir

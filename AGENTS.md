@@ -75,6 +75,10 @@
     - date 列显示格式（钉钉字段 property.formatter）唯一真源 = `config.formats.date`：建表（replicate_base）/
       补列（sync_schema）经 `skills/replicate/scripts/datefmt.py` 派生 property，真表存量列经 datefmt.align 对齐；
       存储值恒为毫秒时间戳（notable._cast），formatter 只管显示；脚本禁止抄 formatter 字面量（元测试防复活）。
+    - 入库报告（stdout 首行 VERDICT 结论 + JSON 结果字段前置顺序）唯一真源 = `shared/report.py`
+      （print_report/verdict/_KEY_ORDER）：upload_resumes/upload_jobs 一律经它输出，禁止各自
+      `print(json.dumps(...))` 抄字段顺序；README/SKILL 只引用"VERDICT 首行 + 结果前置"这一契约、
+      禁止复述字段清单顺序（元测试 test_report_contract.py 防退化）。
     - 中文字段名禁止硬编码进脚本：记录接口经 `Notable.cn()/_cells()` 从 config 取，结构接口按中文名运行时解析。
     - 文档（README/recruit-model/SKILL）不得手抄 base_id/table_id/完整字段清单/技能词表，一律指向真源。
     - 例外：写入值字面量（如 source="系统匹配"、status="招聘中"）、解析私有规则（_DEPT_ALIAS 别名、
@@ -174,3 +178,7 @@ python3 skills/replicate/scripts/sync_schema.py --check  # 只读：报 config �
   --all 重析会把它们捞进批次、用"未提及"覆盖已有好数据（故入队与 --all/--ids 共用 refinable() 判据）。
 - 曾只测到"prepare 带出了 source_file"就宣称读图链路打通 → 能力核心是 subagent 能否真读图出三列，
   必须端到端跑到 apply 写回与出队标记才算验证；现 e2e 用真 PNG 派真 subagent 全链跑通后才落文档。
+- 曾把入库报告用 `json.dumps(indent=2)` 直打、结果字段（created/readback_missing）排在 timing_ms 之后 →
+  agent 扫 stdout 开头只见 total/needs_ocr 就误判"报告缺 created"，白白多绕 Grep+纠正两回合（实测一次
+  上传 162s 里 63s 是这桩空转，占非 OCR 成本的大头）。教训重申：文档约束赌 agent"读全"不可靠，
+  现由 `shared/report.py` 先把 VERDICT 结论行打到首行、再把结果字段前置，把"读全才懂成败"变成"一眼可见"。

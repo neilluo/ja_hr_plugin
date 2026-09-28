@@ -43,10 +43,12 @@ python3 skills/replicate/scripts/replicate_base.py <新baseId>
 python3 skills/replicate/scripts/sync_schema.py --check           # 只读：报 config 与真实 Base 漂移，缺列 exit 2
 ```
 
-入库类命令输出 JSON 报告：`total / parsed / skipped_dup / needs_ocr / failed /
-created / readback_missing`。`readback_missing` 非空或 `failed` 非空时 exit 1。
+入库类命令（简历/岗位）stdout 首行是 `VERDICT:OK|WARN|BAD ...` 结论行，其后为 JSON 报告
+（`created / readback_missing / table_total / refine_queued` 等结果字段前置，`timing_ms` 垫底）。
+`readback_missing` 非空或带 `error` 即 BAD（exit 1）；`failed`/`needs_ocr` 非空为 WARN。
+报告格式唯一真源 `shared/report.py`（结论与字段顺序），文档只引用不复述。
 `--dry-run` 只解析不触网写表。匹配链路的报告字段见各脚本 stdout。
-所有入口 stage 0 会跑环境预检（`shared/preflight/`），缺凭证/缺依赖直接失败。
+所有入口 stage 0 会跑环境预检（`shared/preflight/`，输出走 stderr），缺凭证/缺依赖直接失败。
 
 ## 代码地图（约 2800 行 Python，不含 vendor；以实际为准）
 

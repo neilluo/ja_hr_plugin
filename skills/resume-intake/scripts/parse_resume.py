@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """简历文本 -> 业务字段。parse(text, filename) -> dict。零第三方依赖。
 
+派生规则（与文本无关、只认已定字段值的那几个）一律放本文件，由 parse() 与 derive() 共用同一批
+函数——批量入库走 parse()、扫描件补录走 derive()，两条写径不得各自装配一份（否则即双源）。
+
 枚举双源零容忍（AGENTS.md）：城市备选来自 config.options.resume.expected_location，
 技能词表来自 shared/vocab.SKILL_WORDS_SORTED，分类名以 config.options.resume.category 校验，
 院校 985/211 名单来自 config.refs.resume（派生参考数据真源，本地不留副本）。
@@ -186,3 +189,33 @@ def parse(text, filename=""):
         "expected_salary": salary, "skills": skills,
         "category": _category(position, skills),
     }
+
+
+def derive(row):
+    """补录通道（--backfill）的派生补齐：payload 由 agent 手填，只带事实字段，
+    派生列（category/school_rank）与兜底列（expected_location）在这里按与 parse() **同一批函数**
+    补齐——缺这一步，补录记录的两列会静默留空（28 有 3 空的真实事故成因）。
+
+    口径：只补「空着」的派生列，agent 已显式给出的值一律不覆盖（与精析 CORRECTIONS 的
+    null=未载明不覆盖同一纪律）；education 例外——它是 singleSelect，agent 手填"大学本科"
+    这类别名必须归一到枚举词，否则与批量记录不同质。
+
+    返回新 dict，不改动入参。
+    """
+    out = dict(row)
+    edu = out.get("education")
+    norm = _norm_degree(edu) if edu else ""
+    if norm and norm != edu:
+        out["education"] = norm
+    edu = out.get("education")
+    if not out.get("school_rank"):
+        rank = _school_rank(out.get("school") or "", edu or "")
+        if rank:
+            out["school_rank"] = rank
+    if not out.get("category"):
+        cat = _category(out.get("expected_position"), out.get("skills"))
+        if cat:
+            out["category"] = cat
+    if not (out.get("expected_location") or "").strip():
+        out["expected_location"] = _LOCATION_FALLBACK
+    return out

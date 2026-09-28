@@ -34,6 +34,19 @@ import skills_apply as sapi              # noqa: E402
 import upload_resumes as ur              # noqa: E402
 from notable import Notable              # noqa: E402
 
+
+def parse_report(stdout_text, case):
+    """入库报告新契约：stdout 首行必须是 VERDICT，其余为可解析 JSON。
+
+    契约测试：agent 曾扫 JSON 开头误判"缺 created"，故脚本改为先打 VERDICT 结论行、
+    再把结果字段前置。此 helper 把该契约锁进回归——若哪天首行不是 VERDICT 或 JSON 解析
+    失败，直接 fail，防止退化回"字段散落、需读全才懂"。"""
+    lines = stdout_text.splitlines()
+    case.assertTrue(lines and lines[0].startswith("VERDICT:"),
+                    "报告首行必须是 VERDICT 结论行，实际：%r" % (lines[:1],))
+    return json.loads("\n".join(lines[1:]))
+
+
 # 无 source_file 的最小夹具：供不关心原件路径的用例（queue 子命令计数、prepare 切批）复用。
 # 谓词与原件存在性相关的用例（含扫描件入队/unrefinable）用 TestQueuePredicate._rows()，
 # 那里须在 setUp 内建真实临时文件，模块级常量做不到。
@@ -447,7 +460,7 @@ class TestBackfillQueueReport(unittest.TestCase):
                 with contextlib.redirect_stdout(buf):
                     ur.run_backfill(nt, args)
             self.assertEqual(ctx.exception.code, 0)
-            rep = json.loads(buf.getvalue())
+            rep = parse_report(buf.getvalue(), self)
             self.assertEqual(rep["created"], 1)
             row = nt.created_rows[0]
             # 原件绝对路径入列：这是扫描件唯一的入队凭证与 subagent 读图入口
@@ -484,11 +497,92 @@ class TestBackfillQueueReport(unittest.TestCase):
             finally:
                 sys.stdin = old_stdin
             self.assertEqual(ctx.exception.code, 0)
-            rep = json.loads(buf.getvalue())
+            rep = parse_report(buf.getvalue(), self)
             self.assertEqual(rep["created"], 1)
             self.assertEqual(nt.created_rows[0]["source_file"], os.path.abspath(fpath))
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+    def test_backfill_derives_category_and_school_rank(self):
+        """补录派生补齐（真实事故回归）：agent 只填事实字段，category/school_rank/
+        expected_location 必须与批量 parse() 同源算出——曾漏这步，28 条批量有值、
+        3 条扫描件静默留空，直到人眼看表格才发现。"""
+        d = tempfile.mkdtemp(prefix="ur_backfill_derive_")
+        try:
+            fpath = os.path.join(d, "scan.pdf")
+            with open(fpath, "wb") as f:
+                f.write(b"ocr-fixture")
+            payload = [{"name": "邹文飞", "phone": "13800000001",
+                        "education": "大学本科", "school": "江西南昌航空大学",
+                        "expected_position": "暖通工程师",
+                        "skills": ["HVAC", "空调系统"], "_file": fpath}]
+            pj = os.path.join(d, "ocr.json")
+            json.dump(payload, open(pj, "w", encoding="utf-8"), ensure_ascii=False)
+            nt = _UploadNT()
+            buf = io.StringIO()
+            args = type("A", (), {"backfill": pj})()
+            with self.assertRaises(SystemExit) as ctx:
+                with contextlib.redirect_stdout(buf):
+                    ur.run_backfill(nt, args)
+            self.assertEqual(ctx.exception.code, 0)
+            row = nt.created_rows[0]
+            self.assertEqual(row["category"], "技术类", "缺 category 须按职位+技能派生")
+            self.assertEqual(row["school_rank"], "普通本科", "缺 school_rank 须按院校+学历派生")
+            self.assertEqual(row["education"], "本科", "singleSelect 别名须归一到枚举词")
+            self.assertEqual(row["expected_location"], "不限", "期望地点空缺须落兜底枚举")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_backfill_strips_ai_columns_and_refined_at(self):
+        """补录强制剥离精析产出列（AI 三列 + 出队标记）：payload 带入 ai_refined_at 会让
+        扫描件静默永不出队、三列手析烂也没人再管；带入三列则当场手析、与后台重复劳动。
+        docstring 口头禁过但代码没拦——现由代码兜底，且剥离必须在报告里点名（不静默丢）。"""
+        d = tempfile.mkdtemp(prefix="ur_backfill_strip_")
+        try:
+            fpath = os.path.join(d, "scan.pdf")
+            with open(fpath, "wb") as f:
+                f.write(b"ocr-fixture")
+            payload = [{"name": "王五", "phone": "13800000002", "_file": fpath,
+                        "ai_refined_at": 1700000000000, "skills": ["编造词"],
+                        "ai_extract": "手析", "ai_deep": "手析"}]
+            pj = os.path.join(d, "ocr.json")
+            with open(pj, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False)
+            nt = _UploadNT()
+            buf = io.StringIO()
+            args = type("A", (), {"backfill": pj})()
+            with self.assertRaises(SystemExit) as ctx:
+                with contextlib.redirect_stdout(buf):
+                    ur.run_backfill(nt, args)
+            self.assertEqual(ctx.exception.code, 0)
+            row = nt.created_rows[0]
+            for k in ("ai_refined_at", "skills", "ai_extract", "ai_deep"):
+                self.assertNotIn(k, row, "%s 属精析产出列，补录必须剥离" % k)
+            rep = parse_report(buf.getvalue(), self)
+            self.assertEqual(rep["created"], 1)
+            # 剥离不可静默：报告须点名，否则 agent 以为写进去了
+            self.assertEqual(rep["backfill_stripped"][0]["stripped"],
+                             ["ai_deep", "ai_extract", "ai_refined_at", "skills"])
+            # 剥离后扫描件照常入队（谓词真源 refine_loop：ai_refined_at 空即在队）
+            self.assertEqual(rep["refine_queued"], 1)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_derive_never_overwrites_agent_values(self):
+        """derive() 只补空缺：agent 已显式给出的派生列一律保留（与精析 CORRECTIONS
+        的 null=未载明不覆盖同一纪律）。"""
+        import parse_resume as pr
+        out = pr.derive({"name": "张三", "category": "市场类", "school_rank": "985",
+                         "expected_location": "曲靖", "education": "硕士",
+                         "expected_position": "设备工程师", "skills": ["PLC"]})
+        self.assertEqual(out["category"], "市场类")
+        self.assertEqual(out["school_rank"], "985")
+        self.assertEqual(out["expected_location"], "曲靖")
+        self.assertEqual(out["education"], "硕士")
+        # 纯函数：不改入参
+        src = {"school": "黄河科技学院"}
+        pr.derive(src)
+        self.assertEqual(src, {"school": "黄河科技学院"})
 
     def test_finalize_report_counts_unmarked_as_queued(self):
         # 批量入库（不打标记）→ refine_queued = 有全文未标记条数
@@ -500,7 +594,7 @@ class TestBackfillQueueReport(unittest.TestCase):
         with self.assertRaises(SystemExit):
             with contextlib.redirect_stdout(buf):
                 ur._finalize(nt, "resume", [], report)
-        rep = json.loads(buf.getvalue())
+        rep = parse_report(buf.getvalue(), self)
         self.assertEqual(rep["refine_queued"], 1)
 
 

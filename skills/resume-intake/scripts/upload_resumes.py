@@ -13,7 +13,9 @@
 两种模式共用同一套尾部流程：字段校验 → 附件先传（失败则该条不写表）→ 写表 → 按手机号回读。
 补录与批量走完全一致的不变量，扫描件的原件也会进表、MD5 也写入，重跑幂等。
 
-输出 JSON 报告：created / skipped_dup / needs_ocr / failed / readback_missing / table_total /
+输出报告（格式唯一真源 shared/report.py）：stdout 首行 VERDICT:OK|WARN|BAD 一行结论，
+其后 JSON 报告（结果字段 created/readback_missing/table_total/refine_queued 前置，
+timing_ms 垫底）：created / skipped_dup / needs_ocr / failed / readback_missing / table_total /
 refine_queued / timing_ms（+ 队列非空时的 refine_fire_at）。
 timing_ms 为各阶段机器耗时（毫秒）：list_existing/extract(批量)/build_rows/attach/create/readback/total，
 用于定位脚本侧瓶颈（附件与建记录是主要网络段）。精析是异步队列：上传写完表即结束，refine_queued = 当前待精析队列长度
@@ -38,15 +40,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "shared", "preflight"))
 from extract import extract, SUPPORTED_EXTS     # noqa: E402  扩展名清单唯一源在 shared/extract.py
 from notable import Notable, NotableError       # noqa: E402
-from parse_resume import parse                  # noqa: E402
+from parse_resume import parse, derive      # noqa: E402  parse=批量、derive=补录派生，同一批函数
 from preflight import run_preflight             # noqa: E402
 import refine_loop                              # noqa: E402  队列谓词唯一真源，禁止本地抄副本
+from report import print_report                 # noqa: E402  报告输出唯一真源（VERDICT 行 + 结果字段前置）
 
 _CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "config.json")
 
 FULL_TEXT_MAX = 20000  # 全文参考字段截断上限（打分用 skills，不依赖此字段），唯一源
 # 新入库默认沟通状态；合法枚举清单见 config.options.resume.comm_status
 COMM_STATUS_DEFAULT = "待筛选"
+# 补录通道强制剥离的"精析产出列"：AI 三列 + 出队标记。这些列只由后台精析流水线写
+# （谓词真源 shared/refine_loop.py：ai_refined_at 非空即出队）。payload 由 agent 手填，
+# 若允许带入 ai_refined_at，扫描件会静默永不出队、三列手析烂也没人再管；带入三列则当场
+# 手析、与后台重复劳动（曾实测单份 51s）。docstring 口头禁过，但代码没拦——现由代码兜底。
+BACKFILL_STRIP = frozenset(("skills", "ai_extract", "ai_deep", "ai_refined_at"))
 UPLOAD_WORKERS = 10  # 附件上传/文本解析并发；notable.map_parallel 默认 5 对 30+ 文件偏保守
 
 
@@ -116,14 +124,14 @@ def _finalize(nt, table, rows, report, chrono=None):
 
             if chrono:
                 report["timing_ms"] = chrono.finish()
-            print(json.dumps({**report, "error": "查重失败: %s" % e}, ensure_ascii=False))
+            print_report({**report, "error": "查重失败: %s" % e})
             sys.exit(1)
         if chrono:
             chrono.mark("readback")
             report["timing_ms"] = chrono.finish()
         report["created"] = 0
         report["readback_missing"] = []
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+        print_report(report)
         sys.exit(0)
 
     # 附件先行（UPLOAD_WORKERS 并发）：任一附件上传失败则该条不写表（不留无附件记录）
@@ -144,7 +152,7 @@ def _finalize(nt, table, rows, report, chrono=None):
     except NotableError as e:
         if chrono:
             report["timing_ms"] = chrono.finish()
-        print(json.dumps({**report, "error": str(e)}, ensure_ascii=False))
+        print_report({**report, "error": str(e)})
         sys.exit(1)
     if chrono:
         chrono.mark("create")
@@ -161,8 +169,8 @@ def _finalize(nt, table, rows, report, chrono=None):
     except NotableError as e:
         if chrono:
             report["timing_ms"] = chrono.finish()
-        print(json.dumps({**report, "created": len(ids),
-                          "error": "回读/查重失败: %s" % e}, ensure_ascii=False))
+        print_report({**report, "created": len(ids),
+                      "error": "回读/查重失败: %s" % e})
         sys.exit(1)
     if chrono:
         chrono.mark("readback")
@@ -170,7 +178,7 @@ def _finalize(nt, table, rows, report, chrono=None):
     report["created"] = len(ids)
     report["readback_missing"] = [r["phone"] for r in write_rows
                                   if r.get("phone") and r["phone"] not in back]
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    print_report(report)
     sys.exit(1 if report["readback_missing"] else 0)
 
 
@@ -231,7 +239,7 @@ def run_batch(nt, args):
         report["rows"] = [{k: v for k, v in r.items() if k != "_file"} for r in rows]
         chrono.mark("build_rows")
         report["timing_ms"] = chrono.finish()  # dry-run 仅含 extract/build_rows/total（不触网写表）
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+        print_report(report)
         return
 
     chrono.mark("build_rows")
@@ -280,9 +288,19 @@ def run_backfill(nt, args):
             if rec.get("phone") and rec["phone"] in phones:
                 report["skipped_dup"].append({"file": name, "reason": "phone", "phone": rec["phone"]})
                 continue
-            row = {k: v for k, v in rec.items() if k not in ("_file", "file", "full_text")}
+            row = {k: v for k, v in rec.items()
+                   if k not in ("_file", "file", "full_text") and k not in BACKFILL_STRIP}
+            # 精析产出列若被 payload 带入，剥离并在报告里点名（不静默丢，否则 agent 以为写进去了）
+            dropped = sorted(k for k in rec if k in BACKFILL_STRIP)
+            if dropped:
+                report.setdefault("backfill_stripped", []).append(
+                    {"file": name, "stripped": dropped,
+                     "reason": "AI 三列与出队标记只由后台精析写，补录带入已剥离"})
             if isinstance(row.get("certificates"), list):
                 row["certificates"] = "、".join(row["certificates"])
+            # 派生列补齐（与批量 parse() 同一批函数，见 parse_resume.derive）：agent 只填事实，
+            # category/school_rank/expected_location 由脚本算——曾漏这一步导致 3 份扫描件两列静默留空。
+            row = derive(row)
             row["upload_time"] = int(time.time() * 1000)
             row.setdefault("comm_status", COMM_STATUS_DEFAULT)
             row["attach_md5"] = digest
@@ -313,6 +331,10 @@ def main():
 
     if bool(args.dir) == bool(args.backfill):
         ap.error("二选一：提供 <目录> 走批量，或用 --backfill JSON 走补录")
+    # --dry-run 只在批量路径生效；补录曾静默忽略它、照传附件建记录（人以为在预览实则已写表）。
+    # 补录无 dry-run 语义，直接拒收该组合，不赌调用方知道"这个 flag 会被吞"。
+    if args.backfill and args.dry_run:
+        ap.error("--dry-run 仅用于批量模式（<目录>）；补录（--backfill）无预演语义，会真实写表")
 
     # stage 0: 环境预检
     run_preflight(config_path=_CONFIG, files_dir=args.dir)

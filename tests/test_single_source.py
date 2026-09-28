@@ -98,6 +98,15 @@ class TestExtractExtsSingleSource(unittest.TestCase):
         # from extract import SUPPORTED_EXTS —— 必须是同一对象，不是抄的副本
         self.assertIs(upload_resumes.SUPPORTED_EXTS, extract.SUPPORTED_EXTS)
 
+    def test_preflight_uses_extract_supported(self):
+        # preflight 曾自持一份 _SUPPORTED_RESUME_EXTS 且已漂移（少 .webp/.tif/.txt/.md 等），
+        # 目录里只有 .webp 简历时被误拦。现改为 import 同一对象，副本禁止复活。
+        sys.path.insert(0, os.path.join(ROOT, "shared", "preflight"))
+        import preflight
+        self.assertIs(preflight._SUPPORTED_EXTS, extract.SUPPORTED_EXTS)
+        self.assertFalse(hasattr(preflight, "_SUPPORTED_RESUME_EXTS"),
+                         "漂移的第二份扩展名清单已删，禁止复活（不变量 10）")
+
     def test_supported_exts_content(self):
         self.assertEqual(extract.SUPPORTED_EXTS, extract.DOC_EXTS | extract.IMG_EXTS)
         for e in (".webp", ".tif", ".bmp", ".png", ".jpg"):
