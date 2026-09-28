@@ -4,7 +4,7 @@
 背景：三列精析（skills/ai_extract/ai_deep 与岗位三列）是匹配的前置而非上传的前置，
 上传链路写完表即返回；精析消费方 = 上传后 agent 注册的一次性消费任务（注册时刻取上传报告字段
 refine_fire_at，延迟秒数唯一真源 = 本文件 REFINE_DELAY_S；触发纪律见
-skills/resume-intake/SKILL.md）+ 每日 03:00 兜底巡检。无看门狗层：崩溃恢复靠
+skills/resume-intake/SKILL.md）+ 每日 09:30 兜底巡检。无看门狗层：崩溃恢复靠
 "未打标记录仍在队列 + 租约过期自动接管 + 兜底重吃"，理由见 resume-intake SKILL 裁撤记录。
 队列状态不靠"三列是否为空"推断（岗位三列入库即有正则粗值、推断必失效），
 而以显式标记列 ai_refined_at（config.fields，type date 毫秒）为准：空 = 在队列。
@@ -24,7 +24,7 @@ match_gated 前置门禁经 queue_counts() 判断：队列非空 → exit 2 拒�
 周期租约（防并发双写）：prepare 获取 outputs/refine_<chain>.lock（resume/job 两链各自独立、
 可并行），写回端（skills_apply / sync_job_columns）完成后释放；租约跨进程存活（prepare 进程即退，
 PID 无法判活，故以 mtime 新鲜度为凭），30 分钟内视为有周期在跑、后来者 exit 2 秒退。
-崩溃遗留的租约随过期自然失效，队列项由下一周期（新即时任务/03:00 兜底）重吃；
+崩溃遗留的租约随过期自然失效，队列项由下一周期（新即时任务/09:30 兜底）重吃；
 prepare 切出 0 条时即时自释（并发周期已吃空，不留僵尸租约）。
 --force = 夺回自有租约（同周期内重切批用）。
 """

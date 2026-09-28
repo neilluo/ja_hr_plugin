@@ -16,7 +16,7 @@ author:
 
 精析**不由上传同步触发**：上传写完表即结束，本流水线由后台任务消费精析队列
 （消费入口 = 上传后 agent 注册的一次性消费任务，注册时刻取上传报告字段 `refine_fire_at`
-（延迟秒数唯一真源 = `shared/refine_loop.py` 的 `REFINE_DELAY_S`）+ 每日 03:00 兜底巡检，触发纪律见
+（延迟秒数唯一真源 = `shared/refine_loop.py` 的 `REFINE_DELAY_S`）+ 每日 09:30 兜底巡检，触发纪律见
 `skills/resume-intake/SKILL.md`；提示词唯一源 = `references/subagent-prompt.md`）。
 队列谓词唯一真源 `shared/refine_loop.py`（此处不复述条件）。被触发后**全自动执行，不分步等用户确认**：
 查队列 → 切分 → 同一消息内并发 subagent → 合并 → 写回（含出队标记）→ 回读校验。
