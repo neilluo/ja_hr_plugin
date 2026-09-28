@@ -93,26 +93,33 @@ agent 之间零依赖、各读写自己的文件。**提示词已不含内嵌校
 且多花一轮组装时间。若一条消息实在塞不下 M 个调用，宁可下调 `--batch`（减少批数、每批多扛几条），
 也不许把已经切好的 M 批拆成多波。
 
-### Step 3：合并（含盘上产物体检）
+### Step 3：合并（含盘上产物体检 + 归一化 + 软观察）
 
 ```bash
 python3 skills/skills-analyze/scripts/skills_analyze.py merge
 ```
 
-产出 `outputs/skills_done.json`，报告字段：
+产出 `outputs/skills_done.json`（归一化后的行），报告字段（顺序固定）：
 
 ```
-{"merged":N,"batches":M,"missing_batches":[...],"bad_batches":[...],"bad_rows":[...],"all_complete":true|false}
+{"merged":N,"batches":M,"missing_batches":[...],"bad_batches":[...],"dropped_rows":[...],"normalized":N,"normalizations":{...},"observations":{...},"all_complete":true|false}
 ```
 
 `missing_batches` = 该批 done 不存在或 JSON 不可解析；`bad_batches` = 能解析但 id 集合与 pending
-不一致 / 有行缺 id；`bad_rows` = **schema 违规**的行（`validate_row` 返回非空 errors），
-这些行**已被 merge 从 skills_done.json 剔除、不会写回、其 record 不打 `ai_refined_at` → 下周期自动重析**。
-三类都不阻断其余行的写回。`all_complete = true` 当且仅当三类全空。
+不一致 / 有行缺 id；`dropped_rows` = **被丢弃的行**（L0：非 dict、缺 id、id 重复、三列全空），
+每条 `{"id":...,"reason":...}`。`normalized` = 被 `normalize_row` 自动修复过格式的行数，
+`normalizations` = 各修复动作（blank_lines/pipe_fixed/seg_filled/coerced_int…）的次数聚合；
+`observations` = **非阻断质量观察**（超长标签/技能数偏少/文本过长，口径唯一真源
+`shared/soften.py`），格式 `{key: [[id, 值], ...]}`——**只报告、不丢行、不打回重析、
+不影响 all_complete**，可留给人工事后用 sync_ai_columns 薄通道修。
+`all_complete = true` 当且仅当 missing_batches、bad_batches、dropped_rows 三者全空。
 
-**schema 唯一真源 = `skills_analyze.validate_row`**（不变量 10），模板与 subagent 不再自校验——
-过去每 agent 一个 bash 回合跑内嵌 assert 脚本、失败要再"修正 + 复验"至多 2 回合，
-把每 agent 固定开销抬高 30-60s。现 agent 只 Write 产物，merge 一次性扫合规性并把违规行丢回队列。
+**分层口径（不变量 10，约束强度匹配违规可逆性）**：能自动修的一律 `normalize_row` 修复
+（空行、半角竖线、缺段补"未提及"、数组→字符串、"1年"→1）；修不了的质量问题只进
+observations；只有 L0（`validate_row`：非 dict / 三列全空）与缺 id/id 重复才丢行。
+模板与 subagent 不再自校验——过去每 agent 一个 bash 回合跑内嵌 assert 脚本、失败要再
+"修正 + 复验"至多 2 回合，把每 agent 固定开销抬高 30-60s。现 agent 只 Write 产物，
+merge 一次性归一化并把观察报出来。
 
 ### Step 4：写回（同批打出队标记）
 
@@ -147,8 +154,9 @@ python3 skills/skills-analyze/scripts/skills_apply.py outputs/skills_done.json -
 - `<N>` → 批次号 N（done 文件名从 pending→done 自派生，N 不变）
 - `<VOCAB_PATH>` → `outputs/job_vocab.json` 的绝对路径
 
-**schema 校验不再内嵌进模板**：done 产物合规性判定唯一真源 = `skills_analyze.validate_row` +
-`merge`，违规行 merge 丢弃、record 保持未打 `ai_refined_at` → 下周期自动重析。
+**schema 校验不再内嵌进模板**：done 产物的格式偏差由 merge 的 `normalize_row` 自动归一化，
+质量问题由 `soft_observations` 记为非阻断观察（口径唯一真源 `shared/soften.py`），
+只有缺 id / id 重复 / L0（`validate_row`）才丢行（`dropped_rows`）。
 subagent 端不跑 bash 校验、不做"修正-复验"多回合，回合省到"读输入 → 推理 → 写产物"三步。
 
 分派方禁止凭记忆拼路径（N 与路径以 `outputs/skills_dispatch.json` 为准），
@@ -164,10 +172,11 @@ subagent 端不跑 bash 校验、不做"修正-复验"多回合，回合省到"�
   条数超 20 时自动加大 batch 压回 20。**一次性并发发完，不分波、不串行。**
 - 子任务之间零依赖、各读写独立文件；部分失败 merge 自动跳过缺失批次，全部失败才整体失败。
   **subagent 报 failed 时不要立刻补发**：先跑 merge，它已内联盘上产物体检（missing_batches=不存在/
-  不可解析、bad_batches=id 集合不一致、bad_rows=schema 违规行），产物齐全即视为该批成功、
+  不可解析、bad_batches=id 集合不一致、dropped_rows=缺 id/id 重复/L0 无法写回的行），产物齐全即视为该批成功、
   直接进 apply——失败常只发生在产物已落盘后的收尾回合（历史批次 13 即此例：产物已完整，
   收尾回合模型流被 TLS 掐断报 failed，补发白费一轮还覆盖了好产物）。仅当体检报出该批 missing/bad
-  时，才补发该批；bad_rows 里的 record 未打标记、下一周期自动重析，也无需手工补发。
+  时，才补发该批；dropped_rows 里的 record 未打标记、下一周期自动重析，也无需手工补发。
+  质量类问题不再丢行（只进 observations 非阻断观察），因此不存在"因标签字数被打回"的补发场景。
 - 扫描件（`full_text` 为空、`source_file` 指向本地原件）**照常入队精析**：subagent 用 Read 直接读原件
   （PDF/图片，多页逐页、同一条消息并发发出），读图规则见 `references/subagent-prompt.md`。
   原件已被移动/删除的记录判为不可精析、不入队（防永久卡队列并阻塞匹配门禁），

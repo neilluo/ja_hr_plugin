@@ -215,9 +215,11 @@ class TestSkillsAnalyzeQueueCmd(unittest.TestCase):
             finally:
                 sys.argv = old_argv
             out = json.loads(buf.getvalue().strip().splitlines()[-1])
-            # merge 报告契约：盘上体检 + schema 违规行过滤（validate_row SSOT）
+            # merge 报告契约：盘上体检 + L0 丢行 + 归一化/观察（validate_row/soften SSOT）
             self.assertEqual(out, {"merged": 1, "batches": 1, "missing_batches": [],
-                                   "bad_batches": [], "bad_rows": [], "all_complete": True})
+                                   "bad_batches": [], "dropped_rows": [],
+                                   "normalized": 0, "normalizations": {},
+                                   "observations": {}, "all_complete": True})
         finally:
             sa.OUTDIR, sa.Notable = old_outdir, old_nt
             shutil.rmtree(tmp, ignore_errors=True)

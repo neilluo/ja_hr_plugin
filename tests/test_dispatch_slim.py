@@ -1,16 +1,18 @@
 # -*- coding: utf-8 -*-
-"""分派发瘦 + schema SSOT 下沉回归。
+"""分派发瘦 + L0/观察分层回归。
 
 覆盖三块：
   1. render_prompts：per-batch 提示词渲染，所有占位符必须替换干净；模板不再内嵌 bash 校验；
   2. done_integrity：盘上 done 产物结构体检（缺失/坏批），merge 内联判定；
-  3. validate_row：done 行 schema 唯一真源（SSOT），merge 用它决定丢弃哪些行、
-     违规行不打 ai_refined_at 标记 → 下周期自动重析。
+  3. validate_row / normalize_row：L0 硬门槛（仅"确实无法写回"）+ 自动归一化；
+     质量/审美问题只进 soft_observations 非阻断观察（口径唯一真源 shared/soften.py），
+     **不再丢行、不打回重析**（约束强度必须匹配违规可逆性，见 soften 模块 docstring）。
 
 防的事故（AGENTS.md 犯错记录）：
   - 主 agent 把 8.6KB 提示词原文内联进每个 Agent 工具调用 → 工具流截断 → 被迫分波；
-  - subagent 自写/自运行校验脚本 → 每 agent 多 1-3 回合、拉长 stall 暴露窗。
-现渲染后每批只发路径指针；schema 校验唯一真源在 merge。纯本地文件操作，不触网。
+  - subagent 自写/自运行校验脚本 → 每 agent 多 1-3 回合、拉长 stall 暴露窗；
+  - 7 字中文术语触发旧字数硬门槛 → 整行读图产物被丢、队列卡死 ~11 小时并阻塞匹配门禁。
+现渲染后每批只发路径指针；L0 判定唯一真源在 merge。纯本地文件操作，不触网。
 """
 import contextlib
 import io
@@ -26,10 +28,11 @@ sys.path.insert(0, os.path.join(ROOT, "shared"))
 sys.path.insert(0, os.path.join(ROOT, "skills", "skills-analyze", "scripts"))
 
 import skills_analyze as sa              # noqa: E402
+import soften                            # noqa: E402
 
 
 def _row(**ov):
-    """合规基线，ov 覆盖单字段以构造违规样例。"""
+    """合规基线，ov 覆盖单字段以构造样例。"""
     base = {"id": "r1",
             "skills": ["拉晶", "单晶", "拉棒工艺", "切片", "设备管理"],
             "ai_structured": "学历背景｜a\n工作经验｜b\n核心技能｜c\n求职意向｜d\n匹配度评估｜e",
@@ -81,7 +84,7 @@ class TestRenderPrompts(unittest.TestCase):
         self.assertEqual(remaining, ["skills_prompt_part1.md", "skills_prompt_part2.md"])
 
     def test_prompt_no_longer_carries_bash_validator(self):
-        # 校验脚本已从模板剥离，schema SSOT 移到 validate_row + merge（AGENTS.md 教训）
+        # 校验脚本已从模板剥离，schema 判定唯一真源在 merge（AGENTS.md 教训）
         with open(sa.render_prompts(1, "/tmp/vocab.json")[0], encoding="utf-8") as f:
             body = f.read()
         for residue in ("assert 'id 集合不一致'", "标签字数违规",
@@ -89,54 +92,66 @@ class TestRenderPrompts(unittest.TestCase):
             self.assertNotIn(residue, body, "模板仍含旧内嵌校验残留：%s" % residue)
 
 
-class TestValidateRow(unittest.TestCase):
-    """schema 唯一真源：所有违规类别必须被抓到，所有合法边缘必须放过。"""
+class TestValidateRowL0Only(unittest.TestCase):
+    """L0 硬门槛：只报"确实无法写回"的问题；一切质量/审美问题不再是错误。"""
 
     def test_happy_path(self):
-        self.assertEqual(sa.validate_row(_row()), [])
+        self.assertEqual(sa.validate_row(sa.normalize_row(_row())[0]), [])
 
-    def test_missing_required_field(self):
-        r = _row(); r.pop("ai_deep")
-        self.assertTrue(any("缺字段" in e for e in sa.validate_row(r)))
+    def test_non_dict_rejected(self):
+        self.assertTrue(sa.validate_row("不是dict"))
+        self.assertTrue(sa.validate_row(None))
 
-    def test_ai_structured_wrong_segment_names(self):
-        errs = sa.validate_row(_row(ai_structured="学历｜x\n工作经验｜y\n核心｜z\n求职｜a\n匹配｜b"))
-        self.assertTrue(any("段名错" in e for e in errs))
+    def test_missing_nullable_fields_are_not_errors(self):
+        # 缺的可空校正字段 ≡ null：normalize_row 补 None 后 validate_row 必须放过
+        r = {"id": "r1", "skills": [], "ai_structured": "学历背景｜a", "ai_deep": "x"}
+        nr, kinds = sa.normalize_row(r)
+        self.assertIn("field_defaulted", kinds)
+        self.assertEqual(sa.validate_row(nr), [])
 
-    def test_text_over_length(self):
-        self.assertTrue(any("ai_structured" in e for e in sa.validate_row(_row(ai_structured="长" * 201))))
-        self.assertTrue(any("ai_deep" in e for e in sa.validate_row(_row(ai_deep="长" * 201))))
+    def test_aesthetic_issues_never_rejected(self):
+        # 旧硬门槛样例（标签字数/技能数/文本长度/段名）在 L0 一律不报错
+        for ov in (
+            {"skills": ["热镀铝锌硅钢板", "扫描电子显微镜", "质量管理体系认证"]},
+            {"skills": ["只一个"]},
+            {"skills": ["标签%d" % i for i in range(13)]},
+            {"ai_deep": "长" * (sa.DONE_TEXT_MAX + 1)},
+            {"ai_structured": "学历｜x\n工作经验｜y"},          # 段名不全（可归一化修复）
+            {"years_experience": True},                        # bool → coerce_int 归 None
+            {"name": 42},                                      # 数字 → coerce_str 归 "42"
+            {"certificates": ["低压电工证", "特种作业操作证"]},  # list → join_list 归字符串
+        ):
+            nr, _ = sa.normalize_row(_row(**ov))
+            self.assertEqual(sa.validate_row(nr), [], "L0 不应拒绝 %r" % (ov,))
 
-    def test_skill_count_out_of_range(self):
-        self.assertTrue(any("技能数" in e for e in sa.validate_row(_row(skills=["a", "b", "c", "d"]))))
-        self.assertTrue(any("技能数" in e for e in
-                            sa.validate_row(_row(skills=["标签%d" % i for i in range(13)]))))
 
-    def test_zh_skill_length(self):
-        errs = sa.validate_row(_row(skills=["拉晶", "单晶", "很长很长很长很长标签", "切片", "设备管理"]))
-        self.assertTrue(any("中文字数" in e for e in errs))
+class TestObservationSpecs(unittest.TestCase):
+    """软观察：质量问题只进 observations，不影响写回。阈值真源 = shared/soften.py。"""
 
-    def test_years_experience_bool_rejected(self):
-        # bool 是 int 子类，历史坑：True/False 不能当年限
-        self.assertTrue(any("years_experience" in e for e in sa.validate_row(_row(years_experience=True))))
+    def test_over_len_tags_observed_not_rejected(self):
+        row = sa.normalize_row(_row(skills=["拉晶", "热镀铝锌硅钢板"]))[0]
+        obs = soften.soft_observations(row, sa.observation_specs())
+        self.assertEqual(obs.get("over_len_tags"), ["热镀铝锌硅钢板"])
 
-    def test_nullable_str_field_wrong_type(self):
-        self.assertTrue(any("name" in e for e in sa.validate_row(_row(name=42))))
+    def test_thin_tags_only_reports_under(self):
+        thin = sa.normalize_row(_row(skills=["拉晶", "单晶"]))[0]
+        obs = soften.soft_observations(thin, sa.observation_specs())
+        self.assertEqual(obs.get("thin_tags"), [2])
+        ok = sa.normalize_row(_row())[0]
+        self.assertNotIn("thin_tags", soften.soft_observations(ok, sa.observation_specs()))
 
-    def test_edge_cases_pass(self):
-        # 纯英文/缩写术语不限字数
-        self.assertEqual(sa.validate_row(_row(skills=["Kubernetes", "PLC", "MES", "Docker", "拉晶"])), [])
-        # skills 空数组（"无内容可析"）合法
-        self.assertEqual(sa.validate_row(_row(skills=[])), [])
-        # 6 个校正字段全 null 合法
-        self.assertEqual(sa.validate_row(_row(name=None, major=None, school=None,
-                                              certificates=None, years_experience=None,
-                                              expected_position=None)), [])
+    def test_oversize_text_observed(self):
+        row = sa.normalize_row(_row(ai_deep="长" * (sa.DONE_TEXT_MAX + 1)))[0]
+        obs = soften.soft_observations(row, sa.observation_specs())
+        self.assertEqual(obs.get("oversize_text"), ["ai_deep"])
+
+    def test_clean_row_has_no_observations(self):
+        obs = soften.soft_observations(sa.normalize_row(_row())[0], sa.observation_specs())
+        self.assertEqual(obs, {})
 
 
 class TestMergeEndToEnd(unittest.TestCase):
-    """merge 消费 validate_row：违规行不写进 skills_done.json、也不进 bad_batches（批次仍算齐），
-    但报告 bad_rows + all_complete=false。"""
+    """merge 新契约：质量行照常写回（只进 observations）；仅缺 id/id 重复/L0 进 dropped_rows。"""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="sa_merge_")
@@ -151,24 +166,39 @@ class TestMergeEndToEnd(unittest.TestCase):
         with open(os.path.join(self.tmp, name), "w", encoding="utf-8") as f:
             json.dump(rows, f, ensure_ascii=False)
 
-    def test_bad_row_dropped_and_reported(self):
-        self._write("skills_pending_part1.json", [{"id": "ok"}, {"id": "bad"}])
-        self._write("skills_done_part1.json", [_row(id="ok"), _row(id="bad", skills=["只一个"])])
+    def test_quality_row_written_back_with_observation(self):
+        # 旧行为：skills=["只一个"] 触发技能数/字数门槛被丢；新行为：照常写回 + 观察
+        self._write("skills_pending_part1.json", [{"id": "ok"}, {"id": "thin"}])
+        self._write("skills_done_part1.json",
+                    [_row(id="ok"), _row(id="thin", skills=["只一个"])])
         rep = self._run_merge()
-        self.assertEqual(rep["merged"], 1)                          # 只有 ok 落盘
-        self.assertEqual(rep["bad_batches"], [])                    # 批次结构齐
-        self.assertEqual([b["id"] for b in rep["bad_rows"]], ["bad"])
-        self.assertFalse(rep["all_complete"])
+        self.assertEqual(rep["merged"], 2)                          # 两行都落盘
+        self.assertEqual(rep["dropped_rows"], [])
+        self.assertIn("thin_tags", rep["observations"])
+        self.assertEqual(rep["observations"]["thin_tags"], [["thin", 1]])
+        self.assertTrue(rep["all_complete"])                        # 观察不影响 all_complete
         with open(os.path.join(self.tmp, "skills_done.json"), encoding="utf-8") as f:
             done = json.load(f)
-        self.assertEqual([r["id"] for r in done], ["ok"])
+        self.assertEqual([r["id"] for r in done], ["ok", "thin"])
 
-    def test_all_good_marks_all_complete(self):
-        self._write("skills_pending_part1.json", [{"id": "a"}, {"id": "b"}])
-        self._write("skills_done_part1.json", [_row(id="a"), _row(id="b")])
+    def test_missing_and_duplicate_id_dropped_and_visible(self):
+        # 旧行为：缺 id/重复 id 静默跳过（报告盲点）；新行为：进 dropped_rows 可见
+        self._write("skills_pending_part1.json", [{"id": "a"}, {"id": "a"}])
+        self._write("skills_done_part1.json",
+                    [_row(id="a"), _row(id="a"), {k: v for k, v in _row().items() if k != "id"}])
         rep = self._run_merge()
-        self.assertTrue(rep["all_complete"])
-        self.assertEqual(rep["bad_rows"], [])
+        self.assertEqual(rep["merged"], 1)
+        self.assertEqual([d["reason"] for d in rep["dropped_rows"]], ["id 重复", "缺 id"])
+        self.assertFalse(rep["all_complete"])
+
+    def test_report_key_order_exact(self):
+        self._write("skills_pending_part1.json", [{"id": "a"}])
+        self._write("skills_done_part1.json", [_row(id="a")])
+        rep = self._run_merge()
+        self.assertEqual(list(rep.keys()),
+                         ["merged", "batches", "missing_batches", "bad_batches",
+                          "dropped_rows", "normalized", "normalizations",
+                          "observations", "all_complete"])
 
     def _run_merge(self):
         buf = io.StringIO()

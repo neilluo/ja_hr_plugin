@@ -72,6 +72,10 @@
     - 技能词表与分词唯一真源 = `shared/vocab.py`（SKILL_WORDS/SEP/toks）；语义同义词典唯一真源 =
       `semantic_score.py`（SYNONYM/HYPERS）；简历支持扩展名唯一真源 = `shared/extract.py`（SUPPORTED_EXTS）。
     - 匹配阈值/MIN_SCORE 等标量提为**唯一具名常量**（match_gated.REC_MIN/PEND_MIN），文档与 prompt 只引用不复述。
+      具名阈值常量分两级：「硬契约」（L0，可致丢行/退出，如 REC_MIN/PEND_MIN、精析 L0 判定）与
+      「软观察」（L2，仅进报告、**绝不许参与丢行/退出/discard 决策**）；软观察类唯一真源 =
+      `shared/soften.py`（TAG_LEN_MAX/ZH_RANGE/TAGS_*/JD_MUST_RANGE/JD_BONUS_RANGE），消费方 import 派生；
+      把任一 L2 阈值接回丢弃路径 = 违规（元测试 test_weak_dependency_meta.py 防复活）。
     - date 列显示格式（钉钉字段 property.formatter）唯一真源 = `config.formats.date`：建表（replicate_base）/
       补列（sync_schema）经 `skills/replicate/scripts/datefmt.py` 派生 property，真表存量列经 datefmt.align 对齐；
       存储值恒为毫秒时间戳（notable._cast），formatter 只管显示；脚本禁止抄 formatter 字面量（元测试防复活）。
@@ -180,10 +184,31 @@ python3 skills/replicate/scripts/sync_schema.py --check  # 只读：报 config �
 - 曾让 subagent 自写校验 assert 口径（把英文术语按字符数判"2-6 字"超长）→ 多轮试探性 Edit 返工、拉长暴露
   stall 窗口的时间；曾一度改为"提示词内嵌 bash 校验、agent 原样运行"消除了自写口径，
   但每 agent 仍固定多 1 个 Bash 回合、失败要"修正+复验"至多再 2 回合，把 31 条流水线的墙钟抬高 30-60s；
-  现 schema 判定唯一真源下沉到 merge 的 `validate_row`（不变量 10：口径单一出现，禁止模板/脚本两处抄），
-  违规行 merge 直接剔除、record 不打 `ai_refined_at` → 下周期自动重析（不新增恢复层，复用既有出队凭证），
-  agent 回合省到"读输入 → 推理 → 写产物"三步。教训：校验放在离产物最近的地方最省回合，
-  让"写者"自检是"多一次工具往返"，让"读者"（merge）在批处理入口统一校验才是"零额外回合"。
+  于是把 schema 判定唯一真源下沉到 merge 的 `validate_row`（回合账是对的），**但迁移时把阈值原样照搬、
+  无人重问"这些阈值配不配当硬门槛"，而搬进 merge 就等于把严重度从"agent 可忽略的提醒"静默升级成
+  "整行销毁"**：那些阈值从来只是发明的审美偏好（非平台限制、非业务要求），7 字中文术语"热镀铝锌硅钢板"
+  触发"2-6 字"硬门槛 → 整行（含一次扫描件读图推理）被丢、不打 `ai_refined_at` → 队列卡死至次日 09:30
+  兜底（~11 小时），期间 match_gated 门禁被非空队列阻塞、全部匹配停摆；"扫描电子显微镜""质量管理体系认证"
+  等标准术语同样全部可拒。同一次迁移里 `≤200字` 文本上限其实已被放宽到 6000 并注释"不再作为打回重析的
+  惩罚门槛"——证明这个问题当时被想过一次，却只应用在了一个阈值上。教训：**搬动一个校验 = 改变它的严重度，
+  严重度必须被刻意选择**；治理原则：**约束强度必须与违规的可逆性匹配**——可逆的外观缺陷（超长词、缺段、
+  半角符号）只配观察/自动修复，不可逆的损伤（脏写、卡队列）才配硬失败。现口径：机械可修的格式问题由
+  `normalize_row` 确定性修复（经 `shared/soften.py`），质量/审美问题进 `observations` 非阻断观察
+  （不丢行、不影响 all_complete），`validate_row` 只剩 L0"确实无法写回"（非 dict、缺/重 id、三列全空——两链对称）；
+  "校验下沉到离产物最近的读者（merge）省回合"仍然成立，但下沉的必须只是 L0。
+  元测试 test_weak_dependency_meta.py + test_soft_dependencies.py + test_jobs_soft_dependencies.py 防再硬化。
+- 曾让 prompt 模板向模型承诺"纯英文/缩写术语不受字数限制"，而代码对所有字符串一刀切 `len(tag) <= 12` →
+  `Continuous Plating Line`（21 字符）照拒，模型无从知晓、无从合规——文档与代码的矛盾永远由代码赢。
+  教训：**凡以文字向模型声明的约束，必须在代码里为真**；发现此类矛盾的修法是删掉不义的检查和阈值本身，
+  不是往提示词里加更多辩解文字。
+- 曾让 merge 对缺/重 id 的行静默 `continue`、不落任何记录 → 一行凭空消失而报告仍称成功（merged 计数
+  看不出少了谁）。教训：**任何丢弃数据的路径都必须出现在报告里**；现缺/重 id 归 L0 进 `dropped_rows`
+  （带 id 与 reason），报告契约（两链一致、键序固定）：merged/batches/missing_batches/bad_batches/
+  dropped_rows/normalized/normalizations/observations/all_complete，旧 `bad_rows` 键已废。
+- 曾把"违规行不打 ai_refined_at → 下周期自动重析"当作廉价安全网 → 本仓的一次性消费任务完成即自删，
+  "下周期"实为次日 09:30 兜底 cron（最坏 ~11 小时），且卡住的记录会让 refine 队列非空、
+  match_gated 门禁期间拒绝为**所有**岗位打分。教训：任何以"下一周期会修好"为依赖的设计，
+  必须写明真实的墙钟延迟与期间被阻塞的功能，答不出就不许把它当恢复手段。
 - 曾给精析队列加 +15 分钟看门狗补跑任务 → 与 03:00 兜底功能重叠，且判活窗口（30 分钟租约）> 看门狗延迟，
   崩溃场景必然被误判成"还在跑"而静默退出——三层恢复互相矛盾的空转层，已整体裁撤（不变量 11）。
   教训：每加一层恢复/兜底，必须先回答"它覆盖了哪一层覆盖不到的真实场景"，答不出就不加。

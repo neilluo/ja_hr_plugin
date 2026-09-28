@@ -35,13 +35,17 @@ python3 skills/job-intake/scripts/upload_jobs.py <目录> --dry-run  # 预演，
   `python3 skills/job-intake/scripts/sync_job_columns.py payload.json`（同一次 update 打 ai_refined_at 标记出队）：
   - `hard_gates` 固定五段、缺项写"不作硬性要求"：`学历：…；专业：…；经验：…；证书：…；年龄：…`
     （这四五项是一票否决依据，也是匹配复核的对照清单）；
-  - `must_skills` 6~10 个、`bonus_skills` 4~8 个，用「、」分隔的短词，
+  - `must_skills` 尽量 6~10 个、`bonus_skills` 尽量 4~8 个（软偏好，不是硬门槛：数量/字数
+    不符只会被 merge 记为观察，不丢行、不阻断写回），用「、」分隔的短词，
     **词表必须与简历库技能标签同源**（成本会计写"账务处理"而候选人标签是"总账处理"，命中率直接归零）；
   - 不要塞"Excel/Word/办公软件"这类无区分度词，除非 JD 把它写成核心要求。
-- 回写后跑一次 `python3 skills/job-intake/scripts/check_skill_coverage.py`，把可命中率低于 50% 的岗位改词再同步，
-  直到该脚本 exit 0 才算完成入库。
-  **但要先分辨低覆盖的两种原因**：① 用词与简历标签不同源 → 改词；② 库里确实没有这类候选人（如成本会计
+- 回写后跑一次 `python3 skills/job-intake/scripts/check_skill_coverage.py --emit-fixes`，
+  低覆盖岗位的 ①/② 两因分辨与建议词由脚本产出（jobs_fix.json / jobs_fix_report.json，
+  详见下节「三模式」），agent 复核报告后 `sync_job_columns.py outputs/jobs_fix.json` 重同步，
+  直到仅剩 ②类才算完成入库。
+  **两因分辨口径**：① 用词与简历标签不同源 → 改词；② 库里确实没有这类候选人（如成本会计
   岗，库内财务候选人只有主管级、无成本核算经验）→ 属有效业务信号，保留原词并在汇报里说明。
+  建议词是启发式候选（共享汉字近邻），落库前必须过目 report，同形不同义不能盲收。
 - 权重默认 0.7/0.3；如需调整用 `shared/query.py job --fields job_id,must_weight` 查 id，
   再经 Notable.update_records 改。
 - JD 附件与简历同纪律：先传后写，附件失败该条不入库。
@@ -63,9 +67,9 @@ python3 skills/job-intake/scripts/upload_jobs.py <目录> --dry-run  # 预演，
   非空则按本 SKILL「智能分析JD」流水线全自动执行到 `sync_job_columns.py` 写回。
 - **完成即自删**：payload 末条指令必须是"任务结束时（含队列为 0 静默结束）按任务名删除本一次性任务自身"——
   已消费完的任务不留列表；每日 09:30 兜底的自清理只是对崩溃在自删之前的任务的兜底网。
-- 写回后跑 `python3 skills/job-intake/scripts/check_skill_coverage.py`，低覆盖按本 SKILL
-  两因分辨纪律处理：① 用词与简历标签不同源 → 改词重同步直到 exit 0；② 库里确实没有这类
-  候选人 → 保留原词并在任务结果里说明，不强行凑 exit 0。
+- 写回后跑 `python3 skills/job-intake/scripts/check_skill_coverage.py --emit-fixes`，低覆盖按本 SKILL
+  两因分辨纪律处理：① 用词与简历标签不同源 → 脚本产建议词进 jobs_fix.json，过目 report 复核后
+  重同步；② 库里确实没有这类候选人 → 保留原词并在任务结果里说明，不强行凑 exit 0。
   简历标签池为空（resume 表无 skills）时跳过覆盖率自检。
 - prepare 返回 refused（exit 2，撞活租约）即退出、禁止抢跑；不设看门狗，消费任务崩溃由
   每日 09:30 兜底巡检重吃（不变量 11）。
@@ -84,15 +88,37 @@ python3 skills/job-intake/scripts/upload_jobs.py <目录> --dry-run  # 预演，
 python3 skills/job-intake/scripts/jobs_analyze.py prepare            # 只取队列中的岗；--all = 连已精析的一起重析
 #   周期租约 outputs/refine_job.lock：prepare 获取（活租约期内第二个周期 refused exit 2，
 #   勿抢跑），sync_job_columns 写回时释放；同周期重切批加 --force
-# → 按 meta.batches 的数量，在同一条消息里一次性并发发 agent（≤20，不分波、不串行）
-#   每个只给：提示词 skills/job-intake/references/job-subagent-prompt.md + 批次号 + part 路径
-#   part 路径必须是盘上真实存在的 pending 文件（禁止凭记忆写前缀/序号）；
-#   done 文件名由 agent 从输入自派生（pending→done，N 不变），分派方不指定
-python3 skills/job-intake/scripts/jobs_analyze.py merge             # → outputs/jobs_done.json（missing_batches 非空则补发该批）
+#   prepare 同时渲染 per-batch 提示词到 outputs/jobs_prompt_part<N>.md（占位符已由代码替换），
+#   分派清单落 outputs/jobs_dispatch.json（{"batches":N,"prompts":[...]}）；
+#   词表参考 outputs/resume_vocab.json = 简历标签池实值派生（岗位选词的打分对手方，非 job 表自参照）
+# → 按 jobs_dispatch.json 的 prompts 列表，在同一条消息里一次性并发发 agent（≤20，不分波、不串行），
+#   每个任务的 prompt 只写一行指针：读 <jobs_prompt_partN.md 路径> 并执行（禁止内联提示词原文，
+#   大批次会撑爆工具流入参导致截断分波，见 AGENTS.md 犯错记录）；
+#   subagent 只"读→推理→写产物"，不自检（schema 判定唯一真源在 merge 的 validate_row）
+python3 skills/job-intake/scripts/jobs_analyze.py merge   # → outputs/jobs_done.json
+#   merge 内联两级判定：done_integrity（盘上体检 missing_batches/bad_batches）+
+#   行级 normalize_row（自动修格式：缺门槛段补"不作硬性要求"、must/bonus 去重、半角标点转全角、数组转串）
+#   + validate_row（L0 唯一丢行判定：非 dict / 缺或重复 job_id / 三列全空 → dropped_rows、不打标、下周期重析）；
+#   质量问题（技能词字数、必备/加分项数量）只进 observations 非阻断观察，照常写回、不影响 all_complete；
+#   报告键序 = merged/batches/missing_batches/bad_batches/dropped_rows/normalized/normalizations/observations/all_complete；
+#   failed 先信体检——all_complete=true 即进写回，仅 missing/bad 批次才补发（省人工验盘回合）
 python3 skills/job-intake/scripts/sync_job_columns.py outputs/jobs_done.json   # 写回三列，同一次 update 打 ai_refined_at 标记（出队）
-python3 skills/job-intake/scripts/check_skill_coverage.py           # 词表同源校验，必须 exit 0
+python3 skills/job-intake/scripts/check_skill_coverage.py --emit-fixes         # 词表同源校验+两因分辨
 ```
 
+**check_skill_coverage 三模式**（低覆盖处置从"agent 现场考古"下沉为脚本判定）：
+- 默认：报低覆盖岗与未命中词，存在低覆盖 exit 2（②类合法保留岗同样 exit 2，处置见下）。
+- `--emit-fixes [OUTDIR]`：对每个未命中词做 ①/② 分辨（①=池内存在 ≥2 共享汉字的近邻 → 建议替换；
+  ②=无近邻 → 库内无此人、保留原词），产出 `jobs_fix.json`（sync_job_columns 可直接消费的 payload，
+  仅改 must_skills）与 `jobs_fix_report.json`（逐词 cause/suggested/still_low）。
+  agent 扫一眼 report 复核建议词（启发式候选，同形不同义如"生产排班"↔"生产计划"不能盲收），
+  再 `sync_job_columns.py outputs/jobs_fix.json` → 复跑 `--emit-fixes` 收敛。
+  仅剩 ②类（报告里 still_low=True）即视为达标，保留原词、汇报说明，不强行凑 exit 0。
+- `--precheck payload.json`：写回前预校验 payload 建议词命中率，全 ≥min 即 exit 0 再 sync
+  （把"写回→自检→发现没修好→再改"的往返掐在写库之前）。
+- **池变动告警**：每次运行与上次标签池快照（outputs/resume_pool_snapshot.json）比对，池被并发
+  简历精析刷新时打 pool_drift 行——上一轮改词结论作废，必须以本次为准（实测两链并行刷池曾使
+  刚修完的词二次返工）。
 子任务判不了时才手工兜底（直接在 payload 里写三字段）。
 **check_skill_coverage 与 match_gated 同纪律**：岗位队列非空即 exit 2（粗词表覆盖率无意义），
 先跑完本流水线清空队列再自检。

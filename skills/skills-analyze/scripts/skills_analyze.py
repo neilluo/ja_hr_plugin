@@ -31,6 +31,7 @@ from notable import Notable  # noqa: E402
 from vocab import toks       # noqa: E402  分词分隔符唯一源，禁止本地再抄正则
 import refine_loop           # noqa: E402  队列谓词唯一真源，禁止本地抄副本
 import analyze_parts as ap   # noqa: E402  切批/合并公共骨架（parts 命名唯一真源）
+import soften                # noqa: E402  归一化+软观察唯一真源（L2 阈值在此，禁止本地抄）
 
 OUTDIR = os.path.join(ROOT, "outputs")
 PREFIX = "skills"
@@ -41,57 +42,98 @@ PROMPT_TPL = os.path.join(ROOT, "skills", "skills-analyze", "references", "subag
 META_BIZ = ["name", "skills", "upload_time"]
 BIZ = META_BIZ + ["full_text", "source_file"]
 
-# ── done 产物 schema 唯一真源（不变量 10）────────────────────────────────────
-# 由 merge 一次性判定所有行；模板与 agent 不再自校验，也不允许在别处再抄口径。
-# 违反此 schema 的行被 merge 丢回队列（ai_refined_at 未打），下一周期自动重析。
+# ── done 产物 schema（L0 硬门槛）+ 归一化口径（不变量 10）──────────────────────
+# L0（确实无法写回：非 dict、缺/重 id、归一化后三列全空）才丢行；由 validate_row + merge 判定。
+# 一切质量/审美问题（标签字数、技能数量、文本长度、段名/格式）一律先由 normalize_row 自动修复，
+# 修不了也只进 soft_observations 非阻断观察——**观察不参与 all_complete、不丢行、不阻断写回**。
+# L2 阈值常量唯一真源 = shared/soften.py（TAG_LEN_MAX/ZH_RANGE/TAGS_*），此处禁止抄数值。
 DONE_REQUIRED_FIELDS = ("skills", "ai_structured", "ai_deep",
                         "name", "major", "school", "certificates",
                         "years_experience", "expected_position")
 DONE_NULLABLE_STR_FIELDS = ("name", "major", "school", "certificates", "expected_position")
 DONE_STRUCTURED_SEGS = ["学历背景", "工作经验", "核心技能", "求职意向", "匹配度评估"]
-DONE_TEXT_MAX = 200      # ai_structured / ai_deep 上限（字符）
-DONE_SKILLS_RANGE = (5, 12)
-DONE_SKILL_LEN_MAX = 12  # 任意标签总字符 ≤ 12
-DONE_SKILL_ZH_RANGE = (2, 6)   # 含中文字符时，中文字数 ∈ [2, 6]；纯英文/缩写不限
+DONE_TEXT_MAX = FULL_TEXT_MAX  # 仅观察口径（oversize_text）：超长只报告不丢行；
+                               # 长度软约束由 prompt 负责（"200字以内"）
+
+
+def normalize_row(r):
+    """把 subagent 产出的一行归一成可写回形态。返回 (row, kinds)；不改入参、构造新 dict。
+
+    修复而非报错（历史事故：7 字术语"热镀铝锌硅钢板"触发旧字数硬门槛 → 整行读图产物被丢、
+    队列卡死 ~11 小时并阻塞匹配门禁；约束强度必须匹配违规可逆性）：
+      - ai_structured 经 soften.normalize_segments 定序补齐五段（空行/半角竖线/缺段/数组均自动修）；
+      - ai_deep / name / major / school / expected_position 经 coerce_str（数组→顿号串、数字→字符串）；
+      - certificates 经 join_list（数组→"、"连接字符串）；
+      - years_experience 经 coerce_int（"1年"→1、1.5→2、bool→None）；
+      - DONE_REQUIRED_FIELDS 缺键补 None（缺的可空校正字段 ≡ null，绝不算错误）。
+    kinds 为修复动作短标签列表（供 merge 聚合报告），空 = 该行本已规范。
+    """
+    kinds = []
+    if not isinstance(r, dict):
+        return r, []          # 非 dict 交 validate_row 作 L0 拦下
+    out = {"id": r.get("id")}
+    st, ks = soften.normalize_segments(r.get("ai_structured"), DONE_STRUCTURED_SEGS)
+    kinds.extend(ks)
+    # 兜底成字符串：skills_apply 写回侧对 ai_extract/ai_deep 直接取用（_cast text 列），
+    # 非字符串会在 PUT 时才炸、且报错信息不指向本行；在此收口保证 L0 之后恒为 str。
+    out["ai_structured"] = st if isinstance(st, str) else soften.coerce_str(st) or ""
+    raw_dp = r.get("ai_deep")
+    dp = soften.coerce_str(raw_dp) or ""
+    # 与"已归一形态"比较（None 与 "" 视为等价），否则空值行每轮都记一次 coerced_str、
+    # 破坏 normalize_row 的幂等契约（第二次调用必须 kinds=[]）
+    if dp != (raw_dp.strip() if isinstance(raw_dp, str) else ""):
+        kinds.append("coerced_str")
+    out["ai_deep"] = dp
+    for f in DONE_NULLABLE_STR_FIELDS:
+        # certificates 走 join_list（数组→顿号串）；其余 coerce_str（list 亦委托 join_list）
+        v = soften.join_list(r.get(f)) if f == "certificates" else soften.coerce_str(r.get(f))
+        if v != r.get(f):
+            kinds.append("list_joined" if isinstance(r.get(f), (list, tuple)) else "coerced_str")
+        out[f] = v
+    ye = soften.coerce_int(r.get("years_experience"))
+    if ye != r.get("years_experience"):
+        kinds.append("coerced_int")
+    out["years_experience"] = ye
+    sk = r.get("skills")
+    out["skills"] = [str(x).strip() for x in sk if str(x).strip()] \
+        if isinstance(sk, (list, tuple)) else (toks(sk) if isinstance(sk, str) else [])
+    if out["skills"] != sk:
+        kinds.append("skills_coerced")
+    for f in DONE_REQUIRED_FIELDS:
+        if f not in r:
+            kinds.append("field_defaulted")   # 缺的可空校正字段 ≡ null，补 None 不算错误
+    return out, kinds
 
 
 def validate_row(r):
-    """返回违规说明列表；空列表 = 合规。禁止在任何调用方再抄 assert 口径（SSOT）。"""
-    errs = []
-    for f in DONE_REQUIRED_FIELDS:
-        if f not in r:
-            errs.append("缺字段 %s" % f)
-    if errs:
-        return errs   # 缺字段已足矣说明问题，后续判定会 KeyError
-    st, dp = r["ai_structured"], r["ai_deep"]
-    if not isinstance(st, str) or not isinstance(dp, str):
-        errs.append("ai_structured/ai_deep 须为字符串")
-        return errs
-    segs = [l.split("｜")[0] for l in st.split("\n")]
-    if segs != DONE_STRUCTURED_SEGS:
-        errs.append("段名错 %s" % segs)
-    if len(st) > DONE_TEXT_MAX:
-        errs.append("ai_structured 超 %d 字" % DONE_TEXT_MAX)
-    if len(dp) > DONE_TEXT_MAX:
-        errs.append("ai_deep 超 %d 字" % DONE_TEXT_MAX)
-    sk = r["skills"]
-    lo, hi = DONE_SKILLS_RANGE
-    if not isinstance(sk, list) or (sk and not (lo <= len(sk) <= hi)):
-        errs.append("技能数越界 %s" % (len(sk) if isinstance(sk, list) else type(sk).__name__))
-    else:
-        for s in sk:
-            if not isinstance(s, str) or not (0 < len(s) <= DONE_SKILL_LEN_MAX):
-                errs.append("标签长度违规 %r" % (s,)); continue
-            zh = sum(1 for ch in s if "一" <= ch <= "鿿")
-            if zh and not (DONE_SKILL_ZH_RANGE[0] <= zh <= DONE_SKILL_ZH_RANGE[1]):
-                errs.append("标签中文字数违规 %r(zh=%d)" % (s, zh))
-    ye = r["years_experience"]
-    if ye is not None and (not isinstance(ye, int) or isinstance(ye, bool)):
-        errs.append("years_experience 须为 int 或 null %r" % (ye,))
-    for f in DONE_NULLABLE_STR_FIELDS:
-        if r[f] is not None and not isinstance(r[f], str):
-            errs.append("%s 须为字符串或 null" % f)
-    return errs
+    """L0 硬门槛（唯一可丢行的判定）：只报"确实无法写回"的问题，返回错误字符串列表（空=可写回）。
+
+    预期在 normalize_row 之后调用。L0 仅两条：非 dict；三列（skills/ai_structured/ai_deep）
+    归一化后全空——无任何可写回内容。
+    第二条**必须在 merge 拦下**，不能留给 skills_apply 的 require_three：apply 侧把该行记进
+    `bad` 而不写回、不打 `ai_refined_at`，于是它永远留在精析队列、每周期重析（无限循环），
+    且报告里只有 merged 计数看不出少了谁。放这里则进 `dropped_rows`（带 id 与 reason）可见。
+    与 JD 链 jobs_analyze.validate_row 的"三列全空"L0 口径对称。
+    质量/审美检查（标签字数、技能数量、文本长度、段名、缺可空字段、years_experience 类型、
+    校正字段 list-vs-str）一律不在这里——已移入 soft_observations（非阻断，只报告）。
+    """
+    if not isinstance(r, dict):
+        return ["行不是 dict（%s）" % type(r).__name__]
+    sk = [x for x in (r.get("skills") or []) if str(x).strip()]
+    if not (sk or str(r.get("ai_structured") or "").strip()
+            or str(r.get("ai_deep") or "").strip()):
+        return ["三列全空（skills/ai_structured/ai_deep 归一化后均无内容）"]
+    return []
+
+
+def observation_specs():
+    """简历链软观察规格：soften 数据驱动 SOFT_SPECS（标签类）+ 本链专有的 oversize_text。
+    返回值仅用于 merge 报告，禁止参与任何丢行/退出决策。"""
+    return tuple(soften.SOFT_SPECS) + (
+        {"key": "oversize_text", "field": "ai_structured/ai_deep",
+         "check": lambda row: [f for f in ("ai_structured", "ai_deep")
+                               if isinstance(row.get(f), str) and len(row[f]) > DONE_TEXT_MAX]},
+    )
 
 
 def render_prompts(n_batches, vocab_path):
@@ -157,8 +199,8 @@ def done_integrity():
         except Exception:  # noqa: BLE001  不可解析按缺失处理，与 read_done 同口径
             missing.append(i)
             continue
-        pids = {r.get("id") for r in pend if r.get("id")}
-        dids = {r.get("id") for r in dn if r.get("id")}
+        pids = {r.get("id") for r in pend if isinstance(r, dict) and r.get("id")}
+        dids = {r.get("id") for r in dn if isinstance(r, dict) and r.get("id")}
         if len(dids) != len(dn) or pids != dids:
             bad.append(i)
     return {"batches": total, "missing_batches": missing, "bad_batches": bad,
@@ -251,25 +293,43 @@ def prepare(args):
 
 def merge(args):
     rows, _ = ap.read_done(OUTDIR, PREFIX)   # 缺失/坏批次判定统一交 done_integrity，此处只取行
-    done, seen, bad_rows = [], set(), []
+    specs = observation_specs()
+    done, seen, dropped = [], set(), []
+    normalizations, observations, n_normalized = {}, {}, 0
     for row in rows:
-        rid = row.get("id")
-        if not rid or rid in seen:
+        if not isinstance(row, dict) or not row.get("id"):
+            dropped.append({"id": None, "reason": "缺 id"})   # 曾静默跳过，现为报告盲点补齐
+            continue
+        rid = row["id"]
+        if rid in seen:
+            dropped.append({"id": rid, "reason": "id 重复"})
             continue
         seen.add(rid)
-        errs = validate_row(row)             # schema 唯一真源：违规行丢弃、不写 ai_refined_at → 下周期重析
+        nr, kinds = normalize_row(row)
+        if kinds:
+            n_normalized += 1
+            for k in kinds:
+                normalizations[k] = normalizations.get(k, 0) + 1
+        errs = validate_row(nr)             # L0 唯一可丢行判定（非 dict / 三列全空）
         if errs:
-            bad_rows.append({"id": rid, "errors": errs})
+            dropped.append({"id": rid, "reason": "; ".join(errs)})
             continue
-        done.append(row)
+        for key, vals in soften.soft_observations(nr, specs).items():
+            observations.setdefault(key, []).extend([[rid, v] for v in vals])
+        done.append(nr)
     json.dump(done, open(os.path.join(OUTDIR, "skills_done.json"), "w", encoding="utf-8"),
               ensure_ascii=False, indent=1)
     integ = done_integrity()   # 盘上产物体检（缺失/坏批次的记录未打标、下周期自动重析）
+    # observations 刻意不影响 all_complete：软观察不阻断写回、不打回队列（见 soften 模块 docstring）
     print(json.dumps({"merged": len(done), "batches": integ["batches"],
                       "missing_batches": integ["missing_batches"],
                       "bad_batches": integ["bad_batches"],
-                      "bad_rows": bad_rows,
-                      "all_complete": (integ["all_complete"] and not bad_rows)},
+                      "dropped_rows": dropped,
+                      "normalized": n_normalized,
+                      "normalizations": normalizations,
+                      "observations": observations,
+                      "all_complete": (not integ["missing_batches"]
+                                       and not integ["bad_batches"] and not dropped)},
                      ensure_ascii=False))
 
 

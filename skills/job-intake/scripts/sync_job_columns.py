@@ -10,10 +10,12 @@ payload.json 格式（键可用 岗位ID 或 "部门|岗位名"）：
                    "bonus_skills": "合并报表、税务申报、ERP、Excel"}}
 
 写法要求：
-  - hard_gates 固定五段（缺项写"不作硬性要求"）：学历：…；专业：…；经验：…；证书：…；年龄：…
+  - hard_gates 五段（缺项由 jobs_analyze.normalize_row 自动补"不作硬性要求"）：
+    学历：…；专业：…；经验：…；证书：…；年龄：…
     这四/五项是一票否决项，也是匹配复核的逐项对照依据。
   - must_skills / bonus_skills 用「、」分隔的短词，词表必须与简历库技能标签同源
-    （否则命中率恒为 0，分数全部失真）；每岗必备技能 6~10 个，加分项 4~8 个。
+    （否则命中率恒为 0，分数全部失真）；每岗必备技能 6~10 个、加分项 4~8 个是软偏好
+    （数量/字数口径唯一真源 shared/soften.py，仅作观察不阻断写回）。
   - 不要塞 Excel/Word/办公软件 这类无区分度词，除非 JD 把它写成核心要求。
 
 用法:  python3 skills/job-intake/scripts/sync_job_columns.py payload.json
