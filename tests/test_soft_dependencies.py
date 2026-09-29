@@ -123,10 +123,16 @@ class TestSoftenHelpers(unittest.TestCase):
         self.assertEqual(soften.normalize_segments("", SEGS)[1], [])
 
     def test_over_len_words_and_count(self):
+        # 默认（jobs 链语义）：纯英文超长仍报观察
         self.assertEqual(soften.over_len_words(["拉晶", "热镀铝锌硅钢板",
                                                 "Continuous Plating Line"]),
                          ["热镀铝锌硅钢板", "Continuous Plating Line"])
         self.assertEqual(soften.over_len_words(["PLC", "Kubernetes"]), [])
+        # en_exempt（skills 链语义，prompt 声明纯英文无字符数上限）：纯英文一律不报
+        self.assertEqual(soften.over_len_words(["拉晶", "热镀铝锌硅钢板",
+                                                "Continuous Plating Line"], en_exempt=True),
+                         ["热镀铝锌硅钢板"])
+        self.assertEqual(soften.over_len_words(["Continuous Plating Line"], en_exempt=True), [])
         self.assertEqual(soften.count_out_of_range(["a"] * 5, 5, 12), [])
         self.assertEqual(soften.count_out_of_range(["a"] * 4, 5, 12), [4])
 

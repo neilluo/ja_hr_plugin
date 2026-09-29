@@ -25,6 +25,7 @@ from semantic_score import toks, txt  # noqa: E402
 # 同 skill 私有常量/公共件唯一真源在 match_gated（不变量 10）：来源标记、行组装、四项统计刷新
 from match_gated import SYS_SOURCE, _match_row, refresh_job_stats  # noqa: E402
 import analyze_parts as ap  # noqa: E402  切批/合并公共骨架（parts 命名唯一真源）
+import soften  # noqa: E402  L2 长度软阈值唯一真源（EV_LEN_MAX/AI_ANALYSIS_RANGE）
 
 OUTDIR = os.path.join(ROOT, "outputs")
 PREFIX = "match"
@@ -96,11 +97,47 @@ def prepare(args):
     return meta
 
 
+def match_observations(rows, expected):
+    """match 链 L2 软观察（阈值唯一真源 shared/soften.EV_LEN_MAX / AI_ANALYSIS_RANGE）。
+
+    只报、绝不阻断：不截断、不丢行、不参与 keep/分数/recommend 任何决策，也不影响
+    missing_batches 口径。2026-09-29 事故教训：evidence 80 字上限曾由提示词声明、
+    subagent 自写 assert 执行，11 批里 9 批撞 AssertionError 返工改写；现长度一律降级为
+    观察（prompt 同步改软偏好、删自检返工指令，见 match-subagent-prompt.md）。
+    expected = pending 应覆盖的 (job_id, name) 集合，missing_pairs 只报漏行不补不丢。
+    返回 {观察名: 非空问题列表}（空观察不出现）。"""
+    obs = {"overlong_evidence": [], "overlong_analysis": [], "thin_analysis": [],
+           "missing_fields": [], "missing_keep": [], "missing_pairs": []}
+    got = set()
+    for r in rows:
+        tag = "%s/%s" % (r.get("job_id"), r.get("name"))
+        got.add((r.get("job_id"), r.get("name")))
+        ev = r.get("evidence")
+        if isinstance(ev, str) and len(ev) > soften.EV_LEN_MAX:
+            obs["overlong_evidence"].append([tag, len(ev)])
+        ai = r.get("ai_analysis")
+        if isinstance(ai, str) and ai.strip():
+            if len(ai) > soften.AI_ANALYSIS_RANGE[1]:
+                obs["overlong_analysis"].append([tag, len(ai)])
+            elif len(ai) < soften.AI_ANALYSIS_RANGE[0]:
+                obs["thin_analysis"].append([tag, len(ai)])
+        elif r.get("keep"):
+            obs["missing_fields"].append([tag, "ai_analysis"])
+        if r.get("keep") and not isinstance(r.get("skill_score"), (int, float)):
+            obs["missing_fields"].append([tag, "skill_score"])
+        if "keep" not in r:
+            obs["missing_keep"].append(tag)
+    for key in sorted(expected - got):
+        obs["missing_pairs"].append(list(key))
+    return {k: v for k, v in obs.items() if v}
+
+
 def merge(args):
     n = ap.count_pending(OUTDIR, PREFIX)
     # 子任务产出只带 name/job_id；用 pending 输入回联 (job_id, name)→record id，给每条判定补 rid，
     # 供 apply 按 record id 取简历（重名不覆盖）
     rid_of = {}
+    expected = set()
     for i in range(1, n + 1):
         pp = ap.pending_path(OUTDIR, PREFIX, i)
         if not os.path.exists(pp):
@@ -109,15 +146,18 @@ def merge(args):
             for blk in json.load(open(pp, encoding="utf-8")):
                 for c in blk.get("candidates", []):
                     rid_of.setdefault((blk["job"]["job_id"], c.get("name")), c.get("id"))
+                    expected.add((blk["job"]["job_id"], c.get("name")))
         except Exception:
             pass    # pending 缺坏只影响 rid 补全，判定照常合并（apply 有 name 回退）
     rows, missing = ap.read_done(OUTDIR, PREFIX)
     for r in rows:
         r.setdefault("rid", rid_of.get((r.get("job_id"), r.get("name"))))
+    obs = match_observations(rows, expected)
     json.dump(rows, open(FINAL, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     keep = [x for x in rows if x.get("keep")]
     print(json.dumps({"batches": n, "missing_batches": missing, "decided": len(rows),
-                      "keep": len(keep), "drop": len(rows) - len(keep)}, ensure_ascii=False))
+                      "keep": len(keep), "drop": len(rows) - len(keep),
+                      "observations": obs}, ensure_ascii=False))
 
 
 def apply_(nt):

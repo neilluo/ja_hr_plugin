@@ -35,6 +35,10 @@ TAGS_MIN = TAGS_RANGE[0]  # 低于此数报 thin_tags（不足不硬凑，只观
 # 组装 must_count_off / bonus_count_off 观察，任何调用方禁止用于丢行/退出决策。
 JD_MUST_RANGE = (6, 10)   # 岗位必备技能数软目标
 JD_BONUS_RANGE = (4, 8)   # 岗位加分项数软目标
+# match 链（match-verify）文本长度软阈值——OBSERVATION-ONLY：仅供 match_analyze.merge
+# 组装 overlong_evidence / overlong_analysis 观察，任何调用方禁止用于丢行/退出/截断决策。
+EV_LEN_MAX = 80                # evidence（匹配依据）字符软上限
+AI_ANALYSIS_RANGE = (150, 250)  # ai_analysis（AI匹配分析）字符软区间（只报上下越界）
 
 
 def join_list(v, sep="、"):
@@ -175,14 +179,24 @@ def normalize_segments(text, seg_names, placeholder="未提及"):
     return result, kinds
 
 
-def over_len_words(words, zh_lo=ZH_RANGE[0], zh_hi=ZH_RANGE[1], len_max=TAG_LEN_MAX):
-    """返回超过旧硬阈值的标签子集（总字符 > len_max，或含中文时中文字数不在
-    [zh_lo, zh_hi]）。这些阈值曾是丢行硬门槛，现降级为仅观察（见模块 docstring）。"""
+def over_len_words(words, zh_lo=ZH_RANGE[0], zh_hi=ZH_RANGE[1], len_max=TAG_LEN_MAX,
+                   en_exempt=False):
+    """返回值得人工过目的超长标签子集：含中文且中文字数不在 [zh_lo, zh_hi]，
+    或（未豁免时）总字符 > len_max。这些阈值曾是丢行硬门槛，现降级为仅观察
+    （见模块 docstring）。
+
+    en_exempt 跟随各链 prompt 的声明（凡以文字向模型声明的约束，必须在代码里为真）：
+    skills 链声明"纯英文/缩写术语不受字数限制、也没有字符数上限"→ 其 SOFT_SPECS 传
+    en_exempt=True，纯英文/缩写一律不报；jobs 链声明"长英文术语照写、过长只记观察"
+    → 用默认 False，纯英文超长仍报观察。机制唯一真源在本函数，各链语义以各自 prompt 为准。"""
     out = []
     for w in words:
         s = str(w)
         zh = sum(1 for ch in s if "一" <= ch <= "鿿")
-        if len(s) > len_max or (zh and not (zh_lo <= zh <= zh_hi)):
+        if not zh:
+            if not en_exempt and len(s) > len_max:
+                out.append(s)
+        elif not (zh_lo <= zh <= zh_hi) or len(s) > len_max:
             out.append(s)
     return out
 
@@ -197,7 +211,7 @@ def count_out_of_range(words, lo, hi):
 # 简历链直接取用；JD 链按自己的字段名复用同一套 helper 组装（阈值仍以此处为唯一真源）。
 SOFT_SPECS = (
     {"key": "over_len_tags", "field": "skills",
-     "check": lambda row: over_len_words(toks(row.get("skills")))},
+     "check": lambda row: over_len_words(toks(row.get("skills")), en_exempt=True)},
     # 只报"不足"（thin）：数量偏多不是问题，偏少提示可能漏析——但都不阻断写回
     {"key": "thin_tags", "field": "skills",
      "check": lambda row: (lambda s: [len(s)] if 0 < len(s) < TAGS_MIN else [])(

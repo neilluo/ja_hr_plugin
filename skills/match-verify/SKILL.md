@@ -42,7 +42,8 @@ python3 skills/match-verify/scripts/match_analyze.py stats    # 5 单独一次�
 子任务承担的判断（原来只能我手工做）：
 - **keep 判定**：工序/方向不对应、助理岗降配、技能零交集 → false；
 - **语义计分**：同义与单向上下位（禁把暖通/排风/冷却水/空压机互相顶替），部分覆盖可给分但必须写依据；
-- **产出**：`evidence`（命中口径一句话）+ `ai_analysis`（结论/亮点/缺口/建议，150-250字），
+- **产出**：`evidence`（命中口径一句话）+ `ai_analysis`（结论/亮点/缺口/建议，目标 150-250 字，
+  软偏好：长度只由 merge 记观察、不退回不截断），
   由 `match_analyze.py apply` 一并写入 match 表 `AI匹配分析` 列；口径真源在
   `references/match-subagent-prompt.md`。
 

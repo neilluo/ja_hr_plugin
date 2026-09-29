@@ -79,5 +79,84 @@ class TestCapBlocks(unittest.TestCase):
         self.assertEqual([b["job"]["job_id"] for b in out], ["J1", "J1", "J2"])  # 空候选块丢弃
 
 
+class TestMatchObservations(unittest.TestCase):
+    """match 链 L2 软观察：只报、绝不阻断（不截断/不丢行/不改行内容）。
+
+    2026-09-29 事故回归：evidence 80 字上限曾由 subagent 自写 assert 执行导致 9/11 批返工；
+    现长度降级为观察，阈值唯一真源 shared/soften.EV_LEN_MAX / AI_ANALYSIS_RANGE。"""
+
+    def _row(self, **kw):
+        r = {"name": "张三", "job_id": "J1", "keep": True, "skill_score": 50,
+             "bonus_score": 10, "total_score": 60, "recommend": "待定",
+             "evidence": "语义匹配：必备5/8；加分1/3", "ai_analysis": "结" * 160}
+        r.update(kw)
+        return r
+
+    def test_clean_rows_no_observations(self):
+        self.assertEqual(match_analyze.match_observations(
+            [self._row()], {("J1", "张三")}), {})
+
+    def test_overlong_evidence_observed_not_truncated(self):
+        ev = "语义匹配：必备8/8（" + "、".join("命中项%02d" % i for i in range(12)) + "）"
+        r = self._row(evidence=ev)
+        self.assertGreater(len(r["evidence"]), 80)
+        before = r["evidence"]
+        obs = match_analyze.match_observations([r], {("J1", "张三")})
+        self.assertEqual(obs["overlong_evidence"], [["J1/张三", len(before)]])
+        self.assertEqual(r["evidence"], before)   # 行内容原样，不截断
+
+    def test_overlong_and_thin_analysis(self):
+        obs = match_analyze.match_observations(
+            [self._row(ai_analysis="结" * 300), self._row(name="李四", ai_analysis="短")],
+            {("J1", "张三"), ("J1", "李四")})
+        self.assertEqual(obs["overlong_analysis"], [["J1/张三", 300]])
+        self.assertEqual(obs["thin_analysis"], [["J1/李四", 1]])
+
+    def test_missing_fields_on_keep(self):
+        obs = match_analyze.match_observations(
+            [self._row(ai_analysis=""), self._row(name="李四", skill_score=None)],
+            {("J1", "张三"), ("J1", "李四")})
+        self.assertIn(["J1/张三", "ai_analysis"], obs["missing_fields"])
+        self.assertIn(["J1/李四", "skill_score"], obs["missing_fields"])
+
+    def test_missing_keep_and_missing_pairs(self):
+        nokeep = self._row(name="漏keep")
+        del nokeep["keep"]
+        obs = match_analyze.match_observations(
+            [nokeep], {("J1", "漏keep"), ("J1", "没产出")})
+        self.assertEqual(obs["missing_keep"], ["J1/漏keep"])
+        self.assertEqual(obs["missing_pairs"], [["J1", "没产出"]])
+
+    def test_drop_rows_exempt_from_field_checks(self):
+        # keep=false 的条目不要求三字段/ai_analysis（prompt 只要求 keep=true 齐全）
+        obs = match_analyze.match_observations(
+            [self._row(keep=False, ai_analysis="", skill_score=None)], {("J1", "张三")})
+        self.assertEqual(obs, {})
+
+    def test_thresholds_single_source_in_soften(self):
+        import soften
+        self.assertEqual(soften.EV_LEN_MAX, 80)
+        self.assertEqual(soften.AI_ANALYSIS_RANGE, (150, 250))
+
+
+class TestPromptNoLengthRework(unittest.TestCase):
+    """prompt 契约：长度是软偏好、禁止为长度自检返工（事故根因防复活）。"""
+
+    PROMPT = os.path.join(ROOT, "skills", "match-verify", "references",
+                          "match-subagent-prompt.md")
+
+    def test_lengths_declared_soft_only(self):
+        src = open(self.PROMPT, encoding="utf-8").read()
+        self.assertNotIn("80字内", src)          # 旧硬声明（标题级）已删
+        self.assertNotIn("150-250字）", src)     # 旧硬区间声明已删
+        self.assertIn("软偏好、无机器拒收", src)
+        self.assertIn("不要为长度自检或改写重试", src)
+        self.assertIn("不要为字数自检或改写重试", src)
+
+    def test_selfcheck_is_completeness_only(self):
+        src = open(self.PROMPT, encoding="utf-8").read()
+        self.assertIn("只检完整性，不检任何字数", src)
+
+
 if __name__ == "__main__":
     unittest.main()
