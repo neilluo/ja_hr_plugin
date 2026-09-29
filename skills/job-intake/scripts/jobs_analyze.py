@@ -177,20 +177,17 @@ def render_prompts(n_batches, vocab_path):
     """
     with open(PROMPT_TPL, encoding="utf-8") as f:
         tpl = f.read()
+    ap.prune_prompts(OUTDIR, PREFIX)   # 命名/清旧唯一真源在公共骨架
     paths = []
     for i in range(1, n_batches + 1):
         pend = ap.pending_path(OUTDIR, PREFIX, i)   # 路径经公共骨架派生，禁止本地抄 parts 命名
         body = (tpl.replace("<BATCH_PATH>", pend)
                    .replace("<VOCAB_PATH>", vocab_path)
                    .replace("<N>", str(i)))
-        out = os.path.join(OUTDIR, "%s_prompt_part%d.md" % (PREFIX, i))
+        out = ap.prompt_path(OUTDIR, PREFIX, i)
         with open(out, "w", encoding="utf-8") as f:
             f.write(body)
         paths.append(out)
-
-    idx = os.path.join(OUTDIR, "jobs_dispatch.json")
-    with open(idx, "w", encoding="utf-8") as f:
-        json.dump({"batches": n_batches, "prompts": paths}, f, ensure_ascii=False, indent=1)
     return paths
 
 
@@ -257,8 +254,8 @@ def prepare(args):
     # 并回写进 meta 文件，供 agent 二次读取，不再重复打印。
     vocab_path = os.path.join(OUTDIR, "resume_vocab.json")
     json.dump(_resume_vocab(nt), open(vocab_path, "w", encoding="utf-8"), ensure_ascii=False)
-    render_prompts(meta["batches"], vocab_path)
-    meta["dispatch"] = os.path.join(OUTDIR, "jobs_dispatch.json")
+    paths = render_prompts(meta["batches"], vocab_path)
+    meta["dispatch"] = ap.write_dispatch(OUTDIR, PREFIX, paths)   # 清单形状唯一真源在公共骨架
     json.dump(meta, open(ap.meta_path(OUTDIR, PREFIX), "w", encoding="utf-8"))
     return meta
 

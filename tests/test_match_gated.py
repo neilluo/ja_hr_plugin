@@ -24,7 +24,7 @@ def _skills(n):
 
 
 def _jf(must, bonus=(), mw=1.0):
-    # bonus_weight 留 0.0 会因 `or 0.3` 回落，故 bonus 为空时权重不影响 bo=0
+    # bonus 为空时 bo 恒 0，权重取值不影响；权重回落语义见 match_gated.weights
     return {"must_skills": list(must), "bonus_skills": list(bonus),
             "must_weight": mw, "bonus_weight": 0.3}
 
@@ -65,6 +65,19 @@ class TestScoreThresholds(unittest.TestCase):
         sk, bo, tot, rec, ev = score({"skills": must + bonus}, jf)
         self.assertEqual((sk, bo, tot), (70, 30, 100))
         self.assertEqual(rec, REC_LABEL)
+
+    def test_zero_weight_is_business_value_not_missing(self):
+        """0.0 是合法业务值（该侧不计分），不得被 `or` 回落成默认 0.3
+        （2026-09-29 test_match_grants 抓出：bonus_weight=0.0 曾被算成 0.3）。"""
+        from match_gated import weights
+        self.assertEqual(weights({"must_weight": 1.0, "bonus_weight": 0.0}), (1.0, 0.0))
+        self.assertEqual(weights({}), (0.7, 0.3))                 # 真缺失才回落
+        self.assertEqual(weights({"must_weight": None, "bonus_weight": ""}), (0.7, 0.3))
+        must, bonus = _skills(4), ["b%04d" % i for i in range(2)]
+        jf = {"must_skills": must, "bonus_skills": bonus,
+              "must_weight": 1.0, "bonus_weight": 0.0}
+        sk, bo, tot, rec, ev = score({"skills": must + bonus}, jf)
+        self.assertEqual((sk, bo, tot), (100, 0, 100))   # bonus 全中也不涨分
 
     def test_evidence_format(self):
         must = _skills(4)

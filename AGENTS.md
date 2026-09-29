@@ -92,9 +92,14 @@
     - 例外：写入值字面量（如 source="系统匹配"、status="招聘中"）、解析私有规则（_DEPT_ALIAS 别名、
       分类→关键词映射）、安全白名单（sync_job_columns.KEYS）属单一出现，不算双源，但须注释指向 config 真源。
     - 例外（subagent prompt 镜像）：subagent 提示词无法 import Python 常量，凡其运行时必须自带的判定值
-      （match-subagent-prompt 的阈值 80/60、语义词典 SYNONYM/HYPERS 示例）以"代码是主、本段仅镜像"形式复述，
-      且必须在同段注明唯一真源（match_gated.REC_MIN/PEND_MIN、semantic_score）与"改代码须同步镜像"纪律；
-      有 per-batch 渲染器的链（skills_analyze.render_prompts）则用占位符从常量注入、不留镜像数字。
+      以"代码是主、本段仅镜像"形式复述，且必须在同段注明唯一真源与"改代码须同步镜像"纪律；
+      match 链 v2 契约后 agent 不再算分（阈值 80/60 与 SYNONYM/HYPERS 镜像已随公式下沉整体删除，
+      机械命中经 baseline 注入），match-subagent-prompt 现为零镜像模板；
+      有 per-batch 渲染器的链（skills_analyze.render_prompts / jobs_analyze.render_prompts /
+      match_analyze.render_prompts）则用占位符从常量注入、不留镜像数字。**match 分派提示词形态
+      （per-batch 渲染 + <BATCH_PATH>/<DONE_PATH> 硬绑定 + <AI_RANGE> 注入）唯一真源 =
+      `match_analyze.render_prompts`**：模板只放占位符、禁止手抄路径/数字/公式，
+      分派清单形态唯一真源仍是 `shared/analyze_parts.write_dispatch`（match 链走 prompts 键）。
     - 每次新增枚举/阈值：先落唯一真源，再让消费方派生；同一提交内 grep 确认无第二份副本，unittest 全绿。
 11. 精析异步队列三层闭环（触发/出队/并发防护），禁止加第四层：
     - 触发 = 上传后 agent 注册消费任务，**注册规格由脚本产出、agent 只透传**：
@@ -262,3 +267,13 @@ python3 skills/replicate/scripts/sync_schema.py --check  # 只读：报 config �
   连带纪律：every 型漏自删会每 60s 反复触发，故 `_consume_message` 把"按名自删"写死到**所有出口**
   （队列空 / refused 撞租约 / 正常消费完），不能只挂在"正常结束"上。教训：**绝对时刻型调度对"由 agent 转发注册"
   的链路天然脆弱，凡触发时刻不依赖外部日历的周期消费，一律用 every 型 + 完成即自删，别用 at 型赌时间窗口。**
+- 曾在 match 链让 11 个 subagent 靠"共享模板 + 记住自己的 part 号"分派、并手算打分公式，2026-09-29 真实运行
+  出两个事故：① 批9 agent 跑错批次（读了 part2 输入）→ 覆盖并 host_safe_delete 了批2 的好产物，merge 报
+  missing_batches:[2] 被迫补发；② 同一输入两个 agent 独立判定 8 对里 7 对分数不一致（公式本是确定性的
+  round(100*mw*hm/mt)），全量 23% 配对跨推荐档位，且不信任提示词、去读源码重推口径（单 agent 最多 20 次源码读取）。
+  教训重申：**agent 只该做方向判断与语义增补，确定性计算与路径绑定必须代码保障**——现 v2 契约：
+  prepare 注入 baseline（机械命中+分数，经 match_gated.hits/score_counts）并按批渲染提示词
+  （match_analyze.render_prompts，<BATCH_PATH>/<DONE_PATH> 硬绑定本批，跨批误写被结构性消除）；
+  agent 只产出 keep/keep_reason/grants（词表原词+简历依据）/ai_analysis；merge 逐批归属校验
+  （串写进 misattributed 只报不收）+ score_counts 重算分数 + 代码组装 evidence（grant 命中以「项※(依据)」出现），
+  misattributed/missing_batches 非空 → 报告先打再 exit 2；提示词侧的公式/阈值镜像与 agent 自检段整体删除。

@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(ROOT, "shared"))
 sys.path.insert(0, os.path.join(ROOT, "skills", "job-intake", "scripts"))
 
 import jobs_analyze as ja  # noqa: E402
+import analyze_parts as ja_ap  # noqa: E402  公共骨架（write_dispatch 唯一真源）
 
 GOOD_ROW = {"job_id": "J1",
             "hard_gates": "学历：本科及以上；专业：机械相关专业；经验：2年及以上设备维护经验；"
@@ -55,7 +56,8 @@ class TestRenderPrompts(unittest.TestCase):
             self.assertIn(vocab, body)
 
     def test_dispatch_index_written(self):
-        ja.render_prompts(2, os.path.join(self.tmp, "resume_vocab.json"))
+        paths = ja.render_prompts(2, os.path.join(self.tmp, "resume_vocab.json"))
+        ja_ap.write_dispatch(self.tmp, "jobs", paths)   # 清单落盘归 prepare 侧公共骨架
         with open(os.path.join(self.tmp, "jobs_dispatch.json"), encoding="utf-8") as f:
             idx = json.load(f)
         self.assertEqual(idx["batches"], 2)

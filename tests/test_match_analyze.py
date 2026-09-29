@@ -97,9 +97,11 @@ class TestMatchObservations(unittest.TestCase):
             [self._row()], {("J1", "张三")}), {})
 
     def test_overlong_evidence_observed_not_truncated(self):
-        ev = "语义匹配：必备8/8（" + "、".join("命中项%02d" % i for i in range(12)) + "）"
+        import soften
+        ev = "语义匹配：必备8/8（" + "、".join(
+            "命中项%02d" % i for i in range(soften.EV_LEN_MAX)) + "）"   # 长度随真源阈值撑过
+        self.assertGreater(len(ev), soften.EV_LEN_MAX)   # 夹具长度从真源派生，不抄字面量
         r = self._row(evidence=ev)
-        self.assertGreater(len(r["evidence"]), 80)
         before = r["evidence"]
         obs = match_analyze.match_observations([r], {("J1", "张三")})
         self.assertEqual(obs["overlong_evidence"], [["J1/张三", len(before)]])
@@ -113,11 +115,13 @@ class TestMatchObservations(unittest.TestCase):
         self.assertEqual(obs["thin_analysis"], [["J1/李四", 1]])
 
     def test_missing_fields_on_keep(self):
+        # v2 契约：分数/evidence 由 merge 代码重算，agent 不供分 → skill_score 缺失检查已删；
+        # missing_fields 现在只报 keep=true 却缺 ai_analysis 的情形
         obs = match_analyze.match_observations(
             [self._row(ai_analysis=""), self._row(name="李四", skill_score=None)],
             {("J1", "张三"), ("J1", "李四")})
         self.assertIn(["J1/张三", "ai_analysis"], obs["missing_fields"])
-        self.assertIn(["J1/李四", "skill_score"], obs["missing_fields"])
+        self.assertNotIn(["J1/李四", "skill_score"], obs.get("missing_fields", []))
 
     def test_missing_keep_and_missing_pairs(self):
         nokeep = self._row(name="漏keep")
@@ -135,27 +139,52 @@ class TestMatchObservations(unittest.TestCase):
 
     def test_thresholds_single_source_in_soften(self):
         import soften
-        self.assertEqual(soften.EV_LEN_MAX, 80)
+        self.assertEqual(soften.EV_LEN_MAX, 200)   # v2 代码组装 evidence 后重标定（soften 注释载理由）
         self.assertEqual(soften.AI_ANALYSIS_RANGE, (150, 250))
 
 
-class TestPromptNoLengthRework(unittest.TestCase):
-    """prompt 契约：长度是软偏好、禁止为长度自检返工（事故根因防复活）。"""
+class TestPromptV2Contract(unittest.TestCase):
+    """prompt v2 契约（2026-09-29 事故重构）：agent 不再算分、不再自检；读写路径硬绑定；
+    长度是软偏好、禁止为长度自检返工（事故根因防复活）。"""
 
     PROMPT = os.path.join(ROOT, "skills", "match-verify", "references",
                           "match-subagent-prompt.md")
 
-    def test_lengths_declared_soft_only(self):
-        src = open(self.PROMPT, encoding="utf-8").read()
-        self.assertNotIn("80字内", src)          # 旧硬声明（标题级）已删
-        self.assertNotIn("150-250字）", src)     # 旧硬区间声明已删
-        self.assertIn("软偏好、无机器拒收", src)
-        self.assertIn("不要为长度自检或改写重试", src)
-        self.assertIn("不要为字数自检或改写重试", src)
+    def setUp(self):
+        with open(self.PROMPT, encoding="utf-8") as f:
+            self.src = f.read()
 
-    def test_selfcheck_is_completeness_only(self):
-        src = open(self.PROMPT, encoding="utf-8").read()
-        self.assertIn("只检完整性，不检任何字数", src)
+    def test_lengths_declared_soft_only(self):
+        self.assertIn("软偏好、无机器拒收", self.src)
+        self.assertIn("不要为字数自检或改写重试", self.src)
+
+    def test_paths_are_hard_injected_placeholders(self):
+        # 读写路径经 render_prompts 硬注入本批（<BATCH_PATH>/<DONE_PATH>/<N>），
+        # 不再是"文件名由输入自派生"（旧表述让 agent 自己拼 part 号 → 跨批误写事故）
+        self.assertIn("<BATCH_PATH>", self.src)
+        self.assertIn("<DONE_PATH>", self.src)
+        self.assertNotIn("由输入自派生", self.src)
+        self.assertNotIn("把 pending 换成 done", self.src)
+
+    def test_agent_side_formula_and_mirror_removed(self):
+        # 删掉 §2 打分公式与 80/60 阈值镜像段（agent 不算分，镜像双源随之消失）
+        self.assertNotIn("round(100", self.src)
+        self.assertNotIn("REC_MIN", self.src)
+        self.assertNotIn(">=80", self.src)
+
+    def test_agent_side_selfcheck_removed(self):
+        # 删掉 agent 侧 py 自检段（完整性校验在 merge）
+        self.assertNotIn("只检完整性", self.src)
+        self.assertNotIn("py -X utf8", self.src)
+        self.assertNotIn("自检 JSON 可解析", self.src)
+
+    def test_hard_boundary_present(self):
+        self.assertIn("硬边界", self.src)
+        self.assertIn("禁止删除任何文件", self.src)
+
+    def test_new_output_schema_fields(self):
+        for field in ("keep_reason", "grants", '"side"', "baseline"):
+            self.assertIn(field, self.src)
 
 
 if __name__ == "__main__":

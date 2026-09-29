@@ -25,14 +25,23 @@ bonus_score = round(100 * bonus_weight * 加分命中率)   # 岗位无加分项
 total_score = skill_score + bonus_score
 ```
 
-权重取岗位表 `must_weight` / `bonus_weight`（缺省值见代码常量：`parse_job.parse()` 返回值与
-`match_gated.score()` 的兜底，未在 config.json 里声明）。
+权重取岗位表 `must_weight` / `bonus_weight`（回落语义唯一真源 `match_gated.weights`：
+仅 None/空串回落默认，0.0 是合法业务值保留；公式与档位唯一真源 `match_gated.score_counts`，
+本段仅镜像、改代码须同步本段）。
 
 命中判定**不是字面相等、也不是子串互含就算完**：统一走
 `skills/match-verify/scripts/semantic_score.py` 的 `hit()` —— 同义词典 `SYNONYM`（双向等价）+
 上下位词典 `HYPERS`（单向：候选人写的具体项可满足岗位的宽泛项，反向不算）+ 保守字面包含。
 分词与技能词表唯一源是 `shared/vocab.py`（`toks` / `SEP` / `SKILL_WORDS`）。
-常规链路里最终分数与 keep 结论以 subagent 判定为准，机械打分只用于剔除零交集与初筛排序。
+公式与档位的唯一实现是 `match_gated.score_counts`（命中判定 `match_gated.hits`、证据串
+`match_gated.evidence`）：机械打分（stage_gate/--commit）与 subagent 链共用同一套，禁止第二份公式副本。
+
+**v2 分派契约（分数由代码算，不再由 subagent 手算）**：`match_analyze.py prepare` 给每个候选人注入
+`baseline`（经 hits+score_counts 算好的机械命中与 skill/bonus/total/recommend）；subagent 只产出
+keep/keep_reason/grants（机械没命中、语义该命中的增补，item 须是岗位词表原词、basis 是简历依据）/
+ai_analysis。`match_analyze.py merge` 用 score_counts 重算 keep 行分数（机械命中 ∪ 有效 grants）、
+代码组装 evidence，并逐批做 (job_id,name) 归属校验（串写进 `misattributed`、不收，报告后 exit 2）。
+机械门槛只做一票否决与初筛，方向对不对由 subagent 的 keep 判定；分数与 evidence 恒由代码产出。
 
 ## 推荐阈值
 
@@ -46,9 +55,13 @@ total_score = skill_score + bonus_score
 
 ## 证据格式（evidence 字段）
 
+由代码组装（唯一实现 `match_gated.evidence`，agent 不产出该字段）：
+
 ```
 语义匹配：必备x/y（主要命中项，最多 8 项）；加分z/w；未命中：…（最多 6 项，无则省略）
 ```
+
+subagent 报的有效 grant 命中项，在命中列表里以「项※(依据)」形态出现（依据 = 该 grant 的 basis）。
 
 cand_skills / must_skills / bonus_skills / hard_gates / expected_position / years_experience
 原样冗余进匹配行，便于人工复核不跨表。`ai_analysis`（AI匹配分析）由 subagent 产出结论/亮点/

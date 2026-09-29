@@ -59,13 +59,30 @@ def write_parts(outdir, prefix, items, meta_extra, batch=None):
     return meta
 
 
-def write_dispatch(outdir, prefix, batches, key="parts"):
-    """分派清单落盘 outputs/<prefix>_dispatch.json = {batches:N, key:[真实 pending 路径]}，
-    返回清单路径。agent 复制真实路径指针分派，不再凭记忆手拼 *_pending_part<N>.json
-    （jobs/match 两流水线同机制；skills_analyze 的 skills_dispatch.json 是 prompts 形态、走 render_prompts）。"""
-    path = os.path.join(outdir, "%s_dispatch.json" % prefix)
-    json.dump({"batches": batches,
-               key: [pending_path(outdir, prefix, i) for i in range(1, batches + 1)]},
+def prompt_path(outdir, prefix, i):
+    return os.path.join(outdir, "%s_prompt_part%d.md" % (prefix, i))
+
+
+def prune_prompts(outdir, prefix):
+    """清掉上轮残留的 per-batch 提示词（批数变少时旧 partN.md 会成僵尸误导分派）。
+    三条流水线（skills/jobs/match render_prompts）共用，命名唯一真源在此。"""
+    for old in os.listdir(outdir):
+        if old.startswith("%s_prompt_part" % prefix):
+            os.remove(os.path.join(outdir, old))
+
+
+def dispatch_path(outdir, prefix):
+    return os.path.join(outdir, "%s_dispatch.json" % prefix)
+
+
+def write_dispatch(outdir, prefix, paths):
+    """分派清单唯一写入口 outputs/<prefix>_dispatch.json = {"batches":N,"prompts":[路径]}。
+
+    三条流水线（skills/jobs/match）的 render_prompts 一律经本函数落盘，禁止各自 json.dump
+    抄清单形状（不变量 10）；value 恒为渲染好的 per-batch 提示词真实路径，agent 复制路径
+    指针分派、不再凭记忆手拼 *_pending_part<N>.json。返回清单路径。"""
+    path = dispatch_path(outdir, prefix)
+    json.dump({"batches": len(paths), "prompts": list(paths)},
               open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     return path
 

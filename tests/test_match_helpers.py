@@ -236,6 +236,10 @@ class TestJobsDispatchManifest(unittest.TestCase):
 
 
 class TestMatchDispatchManifest(unittest.TestCase):
+    """match 链 v2 分派：prepare 渲染 per-batch 提示词（match_prompt_part<N>.md），
+    dispatch = 渲染好的提示词路径清单（prompts 键，与 skills/jobs 链对称），
+    路径按批次硬绑定，杜绝 agent 记错 part 号跨批误写。"""
+
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
         self._paths = (match_analyze.OUTDIR, match_analyze.PAIRS)
@@ -263,10 +267,36 @@ class TestMatchDispatchManifest(unittest.TestCase):
         self.assertEqual(meta["dispatch"], dispatch)
         man = json.load(open(dispatch, encoding="utf-8"))
         self.assertEqual(man["batches"], meta["batches"])
-        import analyze_parts as ap
-        for i, p in enumerate(man["parts"], 1):
-            self.assertEqual(p, ap.pending_path(self._tmp, "match", i))
+        # v2 契约：dispatch 键是 prompts（渲染好的 per-batch 提示词文件），非 parts
+        self.assertEqual(len(man["prompts"]), meta["batches"])
+        for i, p in enumerate(man["prompts"], 1):
+            self.assertEqual(p, os.path.join(self._tmp, "match_prompt_part%d.md" % i))
             self.assertTrue(os.path.exists(p))
+
+    def test_prepare_injects_baseline_and_renders_bound_paths(self):
+        pairs = [{"rid": "r0", "name": "候0", "job_id": "J1", "total": 90, "recommend": "推荐"}]
+        json.dump(pairs, open(match_analyze.PAIRS, "w", encoding="utf-8"))
+        nt = FakeNotable({"job": [_job("J1")], "resume": [_resume("r0", "候0")]})
+        old_notable = match_analyze.Notable
+        match_analyze.Notable = lambda: nt
+        try:
+            meta = match_analyze.prepare(["--batch", "1"])
+        finally:
+            match_analyze.Notable = old_notable
+        import analyze_parts as ap
+        pend = json.load(open(ap.pending_path(self._tmp, "match", 1), encoding="utf-8"))
+        cand = pend[0]["candidates"][0]
+        # baseline 注入：机械打分基线（公式经 match_gated，非 agent 手算）
+        for k in ("skill_score", "bonus_score", "total_score", "recommend",
+                  "must_hits", "must_miss", "bonus_hits", "bonus_miss"):
+            self.assertIn(k, cand["baseline"])
+        # 提示词里读写路径已硬绑定本批（<BATCH_PATH>/<DONE_PATH>/<N> 全部替换干净）
+        with open(os.path.join(self._tmp, "match_prompt_part1.md"), encoding="utf-8") as f:
+            body = f.read()
+        for ph in ("<BATCH_PATH>", "<DONE_PATH>", "<N>", "<AI_RANGE>"):
+            self.assertNotIn(ph, body)
+        self.assertIn("match_pending_part1.json", body)
+        self.assertIn("match_done_part1.json", body)
 
 
 # ── #9 upload_jobs 报告带 timing_ms ────────────────────────────────────────────

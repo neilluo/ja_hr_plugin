@@ -173,9 +173,7 @@ def render_prompts(n_batches, vocab_path):
         subs["<CORR_%d>" % i] = k
     # 清旧 prompt 文件：write_parts 只清 pending/done，prompt 是本函数产物须自清，
     # 否则上轮大批次（如 16）残留的 prompt_part15/16.md 会在小批次（如 2）轮里成僵尸文件。
-    for old in os.listdir(OUTDIR):
-        if old.startswith("%s_prompt_part" % PREFIX):
-            os.remove(os.path.join(OUTDIR, old))
+    ap.prune_prompts(OUTDIR, PREFIX)
     paths = []
     for i in range(1, n_batches + 1):
         pend = ap.pending_path(OUTDIR, PREFIX, i)   # 路径经公共骨架派生，禁止本地抄 parts 命名
@@ -184,14 +182,10 @@ def render_prompts(n_batches, vocab_path):
         for ph, val in subs.items():
             body = body.replace(ph, val)
         body = body.replace("<N>", str(i))   # <N> 最后替换：防其他占位符名里含 "<N" 子串误伤
-        out = os.path.join(OUTDIR, "%s_prompt_part%d.md" % (PREFIX, i))
+        out = ap.prompt_path(OUTDIR, PREFIX, i)
         with open(out, "w", encoding="utf-8") as f:
             f.write(body)
         paths.append(out)
-
-    idx = os.path.join(OUTDIR, "skills_dispatch.json")
-    with open(idx, "w", encoding="utf-8") as f:
-        json.dump({"batches": n_batches, "prompts": paths}, f, ensure_ascii=False, indent=1)
     return paths
 
 
@@ -309,8 +303,8 @@ def prepare(args):
     # stdout 只留 write_parts 打过的那一行 meta（守既有单行 JSON 契约），分派信息落 skills_dispatch.json
     # 并回写进 meta 文件，供 agent 二次读取，不再重复打印。
     if meta["batches"]:
-        render_prompts(meta["batches"], vocab_path)
-        meta["dispatch"] = os.path.join(OUTDIR, "skills_dispatch.json")
+        paths = render_prompts(meta["batches"], vocab_path)
+        meta["dispatch"] = ap.write_dispatch(OUTDIR, PREFIX, paths)  # 清单形状唯一真源在公共骨架
         json.dump(meta, open(ap.meta_path(OUTDIR, PREFIX), "w", encoding="utf-8"))
     return meta
 

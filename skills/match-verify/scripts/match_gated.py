@@ -101,22 +101,62 @@ def gate(cand, jf, cs):
     return (not why), why, (bool(need_major) and not auto)
 
 
-def score(cand, jf):
+def weights(jf):
+    """权重取值 (mw, bw) 唯一实现：0.0 是合法业务值（该侧不计分），
+    仅 None/空串回落默认 0.7/0.3——`or` 回落会把 0.0 误当缺失（2026-09-29
+    test_match_grants 抓出：bonus_weight=0.0 被算成 0.3）。score/baseline_of/
+    prepare/rescore 共用，禁止各自抄回落逻辑。"""
+    mw, bw = jf.get("must_weight"), jf.get("bonus_weight")
+    return (float(mw) if mw not in (None, "") else 0.7,
+            float(bw) if bw not in (None, "") else 0.3)
+
+
+def hits(cand, jf):
+    """必备/加分命中列表 (hm, hb)：语义命中判定（semantic_score.hit）的唯一实现，
+    score() 与 match_analyze（prepare 注入 baseline / merge 重算 grants）共用，禁止另抄。"""
     must, bonus = toks(jf.get("must_skills")), toks(jf.get("bonus_skills"))
-    mw, bw = float(jf.get("must_weight") or 0.7), float(jf.get("bonus_weight") or 0.3)
     cs = cand.get("skills") or []
     hm = [n for n in must if hit(cs, n)]
     hb = [n for n in bonus if hit(cs, n)]
-    sk = int(round(100 * mw * (len(hm) / len(must)))) if must else 0
-    bo = int(round(100 * bw * (len(hb) / len(bonus)))) if bonus else 0
+    return hm, hb
+
+
+def score_counts(n_hm, n_hb, must_n, bonus_n, mw, bw):
+    """打分公式 + 推荐档位的唯一实现 (sk, bo, tot, rec)。
+
+    sk = round(100*mw*必备命中率)、bo = round(100*bw*加分命中率)、tot = sk+bo，
+    rec 按 REC_MIN/PEND_MIN 分档（三值标签派生自 config.options.match.recommend）。
+    score() 与 match_analyze.merge 共用；公式禁止第二份副本——
+    2026-09-29 事故：公式是确定性的却交给 subagent 手算，同一输入 8 对里 7 对分数不一致。"""
+    sk = int(round(100 * mw * (n_hm / must_n))) if must_n else 0
+    bo = int(round(100 * bw * (n_hb / bonus_n))) if bonus_n else 0
     tot = sk + bo
     rec = REC_LABEL if tot >= REC_MIN else (PEND_LABEL if tot >= PEND_MIN else REJ_LABEL)
-    miss = [n for n in must if n not in hm]
-    ev = "语义匹配：必备%d/%d（%s）；加分%d/%d" % (len(hm), len(must), "、".join(hm[:8]) or "无",
+    return sk, bo, tot, rec
+
+
+def evidence(hm, hb, must, bonus):
+    """evidence 格式串的唯一组装点（score() 与 match_analyze.merge 共用）。
+
+    hm 元素可为 (项, 依据) 元组 → 渲染为「项※(依据)」（merge 侧语义 grant 命中的展示形态）；
+    未命中段按"must 里不在命中集合（元组按项计）"计算。截断口径不变：命中列 ≤8、未命中 ≤6。"""
+    disp = [("%s※(%s)" % (x[0], x[1])) if isinstance(x, tuple) else x for x in hm]
+    plain = {(x[0] if isinstance(x, tuple) else x) for x in hm}
+    ev = "语义匹配：必备%d/%d（%s）；加分%d/%d" % (len(hm), len(must), "、".join(disp[:8]) or "无",
                                               len(hb), len(bonus))
+    miss = [n for n in must if n not in plain]
     if miss:
         ev += "；未命中：" + "、".join(miss[:6])
-    return sk, bo, tot, rec, ev
+    return ev
+
+
+def score(cand, jf):
+    """机械语义打分（hits + score_counts + evidence 的组合，行为与拆分前一致）。"""
+    must, bonus = toks(jf.get("must_skills")), toks(jf.get("bonus_skills"))
+    mw, bw = weights(jf)
+    hm, hb = hits(cand, jf)
+    sk, bo, tot, rec = score_counts(len(hm), len(hb), len(must), len(bonus), mw, bw)
+    return sk, bo, tot, rec, evidence(hm, hb, must, bonus)
 
 
 def _match_row(cf, jf, scores, source=SYS_SOURCE):

@@ -37,7 +37,10 @@ JD_MUST_RANGE = (6, 10)   # 岗位必备技能数软目标
 JD_BONUS_RANGE = (4, 8)   # 岗位加分项数软目标
 # match 链（match-verify）文本长度软阈值——OBSERVATION-ONLY：仅供 match_analyze.merge
 # 组装 overlong_evidence / overlong_analysis 观察，任何调用方禁止用于丢行/退出/截断决策。
-EV_LEN_MAX = 80                # evidence（匹配依据）字符软上限
+EV_LEN_MAX = 200               # evidence（匹配依据）字符软上限。v2 契约后 evidence 由代码组装、
+                               # 含 grant 依据「项※(依据)」：旧 80 字按"agent 手写无依据"格式标定，
+                               # v2 首跑中位 110/最大 187、94% 行越界 → 观察退化为噪声；
+                               # 200 = 高于实测上界，只抓真正异常的长 basis（2026-09-29 重标定）
 AI_ANALYSIS_RANGE = (150, 250)  # ai_analysis（AI匹配分析）字符软区间（只报上下越界）
 
 

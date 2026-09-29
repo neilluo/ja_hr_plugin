@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.join(ROOT, "skills", "skills-analyze", "scripts"))
 
 import skills_analyze as sa              # noqa: E402
 import soften                            # noqa: E402
+import analyze_parts as sa_ap            # noqa: E402  公共骨架（write_dispatch 唯一真源）
 
 
 def _row(**ov):
@@ -71,7 +72,8 @@ class TestRenderPrompts(unittest.TestCase):
             self.assertIn(vocab, body)
 
     def test_dispatch_index_written(self):
-        sa.render_prompts(2, os.path.join(self.tmp, "job_vocab.json"))
+        paths = sa.render_prompts(2, os.path.join(self.tmp, "job_vocab.json"))
+        sa_ap.write_dispatch(self.tmp, "skills", paths)   # 清单落盘归 prepare 侧公共骨架
         with open(os.path.join(self.tmp, "skills_dispatch.json"), encoding="utf-8") as f:
             idx = json.load(f)
         self.assertEqual(idx["batches"], 2)
