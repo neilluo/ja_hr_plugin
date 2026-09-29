@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.join(ROOT, "skills", "resume-intake", "scripts"))
 
 import notable as notable_mod                    # noqa: E402
 from notable import Notable                      # noqa: E402
-import refine_loop                               # noqa: E402  延迟常量与 fire_at 唯一真源
+import refine_loop                               # noqa: E402  every 型间隔与消费任务规格唯一真源
 import upload_resumes as ur                      # noqa: E402
 import preflight as preflight_mod                # noqa: E402  (upload_resumes 已把其加入 sys.path)
 
@@ -678,34 +678,36 @@ class TestR9SelfHeal(CrashTestBase):
 
 
 class TestR10RoundTripFields(CrashTestBase):
-    """回合瘦身配套：报告新增 refine_fire_at / table_total 两字段 + --backfill - 走 stdin。
+    """回合瘦身配套：报告 cron_job（every 型注册规格）/ table_total 两字段 + --backfill - 走 stdin。
 
-    这两个字段的目的是消灭 agent 的两次验证往返（date 算偏移、query.py 复核总数），
-    故必须锁死其语义：fire_at 由唯一常量 REFINE_DELAY_S 派生、补录模式不输出（手析不入队）、
-    table_total 恒等于表内真实条数。"""
+    这两个字段的目的是消灭 agent 的两次验证往返（手写 payload、query.py 复核总数），
+    故必须锁死其语义：cron_job.schedule 是 every 型（无绝对时刻、注册永不过期）、
+    补录模式队列非空时同样输出、table_total 恒等于表内真实条数。
+    at 型的 fire_at/REFINE_DELAY_S/refine_fire_at 已整体删除（见 refine_loop.EVERY_MS 注释）。"""
 
-    def test_fire_at_derives_from_single_source_constant(self):
-        """refine_fire_at = 当前 + REFINE_DELAY_S（UTC ISO8601）。延迟秒数不许有第二份副本。"""
-        import datetime
-        before = _real_time.time()
-        iso = refine_loop.fire_at()
-        after = _real_time.time()
-        self.assertRegex(iso, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
-        fire = datetime.datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=datetime.timezone.utc).timestamp()
-        lo = before + refine_loop.REFINE_DELAY_S - 2      # strftime 截断到秒，留 2 秒容差
-        hi = after + refine_loop.REFINE_DELAY_S + 2
-        self.assertTrue(lo <= fire <= hi, "fire_at=%s 不在 [%s, %s]" % (iso, lo, hi))
+    def test_cron_job_schedule_is_every_type(self):
+        """cron_job.schedule = {"kind":"every","everyMs":EVERY_MS}：无 at 字段。
+        every 型注册永不过期，结构性消除 at 型"时刻必须在未来"的拒收。"""
+        spec = refine_loop.consume_task_spec("resume", root="/tmp/repo")
+        self.assertEqual(spec["schedule"], {"kind": "every", "everyMs": refine_loop.EVERY_MS})
+        self.assertNotIn("at", spec["schedule"])
+        # at 型旧 API 必须已删干净（防复活）
+        self.assertFalse(hasattr(refine_loop, "fire_at"))
+        self.assertFalse(hasattr(refine_loop, "REFINE_DELAY_S"))
+        self.assertFalse(hasattr(refine_loop, "delay_human"))
 
     def test_backfill_queues_via_source_file(self):
         """补录口径（扫描件交后台读图）：写 source_file、不打 ai_refined_at → 照常入队，
-        故 table_total 有值且输出 refine_fire_at（补录后同样要注册消费任务）。"""
+        故 table_total 有值且输出 cron_job（补录后同样要注册消费任务）。"""
         code, rep, _ = self.run_backfill()
         self.assertEqual(code, 0)
         self.assertEqual(rep["created"], BACKFILL_N)
         self.assertEqual(rep["table_total"], BACKFILL_N)
         self.assertEqual(rep["refine_queued"], BACKFILL_N)   # 原件在盘 → 入队读图
-        self.assertIn("refine_fire_at", rep)
+        self.assertIn("cron_job", rep)
+        self.assertEqual(rep["cron_job"]["schedule"],
+                         {"kind": "every", "everyMs": refine_loop.EVERY_MS})
+        self.assertNotIn("refine_fire_at", rep)               # at 型字段已废弃
         for r in self.state.all_records(self.SHEET):
             self.assertTrue(r["fields"].get(SRC_CN), r["id"])   # 原件绝对路径已入列
             self.assertFalse(r["fields"].get(REFINED_CN), r["id"])  # 未打出队标记
@@ -729,15 +731,18 @@ class TestR10RoundTripFields(CrashTestBase):
         self.assertEqual(rep2["created"], 0)
         self.assertEqual(rep2["table_total"], BACKFILL_N)
 
-    def test_batch_emits_fire_at_when_queue_nonempty(self):
-        """批量入库后队列非空 → 输出 refine_fire_at；table_total 与表内条数一致。"""
+    def test_batch_emits_cron_job_when_queue_nonempty(self):
+        """批量入库后队列非空 → 输出 every 型 cron_job；table_total 与表内条数一致。"""
         if not DATA_DIR or not os.path.isdir(DATA_DIR):
             self.skipTest("需设置 JA_TEST_RESUME_DIR 指向简历夹具目录（31 份简历）")
         code, rep, _ = self.run_batch()
         self.assertEqual(code, 0)
         self.assertEqual(rep["created"], EXPECTED_CREATED)
         self.assertGreater(rep["refine_queued"], 0)
-        self.assertIn("refine_fire_at", rep)
+        self.assertIn("cron_job", rep)
+        self.assertEqual(rep["cron_job"]["schedule"],
+                         {"kind": "every", "everyMs": refine_loop.EVERY_MS})
+        self.assertNotIn("refine_fire_at", rep)
         self.assertEqual(rep["table_total"], EXPECTED_CREATED)
 
 

@@ -15,8 +15,8 @@ author:
 # 简历 AI 精析（后台周期流水线）
 
 精析**不由上传同步触发**：上传写完表即结束，本流水线由后台任务消费精析队列
-（消费入口 = 上传后 agent 注册的一次性消费任务，注册规格由上传报告的 `cron_job` 字段带出、agent 原样透传
-（延迟唯一真源 = `shared/refine_loop.py` 的 `REFINE_DELAY_S`，规格由其 `consume_task_spec` 产出）
+（消费入口 = 上传后 agent 注册的消费任务，注册规格由上传报告的 `cron_job` 字段带出、agent 原样透传
+（every 型轮询，间隔唯一真源 = `shared/refine_loop.py` 的 `EVERY_MS`，规格由其 `consume_task_spec` 产出）
 + 每日兜底巡检（时刻见 `refine_loop.FALLBACK_CRON`），触发纪律见
 `skills/resume-intake/SKILL.md`；提示词唯一源 = `references/subagent-prompt.md`）。
 队列谓词唯一真源 `shared/refine_loop.py`（此处不复述条件）。被触发后**全自动执行，不分步等用户确认**：
@@ -49,7 +49,7 @@ python3 skills/skills-analyze/scripts/skills_analyze.py prepare
 候选来源 = 精析队列（`refine_loop.queue(nt, "resume")`），不再按"三列是否为空"推断。
 `--all` = 连已精析的一起重析（用户说"全部重跑"时用）；`--since N` 在队列内只看最近 N 分钟上传的；
 `--ids file.json` 指定记录 id（不受队列限制）。
-**周期租约**：prepare 获取 `outputs/refine_resume.lock`（30 分钟新鲜期内拒绝第二个周期，
+**周期租约**：prepare 获取 `outputs/refine_resume.lock`（30 分钟新鲜期——真源 `refine_loop.STALE_AFTER_S`——内拒绝第二个周期，
 exit 2 秒退——看到 refused 说明已有周期在跑，直接结束本轮、不要抢跑）；apply 写回时释放。
 同周期内重新切批（改 --batch/--since）加 `--force` 夺回自有租约。
 
@@ -153,6 +153,9 @@ python3 skills/skills-analyze/scripts/skills_apply.py outputs/skills_done.json -
 - `<BATCH_PATH>` → `outputs/skills_pending_part<N>.json` 的绝对路径
 - `<N>` → 批次号 N（done 文件名从 pending→done 自派生，N 不变）
 - `<VOCAB_PATH>` → `outputs/job_vocab.json` 的绝对路径
+- schema 数值/段名/校正字段名 → 由 `render_prompts` 从**唯一真源**注入，模板禁止手抄：
+  `<SKILLS_RANGE>`/`<SKILL_ZH_RANGE>`/`<TEXT_MAX>`/`<SEGS_N>`/`<SEG_1..5>` ← `skills_analyze.DONE_*`；
+  `<CORR_N>`/`<CORR_1..6>` ← `skills_apply.CORRECTIONS`。改口径只改这两处 .py 常量。
 
 **schema 校验不再内嵌进模板**：done 产物的格式偏差由 merge 的 `normalize_row` 自动归一化，
 质量问题由 `soft_observations` 记为非阻断观察（口径唯一真源 `shared/soften.py`），

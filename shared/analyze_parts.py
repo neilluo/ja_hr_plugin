@@ -58,6 +58,17 @@ def write_parts(outdir, prefix, items, meta_extra, batch=None):
     return meta
 
 
+def write_dispatch(outdir, prefix, batches, key="parts"):
+    """分派清单落盘 outputs/<prefix>_dispatch.json = {batches:N, key:[真实 pending 路径]}，
+    返回清单路径。agent 复制真实路径指针分派，不再凭记忆手拼 *_pending_part<N>.json
+    （jobs/match 两流水线同机制；skills_analyze 的 skills_dispatch.json 是 prompts 形态、走 render_prompts）。"""
+    path = os.path.join(outdir, "%s_dispatch.json" % prefix)
+    json.dump({"batches": batches,
+               key: [pending_path(outdir, prefix, i) for i in range(1, batches + 1)]},
+              open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    return path
+
+
 def read_done(outdir, prefix):
     """扫描 done part 逐批解析合并。返回 (rows, missing_batches)：
     缺失或解析失败的批次进 missing 并打印告警，其余照常返回（部分失败不整体失败）。

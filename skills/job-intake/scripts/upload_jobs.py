@@ -16,16 +16,19 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "shared"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "shared", "preflight"))
-from extract import extract                      # noqa: E402
+from extract import extract, DOC_EXTS           # noqa: E402  扩展名唯一真源 shared/extract.py
 from notable import Notable, NotableError       # noqa: E402
 from parse_job import parse                     # noqa: E402
 from preflight import run_preflight             # noqa: E402
 import refine_loop                              # noqa: E402  队列谓词唯一真源
-from report import print_report                 # noqa: E402  报告输出唯一真源（VERDICT 行 + 结果字段前置）
+from report import print_report, Chrono        # noqa: E402  报告输出唯一真源（VERDICT 行 + 结果字段前置 + 计时器）
 
 _CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "config.json")
 
-EXTS = (".doc", ".docx", ".pdf")
+# 岗位 JD 扩展名从唯一真源 extract.DOC_EXTS 派生（不变量 10：禁止再抄一份清单）。
+# JD 侧刻意排除纯文本类（.txt/.md）：岗位说明书是正式文档，纯文本文件当 JD 入库多为误放。
+_JD_EXCLUDE = {".txt", ".md"}
+EXTS = tuple(sorted(DOC_EXTS - _JD_EXCLUDE))
 
 
 def job_id_of(dept, name):
@@ -41,10 +44,12 @@ def main():
     # stage 0: 环境预检
     run_preflight(config_path=_CONFIG, files_dir=args.dir)
 
+    chrono = Chrono()
     nt = Notable()
     files = sorted(f for f in os.listdir(args.dir) if f.lower().endswith(EXTS))
     existing = {r["fields"].get("job_id") for r in nt.list_records("job", biz_fields=["job_id"])} \
         if not args.dry_run else set()
+    chrono.mark("list_existing")
 
     rows, report = [], {"kind": "岗位", "total": len(files), "parsed": 0, "skipped_dup": [],
                         "needs_ocr": [], "failed": []}
@@ -87,12 +92,16 @@ def main():
 
     if args.dry_run:
         report["rows"] = [{k: v for k, v in r.items() if k != "_file"} for r in rows]
+        chrono.mark("build_rows")
+        report["timing_ms"] = chrono.finish()  # dry-run 仅含 list_existing/build_rows/total（不触网写表）
         print_report(report)
         return
 
+    chrono.mark("build_rows")
     # JD 附件先传后写（5 并发），与简历同纪律
     paths = [row.pop("_file") for row in rows]
     cells, errs = nt.map_parallel(nt.upload_attachment, paths)
+    chrono.mark("attach")
     write_rows, attach_fail = [], []
     for row, cell in zip(rows, cells):
         if cell is not None:
@@ -105,8 +114,10 @@ def main():
     try:
         ids = nt.create_records("job", write_rows) if write_rows else []
     except NotableError as e:
+        report["timing_ms"] = chrono.finish()
         print_report({**report, "error": str(e)})
         sys.exit(1)
+    chrono.mark("create")
 
     try:
         # 写后查重自愈：重试双写或历史残留的重复 job_id，保留最早一条删其余
@@ -122,9 +133,12 @@ def main():
         report["duplicates_removed"] = len(dup_ids)
         back = set(groups)
     except NotableError as e:
+        report["timing_ms"] = chrono.finish()
         print_report({**report, "created": len(ids),
                       "error": "回读/查重失败: %s" % e})
         sys.exit(1)
+    chrono.mark("readback")
+    report["timing_ms"] = chrono.finish()
     report["created"] = len(ids)
     report["readback_missing"] = [r["job_id"] for r in write_rows if r["job_id"] not in back]
     try:

@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""refine_loop.py — AI 精析队列唯一真源：队列谓词 / 队列计数 / 周期锁 / 触发时刻（fire_at）/ 任务规格。
+"""refine_loop.py — AI 精析队列唯一真源：队列谓词 / 队列计数 / 周期锁 / 消费任务规格。
 
 背景：三列精析（skills/ai_extract/ai_deep 与岗位三列）是匹配的前置而非上传的前置，
 上传链路写完表即返回；精析消费方 = 上传后 agent 注册的一次性消费任务（注册规格由本文件
-consume_task_spec 产出、经上传报告的 cron_job 字段带出，agent 只透传；延迟唯一真源 =
-REFINE_DELAY_S，触发纪律见 skills/resume-intake/SKILL.md）+ 每日兜底巡检（时刻见
-FALLBACK_CRON / fallback_hhmm()，规格由 fallback_task_spec 产出）。无看门狗层：崩溃恢复靠
+consume_task_spec 产出、经上传报告的 cron_job 字段带出，agent 只透传；触发纪律见
+skills/resume-intake/SKILL.md）+ 每日兜底巡检（时刻见 FALLBACK_CRON / fallback_hhmm()，
+规格由 fallback_task_spec 产出）。无看门狗层：崩溃恢复靠
 "未打标记录仍在队列 + 租约过期自动接管 + 兜底重吃"，理由见 resume-intake SKILL 裁撤记录。
 队列状态不靠"三列是否为空"推断（岗位三列入库即有正则粗值、推断必失效），
 而以显式标记列 ai_refined_at（config.fields，type date 毫秒）为准：空 = 在队列。
@@ -24,7 +24,7 @@ match_gated 前置门禁经 queue_counts() 判断：队列非空 → exit 2 拒�
 
 周期租约（防并发双写）：prepare 获取 outputs/refine_<chain>.lock（resume/job 两链各自独立、
 可并行），写回端（skills_apply / sync_job_columns）完成后释放；租约跨进程存活（prepare 进程即退，
-PID 无法判活，故以 mtime 新鲜度为凭），30 分钟内视为有周期在跑、后来者 exit 2 秒退。
+PID 无法判活，故以 mtime 新鲜度为凭），STALE_AFTER_S（30 分钟）内视为有周期在跑、后来者 exit 2 秒退。
 崩溃遗留的租约随过期自然失效，队列项由下一周期（新即时任务/每日兜底巡检）重吃；
 prepare 切出 0 条时即时自释（并发周期已吃空，不留僵尸租约）。
 --force = 夺回自有租约（同周期内重切批用）。
@@ -40,15 +40,23 @@ QUEUE_BIZ = {"resume": ["ai_refined_at", "full_text", "source_file", "name"],
 _TEXT_KEY = {"resume": "full_text", "job": "responsibilities"}
 TABLES = ("resume", "job")
 
-# 精析消费任务的触发延迟（秒）：唯一真源，resume/job 两条上传链共用（AGENTS.md 不变量 10/11）。
-# 各 SKILL.md 与 prompt 一律只引用报告字段 refine_fire_at，禁止复述本数字。
-# 取值必须吃得下"脚本返回 → agent 发出注册请求"的模型往返（实测单回合 25-30s）：
-# 曾取 45s，单份小文件秒回时窗口被 agent 往返吃光，注册被"Scheduled time must be in the future"
-# 拒收，反要多花 3 个回合重算时刻。代价（三列晚几分钟填好）对不阻塞人的异步链路是免费的。
-REFINE_DELAY_S = 180
+# 精析消费任务的轮询间隔（毫秒）：唯一真源，resume/job 两条上传链共用（AGENTS.md 不变量 10/11）。
+# 消费任务是 every 型（非 at 型）：注册即启用、每 EVERY_MS 触发一次、消费完自删。
+# 为什么不用 at 型（绝对时刻）：at 型要求 schedule.at > now，而"脚本返回 → agent 发出注册"
+# 至少要一个模型回合（实测 25-30s），曾取 fire_at=now+45s，单份小文件秒回时窗口被 agent 往返
+# 吃光，注册被"Scheduled time must be in the future"拒收，反要多花 3 个回合重算时刻。
+# every 型的 schedule 里没有绝对时刻字段，注册永不过期——失败模式被结构性消除，不靠加大延迟去躲。
+# 60s 间隔：首次触发 ≈ 注册后 60s，比旧 at 型的 180s 更快；撞 30 分钟租约时见 refused 即自删退出。
+EVERY_MS = 60000
+
+# 周期租约判活窗口（秒，唯一真源）：锁 mtime 在此窗口内视为有周期在跑（30 分钟）。
+# 消费方（skills_analyze/jobs_analyze 的 prepare）一律用 acquire_lock 默认值，禁止再显式传
+# stale_after 抄第二份字面量（不变量 10）；文档只写"30 分钟"人话并指向本常量。
+STALE_AFTER_S = 1800
 
 # 一次性消费任务名前缀 / 每日兜底任务名（唯一真源）：兜底 cron 的自清理按前缀匹配已消费完的
 # 一次性任务，前缀与兜底规格在此定义一次、由本文件 CLI 产出，禁止在 cron payload 里手抄副本。
+# "一次性"指语义（跑到队列空即自删），非 schedule 类型——schedule 是 every 型（见 EVERY_MS）。
 TASK_PREFIX = {"resume": "简历精析消费", "job": "岗位JD精析消费"}
 FALLBACK_NAME = "招聘精析队列兜底巡检"
 FALLBACK_CRON = "30 9 * * *"        # 每日 09:30：白天工作时段，电脑通常在开机状态
@@ -74,12 +82,12 @@ def repo_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def delay_human():
-    """REFINE_DELAY_S 的人话表述：汇报里"约 N 分钟后自动精析"由此派生。
-    禁止在 SKILL.md / cron payload / agent 措辞里手抄分钟数（改延迟必漏一处）。"""
-    if REFINE_DELAY_S % 60 == 0:
-        return "%d 分钟" % (REFINE_DELAY_S // 60)
-    return "%d 秒" % REFINE_DELAY_S
+def every_human():
+    """EVERY_MS 的人话表述：汇报里"约 N 分钟内自动精析"由此派生。
+    禁止在 SKILL.md / cron payload / agent 措辞里手抄分钟数（改间隔必漏一处）。"""
+    if EVERY_MS % 60000 == 0:
+        return "%d 分钟" % (EVERY_MS // 60000)
+    return "%d 秒" % (EVERY_MS // 1000)
 
 
 def fallback_hhmm():
@@ -89,31 +97,31 @@ def fallback_hhmm():
     return "%s:%s" % (hour.zfill(2), minute.zfill(2))
 
 
-def fire_at(delay=REFINE_DELAY_S):
-    """注册精析消费任务的目标时刻：当前 +delay 秒，UTC ISO8601 秒级带 Z（cron schedule.at 直接可用）。"""
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + delay))
-
-
 def _consume_message(chain, name, root):
-    """一次性消费任务的 payload 指令：只写"跑什么命令、按哪份 SKILL、结束时自删"，
-    不复述流水线细节（细节唯一真源在各 SKILL.md，此处复述即双源、且必与文档漂移）。"""
+    """消费任务的 payload 指令：只写"跑什么命令、按哪份 SKILL、结束时自删"，
+    不复述流水线细节（细节唯一真源在各 SKILL.md，此处复述即双源、且必与文档漂移）。
+    自删措辞覆盖所有出口（队列空 / refused 撞租约 / 正常消费完）：every 型任务若任一路径
+    漏自删，就会每 EVERY_MS 反复触发——故第 3 步明写"无论哪种结束都先自删"。"""
     c = _CHAIN[chain]
     return (
         "在仓库 %s（以仓库根为 CWD）消费%s精析队列：\n"
-        "1. 跑 `%s`；该链计数为 0 则静默结束，不要通知任何人。\n"
+        "1. 跑 `%s`；该链计数为 0 则直接进第 3 步自删、静默结束，不要通知任何人。\n"
         "2. 非空则按 %s 的流水线全自动执行到 %s 写回并打 ai_refined_at 出队标记："
         "prepare → 同一条消息一次性并发发出全部 subagent（不分波、不串行，上限见 shared/waves.py）"
         "→ 每批 prompt 只写一行 pending 提示词文件路径（禁止内联提示词原文）→ merge → 写回。"
-        "prepare 返回 refused（撞活租约）即退出、禁止抢跑；不要向用户提问、不要等待确认。\n"
-        "3. 结束时（含第 1 步队列为 0 的静默结束），按任务名「%s」删除本一次性任务自身。"
+        "prepare 返回 refused（撞活租约）即进第 3 步自删退出、禁止抢跑；不要向用户提问、不要等待确认。\n"
+        "3. 无论第 1/2 步以哪种方式结束（队列空静默结束 / refused 撞租约退出 / 正常消费完），"
+        "都必须按任务名「%s」删除本任务自身（every 型任务漏删会反复触发）。"
         % (root, "简历" if chain == "resume" else "岗位JD", c["queue_cmd"], c["skill"],
            c["writeback"], name)
     )
 
 
-def consume_task_spec(chain, at=None, root=None):
-    """一次性精析消费任务的完整注册规格（定时任务管理工具 add 的 job 入参，可原样使用）。
+def consume_task_spec(chain, root=None):
+    """精析消费任务的完整注册规格（定时任务管理工具 add 的 job 入参，可原样使用）。
 
+    schedule 是 every 型（见 EVERY_MS）：注册即启用、每 EVERY_MS 触发、消费完自删。
+    不用 at 型绝对时刻——那会让"脚本返回 → agent 注册"的模型往返吃光窗口而被拒收（见 EVERY_MS 注释）。
     存在理由：agent 手写这份 payload 曾一次吃掉 25s 模型思考，且手抄的任务名前缀与流水线细节
     与代码/文档构成双源。规格改由代码产出后，注册动作退化为"把 cron_job 原样传给工具"。"""
     if chain not in _CHAIN:
@@ -122,9 +130,9 @@ def consume_task_spec(chain, at=None, root=None):
     name = "%s-%s" % (TASK_PREFIX[chain], time.strftime("%Y%m%d-%H%M%S"))
     return {
         "name": name,
-        "description": "消费%s精析队列（入库脚本触发注册，完成即自删）"
+        "description": "消费%s精析队列（入库脚本触发注册，消费完即自删）"
                        % ("简历" if chain == "resume" else "岗位JD"),
-        "schedule": {"kind": "at", "at": at or fire_at()},
+        "schedule": {"kind": "every", "everyMs": EVERY_MS},
         "payload": {"kind": "agentTurn", "message": _consume_message(chain, name, root),
                     "contextDirs": [root]},
         "missedRunPolicy": "run_latest",
@@ -145,7 +153,7 @@ def fallback_task_spec(root=None):
         "全部 subagent（不分波）→ 每批只发一行 pending 提示词文件路径 → merge → 写回；"
         "prepare 返回 refused 即退出、禁止抢跑。\n"
         "3. 自清理（无论队列是否为空都做）：列出定时任务，删除名称以 %s 开头、"
-        "已停用且有执行记录的一次性消费任务（已消费完的 at 型任务留着只会堆积列表）；"
+        "已消费完（有执行记录）的一次性消费任务（正常应已自删，此处兜底清理漏删的残留）；"
         "本巡检任务是周期任务，禁止删除自身。完成后无需通知任何人。"
         % (root, cmds, "、".join(_CHAIN[t]["skill"] for t in TABLES), prefixes)
     )
@@ -161,18 +169,17 @@ def fallback_task_spec(root=None):
 
 
 def trigger(nt, table, report, root=None):
-    """入库脚本的统一收尾：计队列 → 非空则给出注册时刻与现成注册规格。
+    """入库脚本的统一收尾：计队列 → 非空则给出现成的 every 型注册规格。
 
     唯一真源（不变量 10）：resume/job 两条上传链共用本函数，禁止各自再抄
-    "refine_queued = len(queue(...)) + fire_at()" 三行（曾两处并存，改延迟时必漏一处）。
-    写入 report 的三个键：refine_queued（触发信号）、refine_fire_at（注册时刻）、
-    cron_job（可直接传给定时任务工具的 job 规格）。NotableError 由调用方统一捕获。"""
+    "refine_queued = len(queue(...))" + 组装 cron_job（曾两处并存，改规格时必漏一处）。
+    写入 report 的两个键：refine_queued（触发信号）、cron_job（可直接传给定时任务工具的
+    every 型 job 规格）。every 型无绝对时刻，故不再有 refine_fire_at 字段。
+    NotableError 由调用方统一捕获。"""
     n = len(queue(nt, table))
     report["refine_queued"] = n
     if n:
-        at = fire_at()
-        report["refine_fire_at"] = at
-        report["cron_job"] = consume_task_spec(table, at, root)
+        report["cron_job"] = consume_task_spec(table, root)
     return n
 
 
@@ -234,7 +241,7 @@ def lock_path(outdir, chain="resume"):
     return os.path.join(outdir, "refine_%s.lock" % chain)
 
 
-def acquire_lock(outdir, chain="resume", stale_after=1800, force=False):
+def acquire_lock(outdir, chain="resume", stale_after=STALE_AFTER_S, force=False):
     """周期租约：防同一条精析链被两个周期并发双写。返回锁路径或 None（租约被活周期占用）。
 
     force=True：夺回租约（同周期内重新 prepare 切批时用，覆盖锁文件刷新租约）。"""

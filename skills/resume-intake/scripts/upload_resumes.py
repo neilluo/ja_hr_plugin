@@ -19,9 +19,9 @@
   user_line       = 交付用户的一句话原话（措辞与"约 X 分钟/次日 HH:MM 兜底"由 report.py 从
                     refine_loop 真源派生），agent 原样复述即结束，禁止自行组织长汇报；
   next_action     = 下一步动作清单（机器产出），照它做；
-  cron_job        = 精析消费任务的完整注册规格（name/schedule.at/payload/contextDirs 全备好，
-                    refine_loop.consume_task_spec 产出）：仅 refine_queued>0 时输出，agent **原样透传**
-                    给定时任务工具，禁止手写字段、禁止再跑 date 算时刻（延迟真源 = REFINE_DELAY_S）；
+  cron_job        = 精析消费任务的完整注册规格（name/schedule/payload/contextDirs 全备好，
+                    refine_loop.consume_task_spec 产出，schedule 为 every 型无绝对时刻）：仅
+                    refine_queued>0 时输出，agent **原样透传**给定时任务工具，禁止手写字段；
   created_summary = 本次入库记录关键字段回带（最多 SUMMARY_MAX 条）：用户问"传进去的是谁"直接引用，
                     禁止再跑 query.py 复核（readback_missing 为空即已逐手机号回读，不变量 4）；
   created / skipped_dup / needs_ocr / failed / readback_missing / table_total / refine_queued / timing_ms。
@@ -47,7 +47,7 @@ from notable import Notable, NotableError       # noqa: E402
 from parse_resume import parse, derive      # noqa: E402  parse=批量、derive=补录派生，同一批函数
 from preflight import run_preflight             # noqa: E402
 import refine_loop                              # noqa: E402  队列谓词唯一真源，禁止本地抄副本
-from report import print_report                 # noqa: E402  报告输出唯一真源（VERDICT 行 + 结果字段前置）
+from report import print_report, Chrono        # noqa: E402  报告输出唯一真源（VERDICT 行 + 结果字段前置 + 计时器）
 
 _CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "config.json")
 
@@ -65,28 +65,6 @@ UPLOAD_WORKERS = 10  # 附件上传/文本解析并发；notable.map_parallel �
 def _md5(path):
     with open(path, "rb") as f:
         return hashlib.md5(f.read()).hexdigest()
-
-
-class _Chrono:
-    """阶段计时器：mark(name) 记录自上次 mark 起的毫秒增量并按 name 累加。
-
-    报告 timing_ms 字段唯一生产者。分段名在批量/补录两模式间保持一致以便横向比对：
-    list_existing / extract(仅批量) / build_rows / attach / create / readback / total。
-    纯本地 monotonic 计时，不触网、不改变任何业务行为。"""
-
-    def __init__(self):
-        self._start = self._last = time.monotonic()
-        self.segs = {}
-
-    def mark(self, name):
-        now = time.monotonic()
-        self.segs[name] = self.segs.get(name, 0) + round((now - self._last) * 1000)
-        self._last = now
-
-    def finish(self):
-        # total = 自构造起墙钟耗时（非末段残差）；各分段之和 ≈ total（含未打标间隙）
-        self.segs["total"] = round((time.monotonic() - self._start) * 1000)
-        return self.segs
 
 
 def _validate(nt, table, row):
@@ -116,7 +94,7 @@ def _finalize(nt, table, rows, report, chrono=None):
     """批量与补录共用尾部：附件先传 → 写表 → 写后查重自愈 → 按手机号回读 → 队列计数。
     rows 含 _file/attach_md5。chrono 非空时按 attach/create/readback 分段计时并写入 report。
     批量与补录一视同仁：两者新记录都入精析队列（扫描件靠 source_file 入队、由 subagent 读图），
-    故队列非空时都输出 refine_fire_at / cron_job 供 agent 注册消费任务（trigger 唯一真源）。"""
+    故队列非空时都输出 cron_job（every 型规格）供 agent 注册消费任务（trigger 唯一真源）。"""
     if not rows:
         try:
             report["duplicates_removed"], report["table_total"] = _dedupe_selfheal(
@@ -194,7 +172,7 @@ def _scan(dir_or_file):
 
 
 def run_batch(nt, args):
-    chrono = _Chrono()
+    chrono = Chrono()
     base_dir, files = _scan(args.dir)
     if args.dry_run:
         phones, md5s = set(), set()
@@ -220,12 +198,15 @@ def run_batch(nt, args):
             if digest in md5s:
                 report["skipped_dup"].append({"file": fn, "reason": "md5"})
                 continue
+            # needs_ocr 报绝对路径：agent 补录时直接把它当 `_file` 用（视觉读取与 backfill 同源），
+            # 不再由 agent 手拼 base_dir+文件名（确定性转写下沉代码，见 SKILL「扫描件补录」）。
+            # abspath：base_dir 可能是调用方传的相对目录，补录时 agent 的 CWD 未必相同。
             if ex["needs_ocr"] or not ex["text"].strip():
-                report["needs_ocr"].append(fn)
+                report["needs_ocr"].append(os.path.abspath(path))
                 continue
             c = parse(ex["text"], fn)
             if not c["phone"] and not c["email"]:
-                report["needs_ocr"].append(fn)  # 扫描件特征：抽不出任何联系方式
+                report["needs_ocr"].append(os.path.abspath(path))  # 扫描件特征：抽不出任何联系方式
                 continue
             if c["phone"] and c["phone"] in phones:
                 report["skipped_dup"].append({"file": fn, "reason": "phone", "phone": c["phone"]})
@@ -259,7 +240,7 @@ def run_batch(nt, args):
 def run_backfill(nt, args):
     """扫描件补录：读 records.json（字段 + _file 原文件路径），走与批量一致的附件/写表/回读。
     payload 路径为 "-" 时从 stdin 读——agent 可 heredoc 一条命令写完即跑，省一次回合往返。"""
-    chrono = _Chrono()
+    chrono = Chrono()
     if args.backfill == "-":
         records = json.load(sys.stdin)
     else:

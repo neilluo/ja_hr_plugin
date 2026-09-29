@@ -104,7 +104,8 @@ AI 语义分析三列（`resume.ai_extract` AI结构化提取 / `resume.ai_deep`
   `[{filename,size,type,url:resourceUrl,resourceId}]`。附件失败则该条不写表。简历与 JD 同纪律。
 - **回读**：写后按手机号/job_id 全量回读比对，缺失即失败。
 - **匹配**：机械门槛（组织/学历/年限/证书/年龄）一票否决 → subagent 逐岗判 keep 与语义计分 →
-  推荐阈值 total≥80 推荐 / 60–79 待定 / <60 不推荐；落库门槛 `MIN_SCORE` 环境变量默认 20。
+  推荐/待定/不推荐阈值与落库门槛 `MIN_SCORE` 的唯一真源是 `match_gated.py` 的
+  `REC_MIN` / `PEND_MIN` / `MIN_SCORE` 常量（文档只引用不复述数值）。
   口径细节见 `skills/recruit-model/references/ai-analysis-spec.md`。
 - **限流**：429/5xx/文档初始化中 指数退避重试；401 自动刷 token 重试一次；QPS 403 属网关级拒绝可重试。
 - **并发**：附件上传经 `Notable.map_parallel` 5 线程并发（I/O 密集）；解析与记录写串行

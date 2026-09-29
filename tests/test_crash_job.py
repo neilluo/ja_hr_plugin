@@ -43,6 +43,7 @@ EXPECTED_FILES = 19          # 标准夹具：19 份 JD -> 19 created（块1=10 
 import notable as notable_mod            # noqa: E402
 from notable import Notable               # noqa: E402
 import preflight as preflight_mod        # noqa: E402
+import refine_loop                       # noqa: E402  every 型间隔与消费任务规格唯一真源
 import upload_jobs                        # noqa: E402
 
 CN_JOB_ID = "岗位ID"
@@ -657,11 +658,12 @@ class TestCrashJob(unittest.TestCase):
         self.assertEqual(self.h.db.dup_job_ids(), {})
 
 
-class TestJobRefineFireAt(unittest.TestCase):
-    """纯 mock 层：岗位报告 refine_fire_at 语义（不依赖 JA_TEST_DATA_DIR 夹具，永不 skip）。
+class TestJobRefineCronJob(unittest.TestCase):
+    """纯 mock 层：岗位报告 cron_job 语义（不依赖 JA_TEST_DATA_DIR 夹具，永不 skip）。
 
     空目录跑 main()（created=0），队列状态完全由预置内存记录决定：
-    队列非空 → 报告含 refine_fire_at（UTC ISO8601 秒级带 Z）；队列为空 → 不输出该字段。"""
+    队列非空 → 报告含 cron_job（every 型注册规格，无绝对时刻）；队列为空 → 不输出该字段。
+    at 型的 refine_fire_at 字段已整体删除（every 型注册永不过期，见 refine_loop.EVERY_MS 注释）。"""
 
     def setUp(self):
         # 假凭证走环境变量，避免依赖本机 .secrets.json（mock server 无条件发 token）
@@ -670,7 +672,7 @@ class TestJobRefineFireAt(unittest.TestCase):
         os.environ["DINGTALK_APP_KEY"] = "crash-job-test-key"
         os.environ["DINGTALK_APP_SECRET"] = "crash-job-test-secret"
         self.h = Harness()
-        self.d = tempfile.mkdtemp(prefix="crash_job_fireat_")
+        self.d = tempfile.mkdtemp(prefix="crash_job_cronjob_")
         # preflight 要求目录至少含一份支持格式文件；放一份不可解析的占位文件，
         # 解析失败进 failed、created=0，队列状态完全由预置内存记录决定。
         with open(os.path.join(self.d, "placeholder.pdf"), "wb") as f:
@@ -685,8 +687,8 @@ class TestJobRefineFireAt(unittest.TestCase):
         shutil.rmtree(self.d, ignore_errors=True)
         self.h.close()
 
-    def test_fire_at_emitted_when_queue_nonempty(self):
-        # 预置一条待精析岗位（无标记 + 有职责）→ refine_queued=1 → 输出 refine_fire_at
+    def test_cron_job_emitted_when_queue_nonempty(self):
+        # 预置一条待精析岗位（无标记 + 有职责）→ refine_queued=1 → 输出 every 型 cron_job
         self.h.db.add({CN_JOB_ID: "JSEED000001", CN_RESP: "负责设备维护与保养",
                        CN_REFINED: None})
         code, out, exc = self.h.run_main(self.d)
@@ -695,12 +697,16 @@ class TestJobRefineFireAt(unittest.TestCase):
         self.assertEqual(code, 0)
         # 种子记录保证队列非空（占位文件能否解析不影响本断言）
         self.assertGreater(rep.get("refine_queued"), 0)
-        self.assertIn("refine_fire_at", rep)
-        self.assertRegex(rep["refine_fire_at"],
-                         r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        self.assertIn("cron_job", rep)
+        self.assertEqual(rep["cron_job"]["schedule"],
+                         {"kind": "every", "everyMs": refine_loop.EVERY_MS})
+        self.assertTrue(rep["cron_job"]["name"].startswith(refine_loop.TASK_PREFIX["job"]))
+        # at 型残留字段必须已删干净（防复活）
+        self.assertNotIn("refine_fire_at", rep)
+        self.assertNotIn("at", rep["cron_job"]["schedule"])
 
-    def test_no_fire_at_when_queue_empty(self):
-        # 队列空（唯一记录已打标）→ refine_queued=0 且不输出 refine_fire_at
+    def test_no_cron_job_when_queue_empty(self):
+        # 队列空（唯一记录已打标）→ refine_queued=0 且不输出 cron_job / refine_fire_at
         self.h.db.add({CN_JOB_ID: "JSEED000002", CN_RESP: "已精析",
                        CN_REFINED: 1789924509618})
         code, out, exc = self.h.run_main(self.d)
@@ -708,6 +714,7 @@ class TestJobRefineFireAt(unittest.TestCase):
         self.assertIsNone(exc)
         self.assertEqual(code, 0)
         self.assertEqual(rep.get("refine_queued"), 0)
+        self.assertNotIn("cron_job", rep)
         self.assertNotIn("refine_fire_at", rep)
 
 

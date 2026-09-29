@@ -115,37 +115,48 @@ class TestExtractExtsSingleSource(unittest.TestCase):
             self.assertIn(e, extract.SUPPORTED_EXTS)
 
 
-class TestRefineDelaySingleSource(unittest.TestCase):
-    """不变量 10：精析触发延迟唯一真源 = shared/refine_loop.py 的 REFINE_DELAY_S，
-    两条上传链（upload_resumes/upload_jobs）禁止本地副本（含转发别名）。"""
+class TestRefineIntervalSingleSource(unittest.TestCase):
+    """不变量 10/11：精析消费任务用 every 型（非 at 型绝对时刻），间隔唯一真源 =
+    shared/refine_loop.py 的 EVERY_MS，两条上传链（upload_resumes/upload_jobs）禁止本地副本。
+    every 型注册永不过期，结构性消除 at 型"时刻必须在未来"的拒收（见 AGENTS 犯错记录）。"""
 
     def test_constant_defined_only_in_refine_loop(self):
-        # 值本身不钉死（会随往返实测调整），但必须 ≥ 一次 agent 回合往返，
-        # 否则单份秒回时 refine_fire_at 会在注册前过期、被"时刻必须在未来"拒收（见 AGENTS 犯错记录）。
-        self.assertGreaterEqual(refine_loop.REFINE_DELAY_S, 120)
+        # every 型间隔必须 > 0 且是 60s 的整毫秒倍数（人话表述按分钟取整）；
+        # at 型的 REFINE_DELAY_S / fire_at 已整体删除，禁止复活（绝对时刻 = 过期失败模式根源）。
+        self.assertGreater(refine_loop.EVERY_MS, 0)
+        self.assertEqual(refine_loop.EVERY_MS % 1000, 0)
+        self.assertFalse(hasattr(refine_loop, "REFINE_DELAY_S"), "at 型延迟常量已删，禁止复活")
+        self.assertFalse(hasattr(refine_loop, "fire_at"), "at 型时刻函数已删，禁止复活")
+        self.assertFalse(hasattr(refine_loop, "delay_human"), "已改名 every_human，旧名禁止复活")
         for mod in (upload_resumes, upload_jobs):
+            self.assertFalse(hasattr(mod, "EVERY_MS"))
             self.assertFalse(hasattr(mod, "REFINE_DELAY_S"))
-            self.assertFalse(hasattr(mod, "_fire_at"))
             self.assertFalse(hasattr(mod, "fire_at"))
 
     def test_upload_scripts_have_no_local_copy(self):
-        # grep 式断言：上传脚本源码不得再出现延迟常量定义或本地时刻函数（防副本复活）；
+        # grep 式断言：上传脚本源码不得再出现间隔常量定义或本地时刻函数（防副本复活）；
         # docstring 里以"指向 shared/refine_loop.py"形式引用常量名属指针、不算副本。
         for parts in (("skills", "resume-intake", "scripts", "upload_resumes.py"),
                       ("skills", "job-intake", "scripts", "upload_jobs.py")):
             src = open(os.path.join(ROOT, *parts), encoding="utf-8").read()
-            self.assertNotIn("REFINE_DELAY_S =", src, "%s 出现延迟常量定义副本" % (parts,))
-            self.assertNotIn("def _fire_at", src, "%s 出现本地 fire_at 函数副本" % (parts,))
+            self.assertNotIn("EVERY_MS =", src, "%s 出现间隔常量定义副本" % (parts,))
+            self.assertNotIn("def fire_at", src, "%s 出现本地 fire_at 函数副本" % (parts,))
+            self.assertNotIn("refine_fire_at", src, "%s 出现已废弃的 at 型注册时刻字段" % (parts,))
 
     def test_task_spec_is_code_product(self):
-        """消费/兜底任务规格是代码产物：任务名前缀、时刻、payload 均从 refine_loop 派生，
-        禁止 agent 手写 payload 或手抄前缀（曾一次手写 payload 吃掉 25s 模型思考）。"""
+        """消费/兜底任务规格是代码产物：任务名前缀、schedule、payload 均从 refine_loop 派生，
+        禁止 agent 手写 payload 或手抄前缀（曾一次手写 payload 吃掉 25s 模型思考）。
+        consume_task_spec 不再接受 at 参数——every 型无绝对时刻。"""
         import report
-        spec = refine_loop.consume_task_spec("resume", at="2026-01-01T00:00:00Z", root="/tmp/repo")
+        spec = refine_loop.consume_task_spec("resume", root="/tmp/repo")
         self.assertTrue(spec["name"].startswith(refine_loop.TASK_PREFIX["resume"]))
-        self.assertEqual(spec["schedule"], {"kind": "at", "at": "2026-01-01T00:00:00Z"})
+        # 关键断言：schedule 是 every 型，无 at 字段（注册永不过期的根源）
+        self.assertEqual(spec["schedule"], {"kind": "every", "everyMs": refine_loop.EVERY_MS})
+        self.assertNotIn("at", spec["schedule"])
         self.assertEqual(spec["payload"]["contextDirs"], ["/tmp/repo"])
-        self.assertIn("删除本一次性任务", spec["payload"]["message"])   # 完成即自删
+        # 自删措辞覆盖所有出口（every 型漏删会反复触发）：队列空/refused/正常消费完都要删
+        self.assertIn("删除本任务自身", spec["payload"]["message"])
+        self.assertIn("refused", spec["payload"]["message"])
         self.assertIn(refine_loop._CHAIN["resume"]["queue_cmd"], spec["payload"]["message"])
         fb = refine_loop.fallback_task_spec(root="/tmp/repo")
         self.assertEqual(fb["name"], refine_loop.FALLBACK_NAME)
@@ -153,8 +164,8 @@ class TestRefineDelaySingleSource(unittest.TestCase):
         # 兜底自清理的前缀取自 TASK_PREFIX，不是手抄字面量
         for t in refine_loop.TABLES:
             self.assertIn(refine_loop.TASK_PREFIX[t], fb["payload"]["message"])
-        # 人话表述与真源一致（汇报里"约 N 分钟""次日 HH:MM"由此派生）
-        self.assertIn(str(refine_loop.REFINE_DELAY_S // 60), report.refine_loop.delay_human())
+        # 人话表述与真源一致（汇报里"约 N 分钟内""次日 HH:MM"由此派生）
+        self.assertIn(str(refine_loop.EVERY_MS // 60000), report.refine_loop.every_human())
         self.assertRegex(refine_loop.fallback_hhmm(), r"^\d{2}:\d{2}$")
 
 

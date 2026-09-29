@@ -29,4 +29,5 @@ python3 shared/query.py perm
 - `--filter` 可重复传多个，关系为 AND，等值匹配。
 - 输出 JSON：`{count, records:[{id, fields}]}`；select 类字段已归一为字符串。
 - 本 skill 只读；写操作一律走 resume-intake / job-intake 的脚本。
-- 需要 HTML 看板时：读 `shared/query.py job` + `match --stats` 的 JSON 自行渲染，勿改脚本。
+- 需要 HTML 看板时：运行 `python3 skills/recruit-dashboard/scripts/build_dashboard.py`
+  （见 recruit-dashboard skill），聚合与渲染全部由脚本完成，勿自行渲染、勿改脚本。

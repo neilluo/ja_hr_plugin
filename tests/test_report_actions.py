@@ -5,7 +5,7 @@
   1) shared/report.py：user_line（一句话结论，agent 原样复述）/ next_action（下一步动作）/
      created_summary（回带入库记录，免再跑 query.py）/ cron_job 字段前置。
   2) upload_resumes._scan：单个文件路径直接入库，不再需要 /tmp 建软链绕路。
-  3) refine_loop.trigger：队列非空时同时产出 refine_fire_at 与现成 cron_job 规格。
+  3) refine_loop.trigger：队列非空时产出现成 cron_job 规格（every 型，注册永不过期）。
 
 不触网：report/_scan 是纯函数；trigger 用最小 mock。
 """
@@ -32,7 +32,7 @@ class TestUserLine(unittest.TestCase):
         self.assertIn("新增 1 条", line)
         self.assertIn("表内共 1 条", line)
         # 延迟与兜底时刻必须从真源派生，不能是写死的数字
-        self.assertIn(refine_loop.delay_human(), line)
+        self.assertIn(refine_loop.every_human(), line)
         self.assertIn(refine_loop.fallback_hhmm(), line)
 
     def test_warn_needs_ocr(self):
@@ -97,7 +97,6 @@ class TestEnrichOrdering(unittest.TestCase):
         import json
         r = {"kind": "简历", "created": 1, "readback_missing": [], "failed": [],
              "needs_ocr": [], "skipped_dup": [], "table_total": 1, "refine_queued": 1,
-             "refine_fire_at": "2026-01-01T00:00:00Z",
              "cron_job": {"name": "n"}, "timing_ms": {"total": 5}}
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -151,12 +150,12 @@ class _MiniNT:
     def __init__(self, rows):
         self._rows = rows
 
-    def list_records(self, table, flt=None, biz_fields=None, limit=0):
+    def list_records(self, table, flt=None, biz_fields=None):
         return self._rows
 
 
 class TestTrigger(unittest.TestCase):
-    def test_nonempty_queue_emits_fire_at_and_cron_job(self):
+    def test_nonempty_queue_emits_cron_job_every_type(self):
         # 一条 ai_refined_at 空、full_text 非空的 resume 行 = 在队列
         nt = _MiniNT([{"id": "r1", "fields": {"ai_refined_at": None, "full_text": "正文",
                                               "source_file": None, "name": "张三"}}])
@@ -164,12 +163,14 @@ class TestTrigger(unittest.TestCase):
         n = refine_loop.trigger(nt, "resume", rep, root="/tmp/repo")
         self.assertEqual(n, 1)
         self.assertEqual(rep["refine_queued"], 1)
-        self.assertIn("refine_fire_at", rep)
+        # every 型无绝对时刻：不再有 refine_fire_at 字段（at 型已废弃，见 refine_loop.EVERY_MS 注释）
+        self.assertNotIn("refine_fire_at", rep)
         self.assertIn("cron_job", rep)
         self.assertTrue(rep["cron_job"]["name"].startswith(refine_loop.TASK_PREFIX["resume"]))
-        self.assertEqual(rep["cron_job"]["schedule"]["at"], rep["refine_fire_at"])
+        self.assertEqual(rep["cron_job"]["schedule"],
+                         {"kind": "every", "everyMs": refine_loop.EVERY_MS})
 
-    def test_empty_queue_no_fire_fields(self):
+    def test_empty_queue_no_cron_job(self):
         nt = _MiniNT([{"id": "r1", "fields": {"ai_refined_at": 123, "full_text": "正文",
                                               "source_file": None, "name": "张三"}}])
         rep = {}

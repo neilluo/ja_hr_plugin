@@ -14,7 +14,7 @@
 分派纪律（历史教训：merge(nt) vs prepare(nt,args) 签名不一致必崩 TypeError）：
 所有子命令 handler 签名一致 = handler(args)，需要 nt 的自己构造；merge 不触网就不构造 nt。
 """
-import sys, os, json, time, collections
+import sys, os, json, collections
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
 sys.path.insert(0, os.path.join(ROOT, "shared"))
@@ -22,13 +22,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 from notable import Notable  # noqa: E402
 from semantic_score import toks, txt  # noqa: E402
-from match_gated import SYS_SOURCE  # noqa: E402  系统来源标记唯一具名常量（同 skill 私有库）
+# 同 skill 私有常量/公共件唯一真源在 match_gated（不变量 10）：来源标记、行组装、四项统计刷新
+from match_gated import SYS_SOURCE, _match_row, refresh_job_stats  # noqa: E402
 import analyze_parts as ap  # noqa: E402  切批/合并公共骨架（parts 命名唯一真源）
-
-_CONFIG = os.path.join(ROOT, "config.json")
-CONFIG = json.load(open(_CONFIG, encoding="utf-8"))
-# 推荐状态清单唯一派生自 config.options.match.recommend
-_RECOMMEND = CONFIG["options"]["match"]["recommend"]
 
 OUTDIR = os.path.join(ROOT, "outputs")
 PREFIX = "match"
@@ -89,8 +85,15 @@ def prepare(args):
     batch = int(args[args.index("--batch") + 1]) if "--batch" in args else None
     # agent 数硬上限见 shared/waves.MAX_AGENTS(=20)，默认自动铺满
     capped = _cap_blocks(blocks)
-    ap.write_parts(OUTDIR, PREFIX, capped,
-                   {"total_pairs": len(pairs), "jobs": len(blocks), "blocks": len(capped)}, batch)
+    meta = ap.write_parts(OUTDIR, PREFIX, capped,
+                          {"total_pairs": len(pairs), "jobs": len(blocks), "blocks": len(capped)}, batch)
+    # 分派清单落盘：agent 复制真实 pending 路径指针分派，不再凭记忆手拼 *_pending_part<N>.json
+    # （清单形态唯一真源 = shared/analyze_parts.write_dispatch，与 jobs_analyze 同机制；
+    # stdout 仍只留 write_parts 打的单行 meta）
+    if meta["batches"]:
+        meta["dispatch"] = ap.write_dispatch(OUTDIR, PREFIX, meta["batches"])
+        json.dump(meta, open(ap.meta_path(OUTDIR, PREFIX), "w", encoding="utf-8"))
+    return meta
 
 
 def merge(args):
@@ -141,44 +144,24 @@ def apply_(nt):
         cf, jf = cands.get(rid), jmeta.get(r.get("job_id"))
         if not cf or not jf:
             continue
-        create.append({"name": r["name"], "phone": cf.get("phone"), "job_id": r["job_id"],
-                       "job_name": jf.get("job_name"), "org": jf.get("org"),
-                       "source": SYS_SOURCE, "cand_skills": "、".join(toks(cf.get("skills"))),
-                       "must_skills": txt(jf.get("must_skills")), "bonus_skills": txt(jf.get("bonus_skills")),
-                       "hard_gates": txt(jf.get("hard_gates")),
-                       "expected_position": cf.get("expected_position"),
-                       "years_experience": str(cf.get("years_experience") or "无"),
-                       "skill_score": int(r.get("skill_score") or 0),
-                       "bonus_score": int(r.get("bonus_score") or 0),
-                       "total_score": int(r.get("total_score") or 0),
-                       "recommend": r.get("recommend") or "不推荐",
-                       "evidence": r.get("evidence") or "",
-                       "ai_analysis": r.get("ai_analysis") or "",
-                       "update_time": int(time.time() * 1000)})
+        # 行组装唯一真源 match_gated._match_row（与 stage_commit 共用；缺推荐兜底 REJ_LABEL）
+        create.append(_match_row(cf, {"job_id": r["job_id"], "job_name": jf.get("job_name"),
+                                      "org": jf.get("org"), "must_skills": jf.get("must_skills"),
+                                      "bonus_skills": jf.get("bonus_skills"),
+                                      "hard_gates": jf.get("hard_gates")},
+                                 {"name": r["name"], "skill_score": r.get("skill_score"),
+                                  "bonus_score": r.get("bonus_score"), "total_score": r.get("total_score"),
+                                  "recommend": r.get("recommend"), "evidence": r.get("evidence"),
+                                  "ai_analysis": r.get("ai_analysis")}))
     nt.create_records("match", create)
     print(json.dumps({"created": len(create), "deleted_old": len(olds),
                       "next": "执行 stats 刷新岗位统计（索引延迟，必须另起读取）"}, ensure_ascii=False))
 
 
 def stats(nt):
-    rows = nt.list_records("match", biz_fields=["job_id", "recommend"])
-    # 统计位次派生自 config.options.match.recommend 顺序（推荐→1 待定→2 不推荐→3）
-    rec_idx = {r: i + 1 for i, r in enumerate(_RECOMMEND)}
-    st = collections.defaultdict(lambda: [0, 0, 0, 0])
-    for r in rows:
-        f = r["fields"]
-        s = st[f.get("job_id")]
-        s[0] += 1
-        s[rec_idx.get(f.get("recommend"), len(_RECOMMEND))] += 1
-    jobs = nt.list_records("job", biz_fields=["job_id"])
-    upd = []
-    for j in jobs:
-        v = st.get(j["fields"].get("job_id"), [0, 0, 0, 0])
-        upd.append({"id": j["id"], "stat_total": v[0], "stat_recommend": v[1],
-                    "stat_pending": v[2], "stat_reject": v[3]})
-    nt.update_records("job", upd)
-    dist = collections.Counter(r["fields"].get("recommend") for r in rows)
-    print(json.dumps({"match_rows": len(rows), "jobs_updated": len(upd), "分布": dict(dist)},
+    # 统计唯一实现 match_gated.refresh_job_stats（与 stage_stats 共用）
+    n_rows, n_jobs, dist = refresh_job_stats(nt)
+    print(json.dumps({"match_rows": n_rows, "jobs_updated": n_jobs, "分布": dict(dist)},
                      ensure_ascii=False))
 
 

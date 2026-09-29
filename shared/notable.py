@@ -222,7 +222,7 @@ class Notable:
             valid = ", ".join(sorted(self.cfg["fields"].get(table, {})))
             raise NotableError("未知业务键 '%s'（表 %s）。可用: %s" % (biz, table, valid))
 
-    def list_records(self, table, flt=None, biz_fields=None, limit=0):
+    def list_records(self, table, flt=None, biz_fields=None):
         """全量分页拉取。返回 [{id, fields:{业务键: 原始值}}]。flt = {业务键: 值} 等值过滤。"""
         sheet, out, token = self.sheet(table), [], ""
         names = [self.cn(table, k) for k in (biz_fields or [])]
@@ -241,8 +241,6 @@ class Notable:
                 out.append({"id": rec["id"],
                             "fields": {self._biz(table, k): self._norm(v, self._type(table, k))
                                        for k, v in rec.get("fields", {}).items()}})
-            if limit and len(out) >= limit:
-                return out[:limit]
             token = r.get("nextToken", "")
             if not r.get("hasMore") or not token:
                 return out
@@ -303,7 +301,6 @@ class Notable:
 
     # ── 字段值转换 ────────────────────────────────────────
     def _cells(self, table, row):
-        types = self.cfg["types"][table]
         cells = {}
         for biz, val in row.items():
             if val is None or val == "" or val == []:

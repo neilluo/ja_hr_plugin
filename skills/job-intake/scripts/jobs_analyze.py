@@ -216,7 +216,7 @@ def prepare(args):
     # sync_job_columns 写回时释放。同周期重切批 --force 夺回自有租约。
     force = "--force" in args
     args = [a for a in args if a != "--force"]
-    if refine_loop.acquire_lock(OUTDIR, "job", stale_after=1800, force=force) is None:
+    if refine_loop.acquire_lock(OUTDIR, "job", force=force) is None:
         print(json.dumps({"refused": True,
                           "reason": "另一精析周期持锁中（outputs/refine_job.lock 租约未过期）：本轮跳过避免并发双写；"
                                     "确属本周期重切批则加 --force"}))
