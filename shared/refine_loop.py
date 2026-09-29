@@ -25,6 +25,9 @@ match_gated 前置门禁经 queue_counts() 判断：队列非空 → exit 2 拒�
 周期租约（防并发双写）：prepare 获取 outputs/refine_<chain>.lock（resume/job 两链各自独立、
 可并行），写回端（skills_apply / sync_job_columns）完成后释放；租约跨进程存活（prepare 进程即退，
 PID 无法判活，故以 mtime 新鲜度为凭），STALE_AFTER_S（30 分钟）内视为有周期在跑、后来者 exit 2 秒退。
+一个 run 的墙钟 = 最慢 subagent 批次的墙钟（merge 门禁要全部批次到齐），而 mtime 只在 prepare
+写一次，故长流程必须在读到盘上产物/写回前用 renew_lock 续租——判活窗口随工作推进滚动，
+不随 run 墙钟耗尽（不续租的后果见 renew_lock 注释）。
 崩溃遗留的租约随过期自然失效，队列项由下一周期（新即时任务/每日兜底巡检）重吃；
 prepare 切出 0 条时即时自释（并发周期已吃空，不留僵尸租约）。
 --force = 夺回自有租约（同周期内重切批用）。
@@ -261,6 +264,24 @@ def acquire_lock(outdir, chain="resume", stale_after=STALE_AFTER_S, force=False)
 def release_lock(path):
     if path and os.path.exists(path):
         os.remove(path)
+
+
+def renew_lock(outdir, chain="resume"):
+    """续租（把锁 mtime 推到当下）：长 run 的墙钟由最慢 subagent 批次决定，租约判活窗口
+    若只在 prepare 时写一次，就会被工作本身耗光——2026-09-29 实测一次消费耗时 26 分 10 秒，
+    距 30 分钟失效只剩 4 分 11 秒；期间并存的两条消费任务（49 秒内注册两次）靠本租约去重，
+    租约一旦过期，未跑完的周期会被并发周期判定已死而接管，write_parts 随即 os.remove
+    清掉已落盘的好产物（掉队记录只剩次日兜底可吃，最坏 ~11 小时）。
+
+    语义：只在锁文件存在时 touch；不存在 = 已被释放或从未获取，返回 False 且**绝不新建**
+    （续租不是拿锁，凭空建锁会把"上一周期已释"的状态伪装成"有人在跑"）。
+    """
+    p = lock_path(outdir, chain)
+    if not os.path.exists(p):
+        return False
+    now = time.time()
+    os.utime(p, (now, now))
+    return True
 
 
 def _cli():

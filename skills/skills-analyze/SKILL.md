@@ -105,9 +105,11 @@ python3 skills/skills-analyze/scripts/skills_analyze.py merge
 {"merged":N,"batches":M,"missing_batches":[...],"bad_batches":[...],"dropped_rows":[...],"normalized":N,"normalizations":{...},"observations":{...},"all_complete":true|false}
 ```
 
-`missing_batches` = 该批 done 不存在或 JSON 不可解析；`bad_batches` = 能解析但 id 集合与 pending
-不一致 / 有行缺 id；`dropped_rows` = **被丢弃的行**（L0：非 dict、缺 id、id 重复、三列全空），
-每条 `{"id":...,"reason":...}`。`normalized` = 被 `normalize_row` 自动修复过格式的行数，
+`missing_batches` = 该批 done 不存在、或整批一行都抢救不出（load_done 无可解析对象）；
+`bad_batches` = 能解析但 id 集合与 pending 不一致 / 有行缺 id（单条记录 JSON 损坏时，同批好行已被
+行级抢救并入 merged，但该批因 id 集合不全仍判 bad、按整批补发）；`dropped_rows` = **被丢弃的行**
+（L0：非 dict、缺 id、id 重复、三列全空），每条 `{"id":...,"reason":...}`。`normalized` = 被
+`normalize_row` 自动修复过格式的行数，
 `normalizations` = 各修复动作（blank_lines/pipe_fixed/seg_filled/coerced_int…）的次数聚合；
 `observations` = **非阻断质量观察**（超长标签/技能数偏少/文本过长，口径唯一真源
 `shared/soften.py`），格式 `{key: [[id, 值], ...]}`——**只报告、不丢行、不打回重析、
@@ -178,7 +180,11 @@ subagent 端不跑 bash 校验、不做"修正-复验"多回合，回合省到"�
   不可解析、bad_batches=id 集合不一致、dropped_rows=缺 id/id 重复/L0 无法写回的行），产物齐全即视为该批成功、
   直接进 apply——失败常只发生在产物已落盘后的收尾回合（历史批次 13 即此例：产物已完整，
   收尾回合模型流被 TLS 掐断报 failed，补发白费一轮还覆盖了好产物）。仅当体检报出该批 missing/bad
-  时，才补发该批；dropped_rows 里的 record 未打标记、下一周期自动重析，也无需手工补发。
+  时，才补发该批（补发粒度=批：done_integrity 以 id 集合一致性判 bad，坏行同批的好行虽已被
+  shared/analyze_parts.load_done 行级抢救并入 merged，仍按整批重跑覆盖，两行都会打新标记）。
+  **禁止用 `prepare --ids 单条id --force` 做单条增量补发**：prepare 会清空全部 *_done_part*，
+  其余批次已抢救的好行反而从 merge 输入里丢光、退化成等次日兜底。
+  dropped_rows 里的 record 未打标记、下一周期自动重析，也无需手工补发。
   质量类问题不再丢行（只进 observations 非阻断观察），因此不存在"因标签字数被打回"的补发场景。
 - 扫描件（`full_text` 为空、`source_file` 指向本地原件）**照常入队精析**：subagent 用 Read 直接读原件
   （PDF/图片，多页逐页、同一条消息并发发出），读图规则见 `references/subagent-prompt.md`。

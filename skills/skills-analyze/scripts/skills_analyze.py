@@ -53,7 +53,7 @@ DONE_REQUIRED_FIELDS = ("skills", "ai_structured", "ai_deep",
 DONE_NULLABLE_STR_FIELDS = ("name", "major", "school", "certificates", "expected_position")
 DONE_STRUCTURED_SEGS = ["学历背景", "工作经验", "核心技能", "求职意向", "匹配度评估"]
 DONE_TEXT_MAX = FULL_TEXT_MAX  # 仅观察口径（oversize_text）：超长只报告不丢行；
-                               # 长度软约束由 prompt 负责（"200字以内"）
+                               # 长度软约束由 prompt 负责（模板注入 <TEXT_MAX>，真源 FULL_TEXT_MAX）
 
 
 def normalize_row(r):
@@ -203,7 +203,12 @@ def _load(path):
 
 def done_integrity():
     """盘上 done 产物体检（只读）：批次数、缺失批次、id 集合不一致/缺行的坏批次。
-    把 SKILL.md"failed 先验盘上产物再决定补发"这条人工纪律做成机器判定。"""
+    把 SKILL.md"failed 先验盘上产物再决定补发"这条人工纪律做成机器判定。
+    解析口径与 read_done 同走 ap.load_done（单源，禁止本函数另抄一套 json.load，
+    否则会出现"merged 已含抢救行、体检仍报整批缺失"的自相矛盾）：
+    抢救后一行不剩 = missing（补发该批）；剩了但 id 集合不全 = bad（同样整批补发，
+    补发产物 merge 时覆盖抢救版，同批好行不丢数据；抢救的意义在于 merged 计数如实、
+    报告不再自相矛盾，并为 apply 先行部分写回留好通路）。"""
     missing, bad, total = [], [], ap.count_pending(OUTDIR, PREFIX)
     for i in range(1, total + 1):
         dp = ap.done_path(OUTDIR, PREFIX, i)
@@ -212,8 +217,11 @@ def done_integrity():
             continue
         try:
             pend = _load(ap.pending_path(OUTDIR, PREFIX, i))
-            dn = _load(dp)
-        except Exception:  # noqa: BLE001  不可解析按缺失处理，与 read_done 同口径
+        except Exception:  # noqa: BLE001  pending 是脚本产物，坏在此属异常，按缺失处理
+            missing.append(i)
+            continue
+        dn, _errs = ap.load_done(dp)
+        if not dn:
             missing.append(i)
             continue
         pids = {r.get("id") for r in pend if isinstance(r, dict) and r.get("id")}
@@ -309,6 +317,10 @@ def prepare(args):
 
 
 def merge(args):
+    # 读盘前先续租：一个 run 的墙钟由最慢 subagent 批次决定，租约判活窗口只在 prepare 写一次
+    # 就会被工作本身耗光（实测一次 26 分 10 秒，距 30 分钟失效仅剩 4 分 11 秒），
+    # 过期后并存的其他消费周期会接管并清掉已落盘的好产物。真源 shared/refine_loop.renew_lock。
+    refine_loop.renew_lock(OUTDIR, "resume")
     rows, _ = ap.read_done(OUTDIR, PREFIX)   # 缺失/坏批次判定统一交 done_integrity，此处只取行
     specs = observation_specs()
     done, seen, dropped = [], set(), []

@@ -114,6 +114,13 @@
     - 并发防护 = `shared/refine_loop.py` 周期租约：prepare 获取 `outputs/refine_{resume,job}.lock`、
       写回端释放，30 分钟 mtime 判活，撞活租约 refused exit 2（消费方见 refused 即退、禁止抢跑），
       同周期重切批 --force 夺回；锁路径走 OUTDIR 供测试隔离。
+      **merge 开头必须 renew_lock 续租**（真源 `refine_loop.renew_lock`，只 touch 已存在的锁、
+      绝不凭空建锁）：一个 run 的墙钟由最慢 subagent 批次决定（merge 门禁要全部批次到齐），
+      判活窗口若只在 prepare 写一次就会被工作本身耗光——2026-09-29 实测一次 26 分 10 秒、
+      距 30 分钟失效仅剩 4 分 11 秒，且同时段并存两条消费任务（49 秒内注册两次）全靠此租约去重；
+      一旦过期，并存周期会接管并在 write_parts 里清掉已落盘的好产物。
+      **已知边界**：续租点在脚本内，等待掉队 subagent 的墙钟发生在 agent 回合层、无脚本在跑，
+      该段仍不续租——极端情况下（掉队 >30 分钟）悬崖只是后移，未根除。
     - 每日兜底 cron 是**唯一崩溃恢复层**（时刻取白天工作时段，电脑通常在开机状态）；其规格同样由代码产出
       （`python3 shared/refine_loop.py fallback`：任务名 `FALLBACK_NAME`、时刻 `FALLBACK_CRON`、
       自清理前缀取自 `TASK_PREFIX`），部署/重建时原样注册，**禁止在 cron payload 里手抄名称前缀或时刻**。

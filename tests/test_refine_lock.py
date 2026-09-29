@@ -63,6 +63,23 @@ class TestRefineLease(unittest.TestCase):
         refine_loop.release_lock(None)                       # 幂等：未持锁也要安静
         refine_loop.release_lock(os.path.join(self.root, "nope.lock"))  # 不存在也安静
 
+    def test_renew_pushes_mtime_and_keeps_lease_alive(self):
+        # A（续租）：长跑流程在 merge 处续租，把判活窗口随工作推进滚动，
+        # 防 stale_after 窗口被"最慢 subagent 批次墙钟"耗光后被并存周期接管清产物。
+        p = refine_loop.acquire_lock(self.root, "resume")
+        os.utime(p, (time.time() - (refine_loop.STALE_AFTER_S - 5),) * 2)  # 逼近过期
+        self.assertTrue(refine_loop.renew_lock(self.root, "resume"))
+        self.assertLess(abs(time.time() - os.path.getmtime(p)), 2, "续租必须把 mtime 推回当下")
+        self.assertIsNone(refine_loop.acquire_lock(self.root, "resume"),
+                          "续租后原周期仍持锁，第二周期必须被拒")
+
+    def test_renew_never_creates_a_lock(self):
+        # 续租不是拿锁：锁不存在（已释放/从未获取）时返回 False 且不新建，
+        # 否则会把"上一周期已释"伪装成"有人在跑"，毒化下一周期。
+        self.assertFalse(refine_loop.renew_lock(self.root, "resume"))
+        self.assertFalse(os.path.exists(refine_loop.lock_path(self.root, "resume")),
+                         "renew 不得凭空创建锁文件")
+
 
 if __name__ == "__main__":
     unittest.main()
